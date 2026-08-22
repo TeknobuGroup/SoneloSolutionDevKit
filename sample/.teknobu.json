@@ -1,0 +1,17 @@
+{
+  "kit": "1.0",
+  "work_branch": "prelive",
+  "protected": [
+    "main"
+  ],
+  "commit_format": "conventional",
+  "applied": "2026-08-20",
+  "stack": {
+    "node": true,
+    "pm": "npm",
+    "supabase": true,
+    "flutter": false,
+    "python": false,
+    "vercel": false
+  }
+}

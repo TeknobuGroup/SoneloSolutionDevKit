@@ -1,0 +1,5 @@
+# teknobu-kit v1.0 - commands run by .githooks/pre-push (one per line). CI runs the same list.
+# Edit freely; keep them fast enough to run before every push.
+npm run typecheck
+npm run lint
+npm test
