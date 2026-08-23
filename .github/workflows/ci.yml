@@ -20,5 +20,5 @@ jobs:
         run: |
           mkdir -p $RUNNER_TEMP/r && cd $RUNNER_TEMP/r && git init -q -b main && git config user.name ci && git config user.email ci@example.com
           echo '{"name":"r","scripts":{"build":"echo build","test":"echo test"}}' > package.json && git add -A && git commit -qm "chore: init"
-          HOME=$RUNNER_TEMP/h WORKLOG_NO_OPEN=1 python $RUNNER_TEMP/h/.claude/teknobu/repo_setup.py apply
-          HOME=$RUNNER_TEMP/h python $RUNNER_TEMP/h/.claude/teknobu/repo_setup.py check
+          HOME=$RUNNER_TEMP/h WORKLOG_NO_OPEN=1 python $RUNNER_TEMP/h/.claude/sonelo/repo_setup.py apply
+          HOME=$RUNNER_TEMP/h python $RUNNER_TEMP/h/.claude/sonelo/repo_setup.py check
