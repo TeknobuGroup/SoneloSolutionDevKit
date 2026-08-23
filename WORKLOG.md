@@ -1,4 +1,4 @@
-# Worklog agent · v1.13 (part of the Sonelo Solution DevKit v4.0)
+# Worklog agent · v1.14 (part of the Sonelo Solution DevKit v4.0)
 
 Installed and updated through the kit: `python repo_setup.py install` does the machine setup, `/repo-setup` or `apply` puts it in a repo. The rest of this file is the reference.
 
@@ -121,6 +121,6 @@ python .worklog/worklog_agent.py stamp lock        # what the tasks call; you wo
 - Windows: Claude Code runs hooks through Git Bash (from Git for Windows, which you already have). The installer writes the full path of the Python it was run with, so PATH differences between shells don't matter.
 - Every run logs to `.worklog/agent.log` in the repo; the scheduled tasks log to `<pot>/bin/agent.log`.
 
-## Agents (v1.12)
+## Agents (since v1.12, grouped by project since v1.14)
 
-The dashboard's **Agents** card and the weekly report's *Agents and commands* section show, for the sessions in range: each subagent (code-reviewer, security-reviewer, test-runner, ...) with how many times it ran, how long it ran, and the tokens it consumed, attributed from the Task calls in the session transcript and the subagent transcripts under it. Below the table: the slash commands used (`/post-change` x3) and the tools Claude called most. Nothing new to configure; sessions collected before v1.12 show no agent data.
+The dashboard's **Agents** card and the weekly report's *Agents and commands* section show, for the sessions in range, agent usage grouped by project: each project with its totals, then each subagent under it with how many times it ran, how long it ran, and the tokens it consumed, attributed from the Task calls in the session transcript and the subagent transcripts under it. Agents appear under friendly display names (e.g. code-reviewer as "Stephen - Tech Nerd"); the raw ids stay in the data, and `"agent_names": {"code-reviewer": "..."}` in `~/.claude/worklog.json` overrides any of them. Below the table: the slash commands used (`/post-change` x3) and the tools Claude called most. Sessions collected before v1.12 show no agent data.

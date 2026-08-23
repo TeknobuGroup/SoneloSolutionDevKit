@@ -1,0 +1,4 @@
+# teknobu-kit v3.2 - commands run by .githooks/pre-push (one per line). CI runs the same list.
+# Edit freely; keep them fast enough to run before every push.
+python -m py_compile repo_setup.py worklog_agent.py
+python -m unittest discover -s tests

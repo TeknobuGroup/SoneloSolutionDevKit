@@ -1,0 +1,28 @@
+# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.
+name: CI gates
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Changed files
+        id: files
+        run: |
+          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt
+          echo "code=$(grep -Ev '^(docs/|CHANGELOG\.md|\.claude/|\.github/|.*\.md$|\.env)' changed.txt | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Changelog entry present
+        if: steps.files.outputs.code != ''
+        run: grep -q '^CHANGELOG\.md$' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }
+      - name: UAT document present
+        if: steps.files.outputs.code != ''
+        run: grep -q '^docs/uat/' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }
+      - name: Types regenerated after migrations
+        run: |
+          if grep -q '^supabase/migrations/' changed.txt && ! grep -q '^src/types/database.ts$' changed.txt; then
+            echo "::error::Migration changed but src/types/database.ts was not regenerated."; exit 1; fi

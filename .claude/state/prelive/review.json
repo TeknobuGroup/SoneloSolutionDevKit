@@ -1,0 +1,8 @@
+{
+  "branch": "prelive",
+  "at": "2026-08-23T23:43:40+01:00",
+  "verdict": "clear",
+  "blocking": [],
+  "reviewers": { "code": "clear", "security": "clear", "design": "clear" },
+  "tests": "green"
+}

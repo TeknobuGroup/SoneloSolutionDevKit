@@ -1,2 +1,25 @@
 __pycache__/
 *.pyc
+
+# teknobu standards
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+.claude/.backup/
+.worklog/
+node_modules/
+dist/
+build/
+.vercel/
+supabase/.temp/
+supabase/.branches/
+.DS_Store
+Thumbs.db
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
