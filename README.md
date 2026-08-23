@@ -12,6 +12,20 @@ cd teknobu-kit
 python repo_setup.py install          # or double-click install.cmd on Windows, ./install.sh on Mac/Linux
 ```
 
+Or without cloning - one line, PowerShell:
+
+```
+iwr https://raw.githubusercontent.com/TeknobuGroup/teknobu-kit/main/repo_setup.py -OutFile "$env:TEMP\repo_setup.py"; python "$env:TEMP\repo_setup.py" install
+```
+
+Mac/Linux:
+
+```
+curl -fsSL https://raw.githubusercontent.com/TeknobuGroup/teknobu-kit/main/repo_setup.py -o /tmp/repo_setup.py && python3 /tmp/repo_setup.py install
+```
+
+The lone file fetches the worklog from the same repository during install.
+
 Or download the zip from the releases page and run the same from the unzipped folder. It asks four things the first time:
 
 - **Full setup or worklog only.** Worklog only installs nothing but the work log: per-repo hooks, a dashboard, a morning page.

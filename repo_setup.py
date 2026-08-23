@@ -2491,6 +2491,18 @@ def cmd_install(args):
     bundled = Path(__file__).resolve().parent / "worklog_agent.py"
     if bundled.exists() and bundled.resolve() != WORKLOG.resolve():
         shutil.copyfile(str(bundled), str(WORKLOG))
+    elif not bundled.exists():
+        # installed straight from a URL: fetch the worklog from the same repo
+        raw = os.environ.get("TEKNOBU_RAW", "https://raw.githubusercontent.com")
+        src = CONFIG.get("source") or DEFAULTS["source"]
+        try:
+            text = http_get("%s/%s/main/worklog_agent.py" % (raw, src), to=120).decode("utf-8")
+            if "WORKLOG_VERSION" in text or "worklog" in text[:2000]:
+                old_v = version_of(WORKLOG) if WORKLOG.exists() else None
+                WORKLOG.write_text(text, encoding="utf-8")
+                say("worklog    fetched from github.com/%s%s" % (src, "" if not old_v else " (was v%s)" % ".".join(map(str, old_v))))
+        except Exception as e:
+            say("worklog    not bundled and could not fetch from github.com/%s (%s) - kit works, worklog absent until you run install from a clone" % (src, e))
     cfg = configure(args)
     say("config     %s (mode %s, work branch %s, database %s)" % (CONFIG_FILE, cfg["mode"], cfg["work_branch"], cfg["database"]))
     if cfg["mode"] == "worklog":
