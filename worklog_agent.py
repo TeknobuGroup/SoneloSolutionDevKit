@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-worklog_agent.py  (v1.12)  -  per-repo work reporter for Claude Code
+worklog_agent.py  (v1.14)  -  per-repo work reporter for Claude Code
 
 Lives at <repo>/.worklog/worklog_agent.py. Claude Code hooks run it at the start and end of every
 session in this repo, and after each response (throttled). Each run:
@@ -33,6 +33,7 @@ Config:
         {"pot": ..., "idle_minutes": 15, "window_days": 28, "aw_url": "http://localhost:5600",
          "currency": "$", "prices": {"claude-sonnet-4-6": {"in": 3, "cache_create": 3.75, "cache_read": 0.3, "out": 15}}}
         prices are per million tokens, matched by model-name substring; leave empty for no cost column
+        "agent_names": {"code-reviewer": "..."} overrides the built-in friendly display names for agents
   .worklog/worklog.json    this repo only: {"project": "Knecta"}
 
 Python 3.8+, standard library only. Never blocks Claude Code: hook runs exit immediately and do the
@@ -59,7 +60,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.13"
+VERSION = "1.14"
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -75,6 +76,24 @@ PRESENCE_OFF = {"lock", "logoff", "shutdown", "sleep"}
 PRESENCE_ALL = PRESENCE_ON | PRESENCE_OFF | {"boot", "wake"}
 
 DEFAULT_POT = str(Path("~/Worklog").expanduser())   # one pot per machine; change it in ~/.claude/worklog.json ("pot")
+
+AGENT_NAMES = {                                  # friendly display names; raw ids stay as data keys ("agent_names" in the config overrides)
+    "changelog-scribe": "Linda - Archives",
+    "code-reviewer": "Stephen - Tech Nerd",
+    "security-reviewer": "Dwayne - Security",
+    "design-reviewer": "Chloe - Marketing",
+    "docs-maintainer": "Archie - Writer",
+    "impact-analyst": "Cautious Colin",
+    "qa-runner": "Testing Tim",
+    "test-runner": "Raymond the Runner",
+    "test-writer": "Cautious Carl",
+    "uat-plan-maintainer": "Account Manager Mavis",
+    "uat-writer": "Key Account Manager Karen",
+    "Explore": "Code Search Simon",
+    "Plan": "Lead Architect Arthur",
+    "general-purpose": "Gopher Greg",
+    "claude": "Alan AI",
+}
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -224,6 +243,14 @@ def central_cfg():
            "brief_popup": True, "brief_after": "05:00"}
     cfg.update({k: v for k, v in read_json(CENTRAL_CFG, {}).items() if v is not None})
     return cfg
+
+
+def agent_name_map(cfg):
+    m = dict(AGENT_NAMES)
+    over = cfg.get("agent_names")
+    if isinstance(over, dict):                   # a malformed config must not kill report runs
+        m.update({k: " ".join(str(v).replace("|", "/").split()) for k, v in over.items() if v})
+    return m
 
 
 def project_name(root):
@@ -1038,28 +1065,32 @@ def build_report(slices, machines, since, until, cfg):
             L.append("\\* some models had no entry in `prices`, so the figure is partial.")
         L.append("")
 
-    agg_agents, agg_cmds, agg_tools = {}, {}, {}
+    an = agent_name_map(cfg)
+    agg_projs, agg_cmds, agg_tools = {}, {}, {}
     for label, b in ordered:
         for s_ in b.get("session_objs", []):
             for name, a in (s_.get("agents") or {}).items():
-                g = agg_agents.setdefault(name, {"runs": 0, "wall_s": 0, "in": 0, "out": 0, "projects": {}})
+                g = agg_projs.setdefault(label, {}).setdefault(name, {"runs": 0, "wall_s": 0, "in": 0, "out": 0})
                 g["runs"] += a.get("runs", 0); g["wall_s"] += a.get("wall_s", 0)
-                g["projects"][label] = g["projects"].get(label, 0) + a.get("runs", 0)
                 g["in"] += (a.get("tokens") or {}).get("in", 0) + (a.get("tokens") or {}).get("cache_create", 0)
                 g["out"] += (a.get("tokens") or {}).get("out", 0)
             for k, v in (s_.get("commands") or {}).items():
                 agg_cmds[k] = agg_cmds.get(k, 0) + v
             for k, v in (s_.get("tools") or {}).items():
                 agg_tools[k] = agg_tools.get(k, 0) + v
-    if agg_agents or agg_cmds:
+    if agg_projs or agg_cmds:
         L.append("## Agents and commands")
         L.append("")
-        if agg_agents:
-            L.append("| Agent | Runs | Time | Input | Output | Projects |")
-            L.append("|---|---:|---:|---:|---:|---|")
-            for name, g in sorted(agg_agents.items(), key=lambda kv: -kv[1]["wall_s"]):
-                L.append("| %s | %d | %s | %s | %s | %s |" % (name, g["runs"], fmt_dur(g["wall_s"] / 60), fmt_tok(g["in"]) if g["in"] else "-", fmt_tok(g["out"]) if g["out"] else "-",
-                                                         ", ".join("%s \u00d7%d" % (pn, n) for pn, n in sorted(g["projects"].items(), key=lambda kv: -kv[1]))))
+        if agg_projs:
+            L.append("| Project / agent | Runs | Time | Input | Output |")
+            L.append("|---|---:|---:|---:|---:|")
+            for label, pa in sorted(agg_projs.items(), key=lambda kv: -sum(g["wall_s"] for g in kv[1].values())):
+                tot = {k: sum(g[k] for g in pa.values()) for k in ("runs", "wall_s", "in", "out")}
+                L.append("| **%s** | **%d** | **%s** | **%s** | **%s** |" % (label, tot["runs"], fmt_dur(tot["wall_s"] / 60),
+                                                                            fmt_tok(tot["in"]) if tot["in"] else "-", fmt_tok(tot["out"]) if tot["out"] else "-"))
+                for name, g in sorted(pa.items(), key=lambda kv: -kv[1]["wall_s"]):
+                    L.append("| \u00b7 %s | %d | %s | %s | %s |" % (an.get(name, name), g["runs"], fmt_dur(g["wall_s"] / 60),
+                                                                   fmt_tok(g["in"]) if g["in"] else "-", fmt_tok(g["out"]) if g["out"] else "-"))
             L.append("")
         if agg_cmds:
             L.append("Commands: " + ", ".join("%s x%d" % (k, v) for k, v in sorted(agg_cmds.items(), key=lambda kv: -kv[1])))
@@ -1083,7 +1114,7 @@ def build_report(slices, machines, since, until, cfg):
             for name, a in (s_.get("agents") or {}).items():
                 g = pa.setdefault(name, [0, 0]); g[0] += a.get("runs", 0); g[1] += a.get("wall_s", 0)
         if pa:
-            L.append("Agents: " + ", ".join("%s x%d (%s)" % (n, g[0], fmt_dur(g[1] / 60)) for n, g in sorted(pa.items(), key=lambda kv: -kv[1][1])))
+            L.append("Agents: " + ", ".join("%s x%d (%s)" % (an.get(n, n), g[0], fmt_dur(g[1] / 60)) for n, g in sorted(pa.items(), key=lambda kv: -kv[1][1])))
         L.append("")
         for day in sorted(b["days"]):
             L.append("### %s" % day.strftime("%a %d %b"))
@@ -1211,6 +1242,7 @@ def dashboard_data(slices, machines, cfg, pot):
         "generated": datetime.now(local_tz()).isoformat(), "pot": str(pot),
         "window_days": int(cfg["window_days"]), "window_start": window_start_dt.isoformat() if window_start_dt else None,
         "idle_minutes": int(cfg["idle_minutes"]), "currency": cfg.get("currency", "$"), "prices": cfg.get("prices") or {},
+        "agent_names": agent_name_map(cfg),
         "repo_count": len(slices),
         "projects": [{"project": k, "repos": v} for k, v in projects.items()],
         "machine": {"aw_days": aw_days, "presence": presence},
@@ -1609,31 +1641,35 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   }
 
   function renderAgents(R, focus) {
-    var agents = {}, cmds = {}, tools = {};
-    focus.forEach(function (x) { x.sessions.forEach(function (s) {
-      Object.keys(s.agents).forEach(function (k) { var a = s.agents[k], g = agents[k] = agents[k] || { runs: 0, wall: 0, inp: 0, out: 0, projects: {} };
-        g.runs += a.runs || 0; g.wall += a.wall_s || 0; g.inp += ((a.tokens || {}).in || 0) + ((a.tokens || {}).cache_create || 0); g.out += (a.tokens || {}).out || 0; g.projects[x.p.name] = (g.projects[x.p.name] || 0) + (a.runs || 0); });
-      Object.keys(s.commands).forEach(function (k) { cmds[k] = (cmds[k] || 0) + s.commands[k]; });
-      Object.keys(s.tools).forEach(function (k) { tools[k] = (tools[k] || 0) + s.tools[k]; });
-    }); });
-    var names = Object.keys(agents);
-    if (!names.length && !Object.keys(cmds).length) { el('agentsCard').style.display = 'none'; return; }
+    var nameOf = function (n) { var m = DATA.agent_names || {}; return Object.prototype.hasOwnProperty.call(m, n) ? m[n] : n; };
+    var byProj = [], cmds = {}, tools = {};
+    focus.forEach(function (x) {
+      var agents = {};
+      x.sessions.forEach(function (s) {
+        Object.keys(s.agents).forEach(function (k) { var a = s.agents[k], g = agents[k] = agents[k] || { runs: 0, wall: 0, inp: 0, out: 0 };
+          g.runs += a.runs || 0; g.wall += a.wall_s || 0; g.inp += ((a.tokens || {}).in || 0) + ((a.tokens || {}).cache_create || 0); g.out += (a.tokens || {}).out || 0; });
+        Object.keys(s.commands).forEach(function (k) { cmds[k] = (cmds[k] || 0) + s.commands[k]; });
+        Object.keys(s.tools).forEach(function (k) { tools[k] = (tools[k] || 0) + s.tools[k]; });
+      });
+      var names = Object.keys(agents);
+      if (names.length) byProj.push({ p: x.p, agents: agents, names: names });
+    });
+    if (!byProj.length && !Object.keys(cmds).length) { el('agentsCard').style.display = 'none'; return; }
     el('agentsCard').style.display = '';
     var html = '';
-    if (names.length) {
-      names.sort(function (a, b) { return agents[b].wall - agents[a].wall; });
-      var max = Math.max.apply(null, names.map(function (n) { return agents[n].wall; })) || 1;
-      html += '<table><thead><tr><th>Agent</th><th>Runs</th><th>Time</th><th style="text-align:left">Share</th><th>Input</th><th>Output</th><th style="text-align:left">Projects</th></tr></thead><tbody>';
-      names.forEach(function (n) { var g = agents[n];
-        html += '<tr><td>' + esc(n) + '</td><td>' + g.runs + '</td><td>' + fmtDur(g.wall / 60) + '</td><td style="text-align:left"><div class="tokbar" style="width:' + (g.wall / max * 100) + '%"><i style="width:100%;background:#1b1f24"></i></div></td><td>' + (g.inp ? fmtTok(g.inp) : '\u2013') + '</td><td>' + (g.out ? fmtTok(g.out) : '\u2013') + '</td><td style="text-align:left" class="muted">' + esc(Object.keys(g.projects).map(function (p) { return p + ' \u00d7' + g.projects[p]; }).join(', ')) + '</td></tr>'; });
-      html += '</tbody></table>';
-    }
-    var perProj = focus.filter(function (x) { return x.sessions.some(function (s) { return Object.keys(s.agents).length; }); });
-    if (names.length && perProj.length > 1) {
-      html += '<table style="margin-top:10px"><thead><tr><th style="text-align:left">By project</th>' + names.map(function (n) { return '<th>' + esc(n) + '</th>'; }).join('') + '</tr></thead><tbody>';
-      perProj.forEach(function (x) {
-        var row = {}; x.sessions.forEach(function (s) { Object.keys(s.agents).forEach(function (k) { var r = row[k] = row[k] || { runs: 0, wall: 0 }; r.runs += s.agents[k].runs || 0; r.wall += s.agents[k].wall_s || 0; }); });
-        html += '<tr><td style="text-align:left"><span class="sw" style="background:' + x.p.color + '"></span>' + esc(x.p.name) + '</td>' + names.map(function (n) { var r = row[n]; return '<td>' + (r ? r.runs + ' \u00b7 ' + fmtDur(r.wall / 60) : '<span class="muted">\u2013</span>') + '</td>'; }).join('') + '</tr>';
+    if (byProj.length) {
+      var max = 1;
+      byProj.forEach(function (b) {
+        b.total = { runs: 0, wall: 0, inp: 0, out: 0 };
+        b.names.forEach(function (n) { var g = b.agents[n]; b.total.runs += g.runs; b.total.wall += g.wall; b.total.inp += g.inp; b.total.out += g.out; if (g.wall > max) max = g.wall; });
+        b.names.sort(function (n1, n2) { return b.agents[n2].wall - b.agents[n1].wall; });
+      });
+      byProj.sort(function (b1, b2) { return b2.total.wall - b1.total.wall; });
+      html += '<table><thead><tr><th style="text-align:left">Project / agent</th><th>Runs</th><th>Time</th><th style="text-align:left">Share</th><th>Input</th><th>Output</th></tr></thead><tbody>';
+      byProj.forEach(function (b) {
+        html += '<tr><td style="text-align:left"><span class="sw" style="background:' + b.p.color + '"></span><b>' + esc(b.p.name) + '</b></td><td><b>' + b.total.runs + '</b></td><td><b>' + fmtDur(b.total.wall / 60) + '</b></td><td></td><td><b>' + (b.total.inp ? fmtTok(b.total.inp) : '\u2013') + '</b></td><td><b>' + (b.total.out ? fmtTok(b.total.out) : '\u2013') + '</b></td></tr>';
+        b.names.forEach(function (n) { var g = b.agents[n];
+          html += '<tr><td style="text-align:left;padding-left:36px" title="' + esc(n) + '">' + esc(nameOf(n)) + '</td><td>' + g.runs + '</td><td>' + fmtDur(g.wall / 60) + '</td><td style="text-align:left"><div class="bar"><i style="width:' + (g.wall / max * 100) + '%;background:#1b1f24"></i></div></td><td>' + (g.inp ? fmtTok(g.inp) : '\u2013') + '</td><td>' + (g.out ? fmtTok(g.out) : '\u2013') + '</td></tr>'; });
       });
       html += '</tbody></table>';
     }

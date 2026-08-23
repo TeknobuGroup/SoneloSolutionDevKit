@@ -1,6 +1,6 @@
 # Sonelo Solution DevKit
 
-Kit v4.0 · worklog v1.13. Sonelo is the developer platform brand of Teknobu Group. Repo standards, a complete agent pipeline, infrastructure creation and a work log for Claude Code projects. One Python file each, standard library only, Windows first.
+Kit v4.0 · worklog v1.14. Sonelo is the developer platform brand of Teknobu Group. Repo standards, a complete agent pipeline, infrastructure creation and a work log for Claude Code projects. One Python file each, standard library only, Windows first.
 
 ## Install (once per machine)
 

@@ -6,6 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 .claude/settings.local.json
+.claude/.backup/
 .worklog/
 node_modules/
 dist/
