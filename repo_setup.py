@@ -2,10 +2,10 @@
 """
 repo_setup.py  (v3.2)  -  Teknobu repo standards kit
 
-One file, standard library only. Lives at ~/.claude/teknobu/repo_setup.py and is driven by the
+One file, standard library only. Lives at ~/.claude/sonelo/repo_setup.py and is driven by the
 /repo-setup command in Claude Code (or run by hand from a repo root).
 
-  python repo_setup.py install          # once per machine: copies itself to ~/.claude/teknobu/, writes the
+  python repo_setup.py install          # once per machine: copies itself to ~/.claude/sonelo/, writes the
                                         #   /repo-setup command, registers the session-start nudge
   python repo_setup.py apply            # in a repo: lay down the standards (idempotent; --dry-run to preview)
   python repo_setup.py check            # in a repo: what's in place, what's missing
@@ -24,7 +24,7 @@ One file, standard library only. Lives at ~/.claude/teknobu/repo_setup.py and is
   python repo_setup.py uninstall        # remove the commands and the nudge (repos keep their files)
 
 What apply lays down (adapted to what it finds: package.json, supabase/, pubspec.yaml, tests), plus the worklog agent
-(bundled; .worklog/ in the repo, git-ignored locally) and anything in ~/.claude/teknobu/pipeline/:
+(bundled; .worklog/ in the repo, git-ignored locally) and anything in ~/.claude/sonelo/pipeline/:
   .githooks/commit-msg                  Conventional Commits, enforced
   .githooks/pre-commit                  blocks .env files, key material, files over 5 MB, secrets in added lines
   .githooks/pre-push                    refuses direct pushes to main and force-pushes to main/<work>, runs .githooks/checks
@@ -34,12 +34,12 @@ What apply lays down (adapted to what it finds: package.json, supabase/, pubspec
   .github/pull_request_template.md
   .teknobu.json                         branch model and kit version
   <WORK>.md (PRELIVE.md, STAGING.md)    the manual wiring left to do (staging project, secrets, Vercel branch domain)
-  CLAUDE.md                             a "Teknobu standards" section so Claude Code follows the rules
+  CLAUDE.md                             a standards section so Claude Code follows the rules
   .gitignore / .env.example             housekeeping
   git: core.hooksPath=.githooks, work branch created if missing
 
 Branch model: work on the work branch (its own URL and database), pull request into main (production).
-Escape hatches: TEKNOBU_SKIP=1 disables the hooks for one command; TEKNOBU_ALLOW_MAIN=1 allows one direct push to main.
+Escape hatches: SONELO_SKIP=1 disables the hooks for one command; SONELO_ALLOW_MAIN=1 allows one direct push to main (TEKNOBU_* still honoured).
 """
 
 import argparse
@@ -58,9 +58,13 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "3.2"
-MARK = "teknobu-kit"                                   # marker line in every generated file we own
-HOME_DIR = Path("~/.claude/teknobu").expanduser()
+VERSION = "4.0"
+KIT_NAME = "Sonelo Solution DevKit"
+MARK = "sonelo-devkit"                                 # marker line in every generated file we own
+OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
+ALL_MARKS = (MARK,) + OLD_MARKS
+HOME_DIR = Path("~/.claude/sonelo").expanduser()
+OLD_HOME_DIR = Path("~/.claude/teknobu").expanduser()
 INSTALLED = HOME_DIR / "repo_setup.py"
 PIPELINE_DIR = HOME_DIR / "pipeline"                    # optional: files here are copied into every repo (your Claude pipeline)
 WORKLOG = HOME_DIR / "worklog_agent.py"                 # the worklog agent, bundled with the kit
@@ -81,11 +85,15 @@ DEFAULTS = {
     "supabase_region": "us-east-1",
     "database": "separate",               # separate: two projects | branching: one project + a persistent Supabase branch
     "stack_default": "Vite + React + TypeScript + Supabase",
-    "source": "TeknobuGroup/teknobu-kit",    # GitHub repo the `update` command pulls releases from
+    "source": "TeknobuGroup/SoneloSolutionDevKit",    # GitHub repo the `update` command pulls releases from
     "brand": {"PRIMARY": "one accent token (`--primary`); the only call-to-action colour", "FONTS": "one sans for UI, one mono for code and metadata",
               "RADIUS": "4px", "LINT": "none yet; the reviewer reads source"},
 }
 PRESETS = {
+    "sonelo": {"work_branch": "prelive", "github_org": "TeknobuGroup", "domain_pattern": "{name}.co.uk", "supabase_region": "eu-west-2",
+               "database": "separate", "stack_default": "TanStack Start + React + TypeScript + Supabase",
+               "brand": {"PRIMARY": "Teknobu teal `#00AF9F` (token `--primary`)", "FONTS": "Manrope (UI, 400/500/600), JetBrains Mono (code, metadata)",
+                         "RADIUS": "4px", "LINT": "none yet; the reviewer reads source"}},
     "teknobu": {"work_branch": "prelive", "github_org": "TeknobuGroup", "domain_pattern": "{name}.co.uk", "supabase_region": "eu-west-2",
                 "database": "separate", "stack_default": "TanStack Start + React + TypeScript + Supabase",
                 "brand": {"PRIMARY": "Teknobu teal `#00AF9F` (token `--primary`)", "FONTS": "Manrope (UI, 400/500/600), JetBrains Mono (code, metadata)",
@@ -96,8 +104,9 @@ PRESETS = {
 def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     data = {}
+    src = CONFIG_FILE if CONFIG_FILE.exists() else (OLD_HOME_DIR / "config.json")
     try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+        data = json.loads(src.read_text(encoding="utf-8")) if src.exists() else {}
     except (OSError, ValueError):
         data = {}
     for k, v in (data or {}).items():
@@ -133,7 +142,7 @@ def env_doc():
 
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}   # CREATE_NO_WINDOW
 BIN_DIR = HOME_DIR / "bin"                                          # CLIs the kit downloads itself (supabase, gh)
-USER_AGENT = "teknobu-kit/%s (+python-urllib)" % VERSION            # Supabase's API rejects urllib's default User-Agent with 403
+USER_AGENT = "sonelo-devkit/%s (+python-urllib)" % VERSION            # Supabase's API rejects urllib's default User-Agent with 403
 LOVABLE_MARKERS = ("lovable-tagger", "VITE_SUPABASE_PUBLISHABLE_KEY", "lovable.dev", "ai.gateway.lovable.dev")
 
 
@@ -142,9 +151,10 @@ def tool(name):
     found = shutil.which(name)
     if found:
         return found
-    for cand in (BIN_DIR / name, BIN_DIR / (name + ".exe"), BIN_DIR / (name + ".cmd")):
-        if cand.exists():
-            return str(cand)
+    for base in (BIN_DIR, OLD_HOME_DIR / "bin"):
+        for cand in (base / name, base / (name + ".exe"), base / (name + ".cmd")):
+            if cand.exists():
+                return str(cand)
     return None
 
 
@@ -268,7 +278,7 @@ def detect(root):
 
 COMMIT_MSG = r'''#!/bin/sh
 # {MARK} v{VERSION} - commit message format (Conventional Commits). Regenerated by repo_setup.py apply.
-[ "$TEKNOBU_SKIP" = "1" ] && exit 0
+{ [ "$SONELO_SKIP" = "1" ] || [ "$TEKNOBU_SKIP" = "1" ]; } && exit 0
 msg_file="$1"
 first=$(grep -v '^#' "$msg_file" | sed '/^[[:space:]]*$/d' | head -n 1)
 case "$first" in
@@ -287,14 +297,14 @@ cat >&2 <<EOF
   e.g.     feat(webhooks): validate Twilio signature per tenant
            fix: handle empty rate card on work order create
 
-  One-off override: TEKNOBU_SKIP=1 git commit ...
+  One-off override: SONELO_SKIP=1 git commit ...
 EOF
 exit 1
 '''
 
 PRE_COMMIT = r'''#!/bin/sh
 # {MARK} v{VERSION} - blocks env files, key material, large files and secrets in added lines. Regenerated by repo_setup.py apply.
-[ "$TEKNOBU_SKIP" = "1" ] && exit 0
+{ [ "$SONELO_SKIP" = "1" ] || [ "$TEKNOBU_SKIP" = "1" ]; } && exit 0
 fail=0
 files=$(git diff --cached --name-only --diff-filter=ACMR)
 [ -z "$files" ] && exit 0
@@ -329,7 +339,7 @@ IFS=$old_ifs
 if [ "$fail" = "1" ]; then
   echo ""
   echo "  Nothing was committed. Move secrets to environment variables (.env, listed in .env.example),"
-  echo "  then stage again. If this is a false positive: TEKNOBU_SKIP=1 git commit ..."
+  echo "  then stage again. If this is a false positive: SONELO_SKIP=1 git commit ..."
   exit 1
 fi
 exit 0
@@ -337,7 +347,7 @@ exit 0
 
 PRE_PUSH = r'''#!/bin/sh
 # {MARK} v{VERSION} - protects {PROTECTED} and {WORK}, then runs the checks in .githooks/checks. Regenerated by repo_setup.py apply.
-[ "$TEKNOBU_SKIP" = "1" ] && exit 0
+{ [ "$SONELO_SKIP" = "1" ] || [ "$TEKNOBU_SKIP" = "1" ]; } && exit 0
 protected="{PROTECTED}"
 work="{WORK}"
 zero=0000000000000000000000000000000000000000
@@ -349,10 +359,10 @@ while read local_ref local_sha remote_ref remote_sha; do
   updates=$((updates + 1))
   branch=${remote_ref#refs/heads/}
   for p in $protected; do
-    if [ "$branch" = "$p" ] && [ "$TEKNOBU_ALLOW_MAIN" != "1" ]; then
+    if [ "$branch" = "$p" ] && [ "$SONELO_ALLOW_MAIN" != "1" ] && [ "$TEKNOBU_ALLOW_MAIN" != "1" ]; then
       echo "blocked: direct push to '$p'. Push '$work' and open a pull request:"
       echo "    gh pr create --base $p --head $work --fill"
-      echo "  (one-off override: TEKNOBU_ALLOW_MAIN=1 git push ...)"
+      echo "  (one-off override: SONELO_ALLOW_MAIN=1 git push ...)"
       fail=1
     fi
   done
@@ -377,7 +387,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   if ! sh -c "$line"; then
     echo ""
     echo "  pre-push: FAILED: $line"
-    echo "  Fix it and push again, or skip once with TEKNOBU_SKIP=1 git push ..."
+    echo "  Fix it and push again, or skip once with SONELO_SKIP=1 git push ..."
     exit 1
   fi
 done < "$checks"
@@ -503,17 +513,17 @@ What the kit wired automatically: git hooks (commit format, secrets, protected b
 
 {SUPABASE_TODO}### Hosting (Vercel)
 - [ ] Fill `.env.{WORK}` (created next to `.env.example`, git-ignored) with the {WORK} values: Supabase URL and anon key of the {WORK} database, API URLs, anything that differs from production.
-- [ ] `python ~/.claude/teknobu/repo_setup.py vercel --domain {WORK}.<your-domain>` - links the project, assigns the domain to the `{WORK}` branch, checks DNS, pushes `.env.{WORK}` as Preview variables scoped to `{WORK}`. Uses your Vercel CLI login or a `VERCEL_TOKEN` (vercel.com/account/tokens).
+- [ ] `python ~/.claude/sonelo/repo_setup.py vercel --domain {WORK}.<your-domain>` - links the project, assigns the domain to the `{WORK}` branch, checks DNS, pushes `.env.{WORK}` as Preview variables scoped to `{WORK}`. Uses your Vercel CLI login or a `VERCEL_TOKEN` (vercel.com/account/tokens).
 - [ ] If it reports DNS as misconfigured: add the CNAME it prints at your DNS provider (GoDaddy), then re-run.
 - [ ] By hand instead: Settings -> Domains (add domain, Git branch `{WORK}`); Settings -> Environment Variables (Preview, scoped to `{WORK}`); production branch stays `{MAIN}`.
 
 ### GitHub
-- [ ] `python ~/.claude/teknobu/repo_setup.py protect` (needs the `gh` CLI logged in) - or Settings -> Branches -> add rule for `{MAIN}`: require a pull request, require the `checks` status, block force pushes and deletions.
+- [ ] `python ~/.claude/sonelo/repo_setup.py protect` (needs the `gh` CLI logged in) - or Settings -> Branches -> add rule for `{MAIN}`: require a pull request, require the `checks` status, block force pushes and deletions.
 - [ ] Actions -> Secrets: see the list at the top of `.github/workflows/deploy-supabase.yml` (Supabase repos only).
 
 ### Escape hatches
-- `TEKNOBU_SKIP=1 git commit ...` / `TEKNOBU_SKIP=1 git push ...` disables the hooks for one command.
-- `TEKNOBU_ALLOW_MAIN=1 git push origin {MAIN}` allows one direct push (hotfix, first push).
+- `SONELO_SKIP=1 git commit ...` / `SONELO_SKIP=1 git push ...` disables the hooks for one command.
+- `SONELO_ALLOW_MAIN=1 git push origin {MAIN}` allows one direct push (hotfix, first push).
 '''
 
 SUPABASE_TODO = '''### Database (Supabase)
@@ -526,7 +536,7 @@ SUPABASE_TODO = '''### Database (Supabase)
 '''
 
 CLAUDE_SECTION = '''<!-- {MARK}:start v{VERSION} (managed by repo_setup.py; edit outside these markers) -->
-## Teknobu standards
+## Sonelo standards
 
 **Branches.** Work on `{WORK}`; it deploys to its own URL and database. `{MAIN}` is production and only changes through a pull request from `{WORK}` (`gh pr create --base {MAIN} --head {WORK} --fill`). Never push to `{MAIN}` directly and never force-push `{WORK}` or `{MAIN}`. If you find yourself on `{MAIN}` with uncommitted work, switch to `{WORK}` first.
 
@@ -536,12 +546,12 @@ CLAUDE_SECTION = '''<!-- {MARK}:start v{VERSION} (managed by repo_setup.py; edit
 
 **Before pushing.** Typecheck, lint and tests must pass locally (the pre-push hook runs `.githooks/checks`); CI runs the same on GitHub. Database or edge-function changes go to {WORK} first and are verified there before the pull request. Migrations are files under `supabase/migrations`, never hand edits in a dashboard.
 
-**If a hook blocks you**, fix the cause. `TEKNOBU_SKIP=1` exists for false positives only; say so in the commit message if you use it.
+**If a hook blocks you**, fix the cause. `SONELO_SKIP=1` exists for false positives only; say so in the commit message if you use it.
 <!-- {MARK}:end -->
 '''
 
 GITIGNORE_LINES = [
-    "# teknobu standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".worklog/",
+    "# sonelo standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".worklog/",
     "node_modules/", "dist/", "build/", ".vercel/", "supabase/.temp/", "supabase/.branches/",
     ".DS_Store", "Thumbs.db", "*.log", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
 ]
@@ -694,12 +704,12 @@ BUILTIN_PIPELINE = {
     '.claude/commands/post-change.md': '---\ndescription: Run the change pipeline on the current work block - parallel review, fix loop (max 2), tests, verdict, docs. Once per block, not per edit.\n---\nRun the pipeline on everything changed since the last commit on this branch (plus any uncommitted work). Do not ask questions; report each stage in a line or two.\n\n1. **Tier.** Decide fast lane or full pipeline per CLAUDE.md. Say which and why in one line.\n2. **Review, in parallel.** Launch `code-reviewer` and `security-reviewer` together (and `design-reviewer` if anything under the UI changed). Wait for all three.\n3. **Fix loop.** Fix every finding marked *blocks the task* or *hurts the task*. Re-run only the reviewer(s) that reported them. At most two rounds; if a blocker survives two rounds, stop and ask the user with the finding quoted.\n4. **Tests.** Run `test-writer` for the changed behaviour (and the failing-test-first rule for any bug fix), then `test-runner`. Red means fix and re-run; same two-round cap.\n5. **Verdict.** Write `.claude/state/<branch>/review.json`: `{"branch": "...", "at": "<ISO time>", "verdict": "clear" | "blocked", "blocking": ["..."], "reviewers": {"code": "clear|blocked", "security": "clear|blocked", "design": "clear|blocked|skipped"}, "tests": "green|red"}`. The Stop gate reads it.\n6. **Tail, in parallel.** `changelog-scribe` and `docs-maintainer` together. Then, if this block is heading for a pull request, `uat-writer`.\n7. **Summary.** Five lines: tier, findings fixed, tests, what is in the changelog, what is still open.\n\nRules: reviewers never edit; only the lead (you) and test-writer write. Never weaken a test to pass it. Never print secrets or env values.\n',
     '.claude/commands/design-pass.md': "---\ndescription: Design-led polish of a screen within the design contract - applies the design-reviewer's polish and consistency findings in the fast lane; leaves anything that blocks or hurts the task for a human.\nargument-hint: <screen or component path>\n---\nRun `design-reviewer` on $ARGUMENTS (or on the screens touched since the last commit if no argument).\n\nThen, in the fast lane and without asking:\n- Apply every finding marked **polish** or **inconsistency**: spacing, hierarchy by size/weight/space, empty/loading/error states, reuse of the existing component for the same job, tokens instead of literals, accessible names, focus rings.\n- Do not touch data flow, contracts, handlers, or logic. If a finding needs any of those, leave it and list it.\n- Do not apply findings marked **blocks the task** or **hurts the task**; list them for the user with the reviewer's wording.\n\nRe-run `design-reviewer` once on the result. Report: what was applied (file:line), what was left and why, and the screens a human should open to see the result. Commit message if asked: `style: design pass on <screen>`.\n",
     '.claude/commands/pr.md': '---\ndescription: Create the pull request for this branch into production - pipeline verdict must be clear, UAT document required, PR body is the UAT document.\n---\n1. Confirm `.claude/state/<branch>/review.json` exists with `"verdict": "clear"` and `"tests": "green"` from this branch\'s latest work. If not, run `/post-change` first.\n2. Run `uat-writer` if `docs/uat/` has no document for this branch dated today. Commit it: `docs: UAT for <branch>`.\n3. Push the branch. Create the PR with `gh pr create --base <production branch> --head <branch> --title "<conventional summary>" --body-file docs/uat/<the document>`. Add the changelog lines under a "## Changes" heading in the body if the PR template asks for them.\n4. Report the PR URL, the gates that must pass, and the UAT document path. Never print secrets.\n',
-    '.claude/hooks/post-edit.sh': '#!/bin/sh\n# teknobu-kit pipeline: PostToolUse hook on Edit/Write/MultiEdit.\n# Type-checks and lints the edited file\'s project so errors surface immediately. Exit 2 feeds the output back to Claude.\n[ -n "$TEKNOBU_SKIP_HOOKS" ] && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\n[ -z "$file" ] && exit 0\ncase "$file" in\n  *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts) ;;\n  *) exit 0 ;;\nesac\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nout=""\nif [ -f tsconfig.json ]; then\n  tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$tsc_out" ] && out="$out\n[typecheck]\n$tsc_out"\nfi\nif [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then\n  es_out=$(timeout 60 npx --no-install eslint "$file" 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$es_out" ] && out="$out\n[lint]\n$es_out"\nfi\nif [ -n "$out" ]; then\n  printf \'%s\\n\' "Fix these before continuing (from the post-edit hook on $file):$out" >&2\n  exit 2\nfi\nexit 0\n',
-    '.claude/hooks/guard-migrations.sh': '#!/bin/sh\n# teknobu-kit pipeline: PreToolUse hook on Edit/Write/MultiEdit. Migrations are append-only.\n[ -n "$TEKNOBU_SKIP_HOOKS" ] && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\ncase "$file" in\n  *supabase/migrations/*|*supabase\\\\migrations\\\\*) ;;\n  *) exit 0 ;;\nesac\nif [ -f "$file" ]; then\n  echo "Blocked: $file is an existing migration. Migrations are append-only - create a new file under supabase/migrations/ instead. (TEKNOBU_SKIP_HOOKS=1 overrides, say why in the commit.)" >&2\n  exit 2\nfi\nexit 0\n',
-    '.claude/hooks/stop-gate.sh': '#!/bin/sh\n# teknobu-kit pipeline: Stop hook. Blocks the session from stopping while "done" is not true.\n# Checks: (1) code changed -> CHANGELOG.md changed; (2) migrations changed -> generated types changed;\n# (3) the pipeline verdict for this branch is not "blocked". Exit 2 with the reason keeps Claude working.\n[ -n "$TEKNOBU_SKIP_HOOKS" ] && exit 0\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nbranch=$(git branch --show-current 2>/dev/null)\nmain=$(python -c "import json; print((json.load(open(\'.teknobu.json\')).get(\'protected\') or [\'main\'])[0])" 2>/dev/null || echo main)\ntypes=$(python -c "import json; print(json.load(open(\'.teknobu.json\')).get(\'generated_types\') or \'src/types/database.ts\')" 2>/dev/null || echo src/types/database.ts)\n# The working tree is this session\'s work; the branch-level check (code vs changelog vs UAT across the whole PR) is CI\'s job.\nchanged=$( { git diff --name-only 2>/dev/null; git diff --name-only --cached 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u)\n[ -z "$changed" ] && exit 0\ncode=$(printf \'%s\\n\' "$changed" | grep -Ev \'^(docs/|CHANGELOG\\.md|README|\\.claude/|\\.github/|PRELIVE\\.md|STAGING\\.md|[A-Z]+\\.md|.*\\.md$)\' | grep -Ev \'^\\.(env|teknobu)\' | head -1)\nreasons=""\nif [ -n "$code" ] && ! printf \'%s\\n\' "$changed" | grep -q \'^CHANGELOG\\.md$\'; then\n  reasons="$reasons\n- Code changed but CHANGELOG.md has no entry for it. Run changelog-scribe (or /post-change)."\nfi\nif printf \'%s\\n\' "$changed" | grep -q \'^supabase/migrations/\' && ! printf \'%s\\n\' "$changed" | grep -q "^$types\\$"; then\n  reasons="$reasons\n- A migration changed but $types was not regenerated. Run the types generation command from .claude/rules/supabase.md and commit it."\nfi\nverdict=".claude/state/$branch/review.json"\nif [ -f "$verdict" ]; then\n  v=$(python -c "import json; print(json.load(open(\'$verdict\')).get(\'verdict\',\'\'))" 2>/dev/null)\n  if [ "$v" = "blocked" ]; then\n    reasons="$reasons\n- The pipeline verdict for $branch is blocked (see $verdict). Fix the blocking findings and re-run /post-change."\n  fi\nfi\nif [ -n "$reasons" ]; then\n  printf \'%s\\n\' "Not done yet:$reasons" >&2\n  exit 2\nfi\nexit 0\n',
+    '.claude/hooks/post-edit.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PostToolUse hook on Edit/Write/MultiEdit.\n# Type-checks and lints the edited file\'s project so errors surface immediately. Exit 2 feeds the output back to Claude.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\n[ -z "$file" ] && exit 0\ncase "$file" in\n  *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts) ;;\n  *) exit 0 ;;\nesac\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nout=""\nif [ -f tsconfig.json ]; then\n  tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$tsc_out" ] && out="$out\n[typecheck]\n$tsc_out"\nfi\nif [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then\n  es_out=$(timeout 60 npx --no-install eslint "$file" 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$es_out" ] && out="$out\n[lint]\n$es_out"\nfi\nif [ -n "$out" ]; then\n  printf \'%s\\n\' "Fix these before continuing (from the post-edit hook on $file):$out" >&2\n  exit 2\nfi\nexit 0\n',
+    '.claude/hooks/guard-migrations.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PreToolUse hook on Edit/Write/MultiEdit. Migrations are append-only.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\ncase "$file" in\n  *supabase/migrations/*|*supabase\\\\migrations\\\\*) ;;\n  *) exit 0 ;;\nesac\nif [ -f "$file" ]; then\n  echo "Blocked: $file is an existing migration. Migrations are append-only - create a new file under supabase/migrations/ instead. (SONELO_SKIP_HOOKS=1 overrides, say why in the commit.)" >&2\n  exit 2\nfi\nexit 0\n',
+    '.claude/hooks/stop-gate.sh': '#!/bin/sh\n# sonelo-devkit pipeline: Stop hook. Blocks the session from stopping while "done" is not true.\n# Checks: (1) code changed -> CHANGELOG.md changed; (2) migrations changed -> generated types changed;\n# (3) the pipeline verdict for this branch is not "blocked". Exit 2 with the reason keeps Claude working.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nbranch=$(git branch --show-current 2>/dev/null)\nmain=$(python -c "import json; print((json.load(open(\'.teknobu.json\')).get(\'protected\') or [\'main\'])[0])" 2>/dev/null || echo main)\ntypes=$(python -c "import json; print(json.load(open(\'.teknobu.json\')).get(\'generated_types\') or \'src/types/database.ts\')" 2>/dev/null || echo src/types/database.ts)\n# The working tree is this session\'s work; the branch-level check (code vs changelog vs UAT across the whole PR) is CI\'s job.\nchanged=$( { git diff --name-only 2>/dev/null; git diff --name-only --cached 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u)\n[ -z "$changed" ] && exit 0\ncode=$(printf \'%s\\n\' "$changed" | grep -Ev \'^(docs/|CHANGELOG\\.md|README|\\.claude/|\\.github/|PRELIVE\\.md|STAGING\\.md|[A-Z]+\\.md|.*\\.md$)\' | grep -Ev \'^\\.(env|teknobu)\' | head -1)\nreasons=""\nif [ -n "$code" ] && ! printf \'%s\\n\' "$changed" | grep -q \'^CHANGELOG\\.md$\'; then\n  reasons="$reasons\n- Code changed but CHANGELOG.md has no entry for it. Run changelog-scribe (or /post-change)."\nfi\nif printf \'%s\\n\' "$changed" | grep -q \'^supabase/migrations/\' && ! printf \'%s\\n\' "$changed" | grep -q "^$types\\$"; then\n  reasons="$reasons\n- A migration changed but $types was not regenerated. Run the types generation command from .claude/rules/supabase.md and commit it."\nfi\nverdict=".claude/state/$branch/review.json"\nif [ -f "$verdict" ]; then\n  v=$(python -c "import json; print(json.load(open(\'$verdict\')).get(\'verdict\',\'\'))" 2>/dev/null)\n  if [ "$v" = "blocked" ]; then\n    reasons="$reasons\n- The pipeline verdict for $branch is blocked (see $verdict). Fix the blocking findings and re-run /post-change."\n  fi\nfi\nif [ -n "$reasons" ]; then\n  printf \'%s\\n\' "Not done yet:$reasons" >&2\n  exit 2\nfi\nexit 0\n',
     '.claude/rules/supabase.md': '---\npaths: ["supabase/**", "src/integrations/supabase/**", "src/lib/supabase*"]\n---\n# Supabase rules\n- Migrations are append-only files under `supabase/migrations/`; never edit an existing one, never change schema in a dashboard. After any migration change regenerate types: `{GEN_TYPES}` and commit the result.\n- Every table has RLS enabled with a policy per allowed operation, scoped to the owner or tenant. No `using (true)` outside intentionally public reads.\n- `service_role` only in edge functions. Clients use the publishable/anon key.\n- Edge functions validate input, return shaped errors (no stack traces), set CORS explicitly, and read secrets from `Deno.env.get`, never from code.\n- Local development and tests point at the work-branch database or `supabase start`; never at production.\n',
-    '.github/workflows/ci-gates.yml': '# teknobu-kit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
-    '.github/pull_request_template.md': '<!-- teknobu-kit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n',
+    '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
+    '.github/pull_request_template.md': '<!-- sonelo-devkit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n',
     'docs/STATUS.md': '# STATUS - {NAME}\n\n## Now\n- <the one thing being worked on>\n\n## Done recently\n\n## Blocked\n\n## Next\n1.\n2.\n3.\n',
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
@@ -709,11 +719,11 @@ PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan
 LANDING_COMMAND_MD = '''---
 description: Open this repo's landing page - commands, agents, state, environments, docs, worklog - in the browser
 ---
-Run `python "$HOME/.claude/teknobu/repo_setup.py" landing` and report in one line that the page opened (the command prints its path). Do nothing else.
+Run `python "$HOME/.claude/sonelo/repo_setup.py" landing` and report in one line that the page opened (the command prints its path). Do nothing else.
 '''
 
 LANDING_HTML = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>{NAME} &mdash; Teknobu kit</title>
+<html lang="en"><head><meta charset="utf-8"><title>{NAME} &mdash; Sonelo</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;1,9..144,300;1,9..144,400&family=Manrope:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -750,7 +760,7 @@ footer{margin-top:40px;padding-top:18px;border-top:1px solid var(--ink);display:
 @media (max-width:900px){.page{padding:32px 22px 48px}.masthead{grid-template-columns:1fr}.lockup{text-align:left}.masthead h1{font-size:44px}section,section.third{grid-column:1/-1}.row{grid-template-columns:1fr;gap:4px}}
 </style></head><body><div class="page">
 <header class="masthead">
-  <div><div class="eyebrow">Teknobu kit &middot; v{VERSION} &middot; {WHEN}</div><h1>{NAME}</h1>
+  <div><div class="eyebrow">Sonelo Solution DevKit &middot; v{VERSION} &middot; {WHEN}</div><h1>{NAME}</h1>
   <p class="lede">Work on <code>{WORK}</code>, pull request into <code>{MAIN}</code>. Currently on <code>{BRANCH}</code>.</p></div>
   <div class="lockup"><b>{OKCOUNT}<span style="color:var(--mute);font-size:20px"> / {TOTAL}</span></b>standards in place{STATE_NOTE}</div>
 </header>
@@ -775,12 +785,12 @@ footer{margin-top:40px;padding-top:18px;border-top:1px solid var(--ink);display:
 <section class="third"><h2><span class="n">06</span>Documents</h2>{DOCS}</section>
 <section class="third"><h2><span class="n">07</span>Worklog</h2>{WORKLOG}</section>
 <section class="wide"><h2><span class="n">08</span>Escape hatches</h2>
-<div class="row"><span class="k">TEKNOBU_SKIP=1</span><span class="d">in front of a git command: hooks off for that one command</span></div>
-<div class="row"><span class="k">TEKNOBU_ALLOW_MAIN=1</span><span class="d">one direct push to {MAIN}</span></div>
-<div class="row"><span class="k">TEKNOBU_SKIP_HOOKS=1</span><span class="d">Claude Code hooks (type check, migrations guard, Stop gate) off for the session</span></div>
+<div class="row"><span class="k">SONELO_SKIP=1</span><span class="d">in front of a git command: hooks off for that one command</span></div>
+<div class="row"><span class="k">SONELO_ALLOW_MAIN=1</span><span class="d">one direct push to {MAIN}</span></div>
+<div class="row"><span class="k">SONELO_SKIP_HOOKS=1</span><span class="d">Claude Code hooks (type check, migrations guard, Stop gate) off for the session</span></div>
 <div class="row"><span class="k">.nokit &middot; .noworklog</span><span class="d">files in the repo root: no session nudge &middot; no worklog here</span></div></section>
 </div>
-<footer><span>Regenerate with <span class="mono">/landing</span>. Nothing on this page is a secret; keys live in git-ignored env files and are never shown.</span><span>Teknobu Group</span></footer>
+<footer><span>Regenerate with <span class="mono">/landing</span>. Nothing on this page is a secret; keys live in git-ignored env files and are never shown.</span><span>Sonelo &middot; Teknobu Group Ltd</span></footer>
 </div>
 <script>
 document.querySelectorAll('button.copy').forEach(function(b){b.addEventListener('click',function(){navigator.clipboard.writeText(b.getAttribute('data-copy')).then(function(){b.textContent='copied';b.classList.add('done');setTimeout(function(){b.textContent='copy';b.classList.remove('done')},1200)})})});
@@ -800,11 +810,11 @@ Gather everything before doing anything, in one message, defaults in brackets; t
 Confirm the plan in four lines, including that Supabase projects may be billable. Then run without further questions.
 
 Do, reporting each step's output:
-1. `python "$HOME/.claude/teknobu/repo_setup.py" doctor` - stop and tell the user if a login the plan needs is missing; don't work around it.
-2. `python "$HOME/.claude/teknobu/repo_setup.py" apply`. It lays down hooks, CI, {ENVDOC}, CLAUDE.md, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, add `--update-pipeline` to refresh the kit's agents, commands and hooks (backups are kept; filled-in values elsewhere are untouched). Never pass `--force` unless asked.
+1. `python "$HOME/.claude/sonelo/repo_setup.py" doctor` - stop and tell the user if a login the plan needs is missing; don't work around it.
+2. `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down hooks, CI, {ENVDOC}, CLAUDE.md, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, add `--update-pipeline` to refresh the kit's agents, commands and hooks (backups are kept; filled-in values elsewhere are untouched). Never pass `--force` unless asked.
 3. Brand: write the guidelines verbatim to `docs/BRAND.md` if given, and rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the one call-to-action colour, the off-brand list, the design lint command if any). Put the product's one-line description and voice rules into CLAUDE.md and the pipeline's ARCHITECTURE/STATUS/UAT placeholders. Take the stack from the repo, not from the guidelines; if they disagree (e.g. the document still says Lovable Cloud), say so in the summary.
 4. Fill every remaining `TODO` in the pipeline files from what is true of the repo. Ask nothing; leave a TODO only if it is genuinely unknowable.
-5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply teknobu repo standards` on `{WORK}`.
+5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply sonelo repo standards` on `{WORK}`.
 6. If wanted: `repo_setup.py protect` (requires `checks` and the pipeline's gates job). Then `supabase --create [--only {WORK}]` and `vercel --create --domain <{WORK} domain> --production-domain <prod>` as answered. Commit `.env.example` and `vercel.json` if created.
 7. `git push -u origin {WORK}`.
 8. Summary: branch model, what is enforced, what was created, DNS records outstanding, and anything that differed from the plan. Keep it short.
@@ -827,12 +837,12 @@ Ask everything in ONE message, defaults in brackets. The user can reply "default
 
 Confirm the plan in a few lines, including that the Supabase projects may be billable, and that it will run to the end without further questions. Then do all of this, reporting each step briefly:
 
-a. `python "$HOME/.claude/teknobu/repo_setup.py" doctor`. If a login the plan needs is missing, STOP and tell the user what to do; do not work around it.
+a. `python "$HOME/.claude/sonelo/repo_setup.py" doctor`. If a login the plan needs is missing, STOP and tell the user what to do; do not work around it.
 b. Create the folder. `git init -b main`. Commit nothing yet.
-c. Agents and rules FIRST: `python "$HOME/.claude/teknobu/repo_setup.py" apply`. It lays down the pipeline (agents, /post-change, stop gate, CI gates, rules, docs), the design-reviewer, `.claude/rules/design.md`, CLAUDE.md, hooks and CI before any application code exists. If brand guidelines were given: write them verbatim to `docs/BRAND.md`, rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the single call-to-action colour, the off-brand list), and put the one-line description and voice rules into CLAUDE.md. The stack comes from the plan, not from the guidelines.
+c. Agents and rules FIRST: `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down the pipeline (agents, /post-change, stop gate, CI gates, rules, docs), the design-reviewer, `.claude/rules/design.md`, CLAUDE.md, hooks and CI before any application code exists. If brand guidelines were given: write them verbatim to `docs/BRAND.md`, rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the single call-to-action colour, the off-brand list), and put the one-line description and voice rules into CLAUDE.md. The stack comes from the plan, not from the guidelines.
 d. Scaffold the chosen stack into the folder with its current official scaffolding command (check the docs if unsure; non-interactive flags; keep the existing files). For "empty", a README.md. Make sure `.gitignore` exists.
 e. `apply` again (now it detects the stack and fills the pipeline's build/test/types placeholders; it also creates `{WORK}` from `{MAIN}` and checks it out). Fill any remaining TODOs from what is true of the repo; leave none unless genuinely unknowable.
-f. Stage everything, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: scaffold <stack> with teknobu standards and pipeline` on {MAIN}, then `git checkout {WORK}` (or create it from {MAIN} if apply could not).
+f. Stage everything, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: scaffold <stack> with sonelo standards and pipeline` on {MAIN}, then `git checkout {WORK}` (or create it from {MAIN} if apply could not).
 g. `repo_setup.py github --org <org>` (add `--public` only if asked). Creates the repository, pushes {MAIN} and {WORK}, protects {MAIN} with `checks` and the pipeline's gates job.
 h. `repo_setup.py supabase --create` (plus `--org` if doctor listed more than one). Creates the database(s) per the configured strategy ({DATABASE}), runs `supabase init` if the CLI is present so the deploy workflow exists, writes the env files, sets the five GitHub secrets. Then `apply` once more so the deploy workflow is generated, and commit it.
 i. `repo_setup.py vercel --create --domain <{WORK} domain> --production-domain <production domain>`. Creates the project from the GitHub repo, binds the {WORK} domain to the {WORK} branch, pushes `.env.{WORK}` to Preview and `.env.production` to Production, prints any DNS records.
@@ -855,7 +865,7 @@ def fill(tpl, **kw):
 
 def ours(path):
     text = read(path)
-    return text is not None and MARK in text
+    return text is not None and any(m in text for m in ALL_MARKS)
 
 
 class Report:
@@ -870,7 +880,7 @@ class Report:
             action = "created"
         elif existing == text:
             action = "unchanged"
-        elif force or (owned and MARK in existing):
+        elif force or (owned and any(m in existing for m in ALL_MARKS)):
             action = "updated"
         else:
             action = "skipped (exists without kit marker; use --force to replace)"
@@ -890,7 +900,7 @@ def merge_gitignore(root, rep):
     missing = [l for l in GITIGNORE_LINES if l not in have and not l.startswith("#")]
     text = existing
     if missing:
-        text = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + "# teknobu standards\n" + "\n".join(missing) + "\n"
+        text = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + "# sonelo standards\n" + "\n".join(missing) + "\n"
     # .env.example must stay visible: a later `.env*` line (Vercel appends one) re-ignores it unless the negation comes after
     lines = text.splitlines()
     neg = [i for i, l in enumerate(lines) if l.strip() == "!.env.example"]
@@ -955,10 +965,16 @@ def env_prelive(root, rep):
 def claude_md(root, rep, update=False):
     path = root / "CLAUDE.md"
     section = fill(CLAUDE_SECTION, WORK=WORK_BRANCH, MAIN=PROTECTED[0])
-    pstart, pend = "<!-- %s:pipeline:start -->" % MARK, "<!-- %s:pipeline:end -->" % MARK
-    pipeline = pstart + "\n" + fill(PIPELINE_CLAUDE_SECTION, WORK=WORK_BRANCH, MAIN=PROTECTED[0]).rstrip("\n") + "\n" + pend + "\n"
     existing = read(path)
-    start, end = "<!-- %s:start" % MARK, "<!-- %s:end -->" % MARK
+
+    def marker(fmt):
+        for m in ALL_MARKS:
+            if existing and fmt % m in existing:
+                return fmt % m
+        return fmt % MARK
+    pstart, pend = marker("<!-- %s:pipeline:start -->"), marker("<!-- %s:pipeline:end -->")
+    pipeline = ("<!-- %s:pipeline:start -->" % MARK) + "\n" + fill(PIPELINE_CLAUDE_SECTION, WORK=WORK_BRANCH, MAIN=PROTECTED[0]).rstrip("\n") + "\n" + ("<!-- %s:pipeline:end -->" % MARK) + "\n"
+    start, end = marker("<!-- %s:start"), marker("<!-- %s:end -->")
     if existing is None:
         text, action = "# %s\n\n<one line: what this product is and who it is for>\n\n" % root.name + pipeline + "\n" + section, "created"
     else:
@@ -972,7 +988,7 @@ def claude_md(root, rep, update=False):
         else:
             if "## Change pipeline" in text and update:
                 a = text.index("## Change pipeline")
-                m = re.search(r"\n(## |<!-- %s)" % MARK, text[a + 5:])
+                m = re.search(r"\n(## |<!-- (?:%s))" % "|".join(ALL_MARKS), text[a + 5:])
                 b = a + 5 + m.start() + 1 if m else len(text)
                 text = text[:a] + text[b:]
             if start in text:
@@ -1434,7 +1450,7 @@ def cmd_apply(args):
     install_worklog(root, rep)
     created = git_setup(root, rep)
 
-    say("Teknobu standards %s%s: %s" % ("(dry run) " if args.dry_run else "", "applied to", root))
+    say("Sonelo standards %s%s: %s" % ("(dry run) " if args.dry_run else "", "applied to", root))
     say("stack: %s" % ", ".join(k for k in ("node", "supabase", "flutter", "python", "vercel") if d[k]) or "stack: (nothing detected)")
     say("checks: %s" % ("; ".join(d["checks"]) if d["checks"] else "none detected"))
     say("")
@@ -1509,7 +1525,7 @@ def cmd_nudge(args):
             if cfg.get("kit") and tuple(map(int, str(cfg["kit"]).split("."))) < tuple(map(int, VERSION.split("."))):
                 say("Teknobu standards kit v%s is installed but this repo was set up with v%s. Offer to run /repo-setup to refresh the generated files." % (VERSION, cfg["kit"]))
             return
-        say("This repo does not have the Teknobu standards (git hooks, CI, %s branch). Offer the user /repo-setup; do not apply it without asking. Add a .nokit file to the repo root to silence this." % WORK_BRANCH)
+        say("This repo does not have the Sonelo standards (git hooks, CI, %s branch). Offer the user /repo-setup; do not apply it without asking. Add a .nokit file to the repo root to silence this." % WORK_BRANCH)
     except Exception:
         return
 
@@ -2274,7 +2290,7 @@ def cmd_update(args):
     if ver == VERSION and not args.force:
         say("kit        v%s is the latest release (github.com/%s)" % (VERSION, repo))
         return
-    url, asset, _ = latest_release_asset(repo, ["teknobu-kit-v{ver}.zip", "teknobu-kit-{ver}.zip", "teknobu-kit.zip"])
+    url, asset, _ = latest_release_asset(repo, ["SoneloSolutionDevKit-v{ver}.zip", "sonelo-devkit-v{ver}.zip", "teknobu-kit-v{ver}.zip", "SoneloSolutionDevKit.zip"])
     if not url:
         sys.exit("release %s has no kit zip attached; download it from github.com/%s/releases and run install from the unzipped folder" % (tag, repo))
     import zipfile
@@ -2483,7 +2499,27 @@ def configure(args):
     return cfg
 
 
+def migrate_old_home():
+    """v3 lived in ~/.claude/teknobu; carry config, pipeline, CLIs and landing pages across once."""
+    if HOME_DIR.exists() or not OLD_HOME_DIR.exists():
+        return False
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for name in ("config.json", "pipeline", "bin", "landing"):
+        src, dst = OLD_HOME_DIR / name, HOME_DIR / name
+        if src.exists() and not dst.exists():
+            if src.is_dir():
+                shutil.copytree(str(src), str(dst))
+            else:
+                shutil.copyfile(str(src), str(dst))
+            moved.append(name)
+    if moved:
+        say("migrated   %s -> %s (%s); the old folder is untouched" % (OLD_HOME_DIR, HOME_DIR, ", ".join(moved)))
+    return True
+
+
 def cmd_install(args):
+    migrate_old_home()
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     me = Path(__file__).resolve()
     if me != INSTALLED.resolve():

@@ -1,27 +1,27 @@
-# Teknobu kit
+# Sonelo Solution DevKit
 
-Kit v3.2 · worklog v1.12. Repo standards, a complete agent pipeline, infrastructure creation and a work log for Claude Code projects. One Python file each, standard library only, Windows first.
+Kit v4.0 · worklog v1.13. Sonelo is the developer platform brand of Teknobu Group. Repo standards, a complete agent pipeline, infrastructure creation and a work log for Claude Code projects. One Python file each, standard library only, Windows first.
 
 ## Install (once per machine)
 
 Needs Python 3, git, Node.js (for the Vercel CLI and the type-check hook) and Claude Code.
 
 ```
-git clone https://github.com/TeknobuGroup/teknobu-kit
-cd teknobu-kit
+git clone https://github.com/TeknobuGroup/SoneloSolutionDevKit
+cd SoneloSolutionDevKit
 python repo_setup.py install          # or double-click install.cmd on Windows, ./install.sh on Mac/Linux
 ```
 
 Or without cloning - one line, PowerShell:
 
 ```
-iwr https://raw.githubusercontent.com/TeknobuGroup/teknobu-kit/main/repo_setup.py -OutFile "$env:TEMP\repo_setup.py"; python "$env:TEMP\repo_setup.py" install
+iwr https://raw.githubusercontent.com/TeknobuGroup/SoneloSolutionDevKit/main/repo_setup.py -OutFile "$env:TEMP\repo_setup.py"; python "$env:TEMP\repo_setup.py" install
 ```
 
 Mac/Linux:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/TeknobuGroup/teknobu-kit/main/repo_setup.py -o /tmp/repo_setup.py && python3 /tmp/repo_setup.py install
+curl -fsSL https://raw.githubusercontent.com/TeknobuGroup/SoneloSolutionDevKit/main/repo_setup.py -o /tmp/repo_setup.py && python3 /tmp/repo_setup.py install
 ```
 
 The lone file fetches the worklog from the same repository during install.
@@ -33,7 +33,7 @@ Or download the zip from the releases page and run the same from the unzipped fo
 - **The branch you work on** (default `staging`). It gets its own URL and database; `main` is production and moves only by pull request.
 - **Database strategy.** `separate` (a `<name>-<branch>` project and a `<name>` project) or `branching` (one project plus a persistent Supabase branch; Pro plan).
 
-Everything else lives in `~/.claude/teknobu/config.json`: Vercel team, domain pattern, Supabase organisation and region, default stack, brand defaults for the design contract. `install --preset teknobu` applies Teknobu's values; `install --set key=value` changes one.
+Everything else lives in `~/.claude/sonelo/config.json`: Vercel team, domain pattern, Supabase organisation and region, default stack, brand defaults for the design contract. `install --preset sonelo` applies Teknobu Group's own values (`--preset teknobu` still works); `install --set key=value` changes one.
 
 The install also downloads `gh` and the Supabase CLI into its own folder, installs the Vercel CLI with npm, and runs the three browser logins. `repo_setup.py doctor` shows what's present, never the values.
 
@@ -57,14 +57,18 @@ In Claude Code, in any repo or empty folder: `/repo-setup`. It asks whether this
 
 ## Escape hatches
 
-`TEKNOBU_SKIP=1` in front of a git command disables the hooks once. `TEKNOBU_ALLOW_MAIN=1` allows one direct push. `.nokit` in a repo silences the session-start nudge; `.noworklog` opts a repo out of the work log.
+`SONELO_SKIP=1` in front of a git command disables the hooks once. `SONELO_ALLOW_MAIN=1` allows one direct push. (The older `TEKNOBU_*` names still work.) `.nokit` in a repo silences the session-start nudge; `.noworklog` opts a repo out of the work log.
 
 ## Update
 
-`python ~/.claude/teknobu/repo_setup.py update` fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `apply --update-pipeline` in a repo refreshes its agents, commands and hooks with backups.
+`python ~/.claude/sonelo/repo_setup.py update` fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `apply --update-pipeline` in a repo refreshes its agents, commands and hooks with backups.
 
 Windows is the first-class platform (installer, Credential Manager, scheduled presence stamps). The kit and the pipeline also run on Mac and Linux; the presence stamps don't.
 
 ## Before you rely on it
 
 This creates billable resources on your Supabase and Vercel accounts and reads your Claude Code transcripts (and, with ActivityWatch, window titles) for the work log, all on your own machine. Read what a command will do before you run it on a client's account. MIT licence, no warranty.
+
+## Upgrading from teknobu-kit v3
+
+Run `install` once; it migrates `~/.claude/teknobu` (config, pipeline, CLIs) to `~/.claude/sonelo` and leaves the old folder untouched. Repos keep every file they have - the kit recognises its earlier `teknobu-kit` markers as its own - and `apply --update-pipeline` refreshes them under the new name. `.teknobu.json` keeps its filename, and the old `TEKNOBU_*` escape hatches keep working.

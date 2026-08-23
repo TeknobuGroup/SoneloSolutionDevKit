@@ -59,7 +59,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.12"
+VERSION = "1.13"
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -74,9 +74,7 @@ PRESENCE_ON = {"logon", "unlock"}               # only a person opens an interva
 PRESENCE_OFF = {"lock", "logoff", "shutdown", "sleep"}
 PRESENCE_ALL = PRESENCE_ON | PRESENCE_OFF | {"boot", "wake"}
 
-DEFAULT_POT = r"C:\Users\AccountA\Worklog"
-if os.name != "nt" or not Path(DEFAULT_POT).parent.is_dir():   # another machine or profile: ~/Worklog
-    DEFAULT_POT = str(Path("~/Worklog").expanduser())
+DEFAULT_POT = str(Path("~/Worklog").expanduser())   # one pot per machine; change it in ~/.claude/worklog.json ("pot")
 
 
 # ----------------------------------------------------------------------------- small helpers

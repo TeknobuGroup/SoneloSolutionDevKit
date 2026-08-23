@@ -1,4 +1,4 @@
-# Worklog agent · v1.12 (part of the Teknobu kit v3.1)
+# Worklog agent · v1.13 (part of the Sonelo Solution DevKit v4.0)
 
 Installed and updated through the kit: `python repo_setup.py install` does the machine setup, `/repo-setup` or `apply` puts it in a repo. The rest of this file is the reference.
 
