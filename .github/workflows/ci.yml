@@ -4,8 +4,8 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  compile:
-    name: compile
+  checks:
+    name: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
