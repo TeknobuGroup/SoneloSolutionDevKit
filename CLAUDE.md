@@ -60,7 +60,7 @@ Every change goes through: plan -> implement -> review -> test -> verdict -> doc
 - Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user.
 <!-- sonelo-devkit:pipeline:end -->
 
-<!-- sonelo-devkit:start v4.0 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:start v4.1 (managed by repo_setup.py; edit outside these markers) -->
 ## Sonelo standards
 
 **Branches.** Work on `prelive`; it deploys to its own URL and database. `main` is production and only changes through a pull request from `prelive` (`gh pr create --base main --head prelive --fill`). Never push to `main` directly and never force-push `prelive` or `main`. If you find yourself on `main` with uncommitted work, switch to `prelive` first.

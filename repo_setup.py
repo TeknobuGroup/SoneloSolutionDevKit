@@ -58,7 +58,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.0"
+VERSION = "4.1"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -128,8 +128,8 @@ def use_repo_config(root):
     """A repo set up with other branch names keeps them (e.g. prelive) whatever the machine config says now."""
     global WORK_BRANCH, PROTECTED
     rc = read_json(root / ".teknobu.json", {}) if root else {}
-    if rc.get("work_branch"):
-        WORK_BRANCH = rc["work_branch"]
+    if rc.get("work_branch") and re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]*\Z", str(rc["work_branch"])):
+        WORK_BRANCH = str(rc["work_branch"])   # option-shaped values from a cloned repo's config never reach git argv
     if rc.get("protected"):
         PROTECTED = list(rc["protected"])
 
@@ -703,6 +703,7 @@ BUILTIN_PIPELINE = {
     '.claude/agents/docs-maintainer.md': '---\nname: docs-maintainer\ndescription: Keeps docs/STATUS.md current and updates docs/ARCHITECTURE.md when the shape of the system changed. Use at the end of a work block. Haiku; formatting work. Writes only under docs/.\nmodel: haiku\ntools: Read, Edit, Write, Grep, Glob, Bash(git diff:*), Bash(git log:*)\n---\n\nYou keep two documents truthful, editing nothing else.\n\n- `docs/STATUS.md`: what is being worked on now, what was finished in this block (one line each, dated), what is blocked and on whom, the next three things. Delete what is stale; keep it to one screen.\n- `docs/ARCHITECTURE.md`: only when the diff adds or removes a service, table, edge function, integration, route group, or environment variable. Update the relevant section; never rewrite the document.\n\nReport what you changed in two lines.\n',
     '.claude/commands/post-change.md': '---\ndescription: Run the change pipeline on the current work block - parallel review, fix loop (max 2), tests, verdict, docs. Once per block, not per edit.\n---\nRun the pipeline on everything changed since the last commit on this branch (plus any uncommitted work). Do not ask questions; report each stage in a line or two.\n\n1. **Tier.** Decide fast lane or full pipeline per CLAUDE.md. Say which and why in one line.\n2. **Review, in parallel.** Launch `code-reviewer` and `security-reviewer` together (and `design-reviewer` if anything under the UI changed). Wait for all three.\n3. **Fix loop.** Fix every finding marked *blocks the task* or *hurts the task*. Re-run only the reviewer(s) that reported them. At most two rounds; if a blocker survives two rounds, stop and ask the user with the finding quoted.\n4. **Tests.** Run `test-writer` for the changed behaviour (and the failing-test-first rule for any bug fix), then `test-runner`. Red means fix and re-run; same two-round cap.\n5. **Verdict.** Write `.claude/state/<branch>/review.json`: `{"branch": "...", "at": "<ISO time>", "verdict": "clear" | "blocked", "blocking": ["..."], "reviewers": {"code": "clear|blocked", "security": "clear|blocked", "design": "clear|blocked|skipped"}, "tests": "green|red"}`. The Stop gate reads it.\n6. **Tail, in parallel.** `changelog-scribe` and `docs-maintainer` together. Then, if this block is heading for a pull request, `uat-writer`.\n7. **Summary.** Five lines: tier, findings fixed, tests, what is in the changelog, what is still open.\n\nRules: reviewers never edit; only the lead (you) and test-writer write. Never weaken a test to pass it. Never print secrets or env values.\n',
     '.claude/commands/design-pass.md': "---\ndescription: Design-led polish of a screen within the design contract - applies the design-reviewer's polish and consistency findings in the fast lane; leaves anything that blocks or hurts the task for a human.\nargument-hint: <screen or component path>\n---\nRun `design-reviewer` on $ARGUMENTS (or on the screens touched since the last commit if no argument).\n\nThen, in the fast lane and without asking:\n- Apply every finding marked **polish** or **inconsistency**: spacing, hierarchy by size/weight/space, empty/loading/error states, reuse of the existing component for the same job, tokens instead of literals, accessible names, focus rings.\n- Do not touch data flow, contracts, handlers, or logic. If a finding needs any of those, leave it and list it.\n- Do not apply findings marked **blocks the task** or **hurts the task**; list them for the user with the reviewer's wording.\n\nRe-run `design-reviewer` once on the result. Report: what was applied (file:line), what was left and why, and the screens a human should open to see the result. Commit message if asked: `style: design pass on <screen>`.\n",
+    '.claude/commands/worktree.md': '---\ndescription: Manage git worktrees for parallel sessions - new <branch> creates a sibling worktree wired for the worklog, list shows state, clean removes merged ones\nargument-hint: new <branch> | list | clean\n---\nRun `python "$HOME/.claude/sonelo/repo_setup.py" worktree $ARGUMENTS` from the repo root (default to `list` when no argument was given) and relay its output plainly.\n- `new <branch>`: report the created path and tell the user to open their next Claude Code session there; the worklog is pre-stamped to report under this repo\'s project.\n- `clean`: a "kept" line is information for the user - uncommitted work, or a branch git cannot prove merged (squash merges look unmerged). Never force-remove a worktree and never delete branches to make clean succeed.\n',
     '.claude/commands/pr.md': '---\ndescription: Create the pull request for this branch into production - pipeline verdict must be clear, UAT document required, PR body is the UAT document.\n---\n1. Confirm `.claude/state/<branch>/review.json` exists with `"verdict": "clear"` and `"tests": "green"` from this branch\'s latest work. If not, run `/post-change` first.\n2. Run `uat-writer` if `docs/uat/` has no document for this branch dated today. Commit it: `docs: UAT for <branch>`.\n3. Push the branch. Create the PR with `gh pr create --base <production branch> --head <branch> --title "<conventional summary>" --body-file docs/uat/<the document>`. Add the changelog lines under a "## Changes" heading in the body if the PR template asks for them.\n4. Report the PR URL, the gates that must pass, and the UAT document path. Never print secrets.\n',
     '.claude/hooks/post-edit.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PostToolUse hook on Edit/Write/MultiEdit.\n# Type-checks and lints the edited file\'s project so errors surface immediately. Exit 2 feeds the output back to Claude.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\n[ -z "$file" ] && exit 0\ncase "$file" in\n  *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts) ;;\n  *) exit 0 ;;\nesac\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nout=""\nif [ -f tsconfig.json ]; then\n  tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$tsc_out" ] && out="$out\n[typecheck]\n$tsc_out"\nfi\nif [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then\n  es_out=$(timeout 60 npx --no-install eslint "$file" 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$es_out" ] && out="$out\n[lint]\n$es_out"\nfi\nif [ -n "$out" ]; then\n  printf \'%s\\n\' "Fix these before continuing (from the post-edit hook on $file):$out" >&2\n  exit 2\nfi\nexit 0\n',
     '.claude/hooks/guard-migrations.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PreToolUse hook on Edit/Write/MultiEdit. Migrations are append-only.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\ncase "$file" in\n  *supabase/migrations/*|*supabase\\\\migrations\\\\*) ;;\n  *) exit 0 ;;\nesac\nif [ -f "$file" ]; then\n  echo "Blocked: $file is an existing migration. Migrations are append-only - create a new file under supabase/migrations/ instead. (SONELO_SKIP_HOOKS=1 overrides, say why in the commit.)" >&2\n  exit 2\nfi\nexit 0\n',
@@ -2371,6 +2372,145 @@ def frontmatter(path):
     return out
 
 
+# ----------------------------------------------------------------------------- worktrees
+
+def wt_dirname(repo_name, branch):
+    """Folder name for a worktree: <repo>-wt-<branch>, sanitised (slashes and odd characters become dashes)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-.") or "branch"
+    return "%s-wt-%s" % (repo_name, safe)
+
+
+def wt_list(root):
+    """Worktrees from `git worktree list --porcelain`: [{path, branch, main}]; git lists the main worktree first."""
+    out = sh(["git", "-C", str(root), "worktree", "list", "--porcelain"])
+    items, cur = [], {}
+    for line in (out.stdout or "").splitlines() + [""]:
+        if not line.strip():
+            if cur:
+                items.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("branch "):
+            b = line[len("branch "):]
+            cur["branch"] = b[len("refs/heads/"):] if b.startswith("refs/heads/") else b
+        elif line == "detached":
+            cur["branch"] = None
+    for i, it in enumerate(items):
+        it["main"] = (i == 0)
+    return items
+
+
+def wt_state(root, wt):
+    """(dirty, merged-into-the-work-branch) for one worktree. Squash-merged branches read as not merged.
+    Refs are fully qualified so a tag sharing the branch's name cannot shadow it."""
+    dirty = bool((sh(["git", "-C", wt["path"], "status", "--porcelain"]).stdout or "").strip())
+    merged = bool(wt.get("branch")) and sh(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor",
+         "refs/heads/%s" % wt["branch"], "refs/heads/%s" % WORK_BRANCH]).returncode == 0
+    return dirty, merged
+
+
+def git_tip(root, ref):
+    out = sh(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", ref])
+    return (out.stdout or "").strip() if out.returncode == 0 else None
+
+
+def cmd_worktree(args):
+    root = repo_root(args.repo)
+    if not root:
+        sys.exit("not inside a git repository")
+    use_repo_config(root)
+    if args.verb == "new":
+        if not args.branch:
+            sys.exit("usage: worktree new <branch>")
+        wts = wt_list(root)
+        if not wts:
+            sys.exit("git worktree list failed - git 2.7+ is required")
+        main_wt = Path(wts[0]["path"])             # naming and placement follow the main worktree, wherever this runs from
+        dest = main_wt.parent / wt_dirname(main_wt.name, args.branch)
+        if dest.exists():
+            sys.exit("%s already exists - open your session there, or pick another branch name" % dest)
+        have_branch = sh(["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+                          "refs/heads/%s" % args.branch]).returncode == 0
+        have_work = sh(["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+                        "refs/heads/%s" % WORK_BRANCH]).returncode == 0
+        cmd = ["git", "-C", str(root), "worktree", "add", str(dest)]
+        cmd += [args.branch] if have_branch else (["-b", args.branch] + ([WORK_BRANCH] if have_work else []))
+        out = sh(cmd)
+        if out.returncode != 0:
+            sys.exit((out.stderr or out.stdout or "git worktree add failed").strip())
+        project = read_json(main_wt / ".worklog" / "worklog.json", {}).get("project") or main_wt.name
+        write(dest / ".worklog" / "worklog.json", json.dumps({"project": project}, indent=2) + "\n")
+        ex = sh(["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"])
+        if ex.returncode == 0 and ex.stdout.strip():   # shared across worktrees: keep the stamp from reading as dirt in repos without the kit's .gitignore
+            p = Path(ex.stdout.strip())
+            p = p if p.is_absolute() else root / p
+            try:
+                cur = p.read_text(encoding="utf-8") if p.exists() else ""
+                if ".worklog/" not in cur:
+                    write(p, cur.rstrip("\n") + ("\n" if cur else "") + ".worklog/\n")
+            except OSError:
+                pass
+        say("%-10s %s" % ("worktree", dest))
+        say("%-10s %s%s" % ("branch", args.branch, "" if have_branch else (" (new, off %s)" % (WORK_BRANCH if have_work else "HEAD"))))
+        say('%-10s reports under project "%s" (repo column shows the folder name)' % ("worklog", project))
+        say("%-10s open your Claude Code session in %s; the worklog installs itself at session start" % ("next", dest))
+        return
+    work_tip = git_tip(root, "refs/heads/%s" % WORK_BRANCH)
+    if args.verb == "list":
+        for wt in wt_list(root):
+            if wt["main"]:
+                say("%s  %s  (main worktree)" % (wt["path"], wt.get("branch") or "detached"))
+                continue
+            if not Path(wt["path"]).exists():
+                say("%s  %s  · directory gone (run worktree clean)" % (wt["path"], wt.get("branch") or "detached"))
+                continue
+            dirty, merged = wt_state(root, wt)
+            fresh = merged and work_tip and git_tip(root, "refs/heads/%s" % wt["branch"]) == work_tip
+            say("%s  %s%s%s" % (wt["path"], wt.get("branch") or "detached",
+                                "  · uncommitted changes" if dirty else "",
+                                "  · no commits yet" if fresh else (("  · merged into %s" % WORK_BRANCH) if merged
+                                                                    else ("  · not merged into %s" % WORK_BRANCH))))
+        return
+    removed = kept = 0
+    for wt in wt_list(root):
+        if wt["main"]:
+            continue
+        if not Path(wt["path"]).exists():
+            say("%-10s %s - directory already gone; stale record pruned" % ("removed", wt["path"]))
+            removed += 1
+            continue
+        dirty, merged = wt_state(root, wt)
+        if dirty:
+            say("%-10s %s - uncommitted changes (commit or stash there, then re-run clean)" % ("kept", wt["path"]))
+            kept += 1
+            continue
+        if not wt.get("branch"):
+            say('%-10s %s - detached HEAD; remove by hand: git worktree remove "%s"' % ("kept", wt["path"], wt["path"]))
+            kept += 1
+            continue
+        if not merged:
+            if work_tip is None:
+                reason = "the work branch %s has no local ref here, so merges cannot be proven" % WORK_BRANCH
+            else:
+                reason = ('%s is not merged into %s (a squash merge looks unmerged; remove by hand: git worktree remove "%s")'
+                          % (wt["branch"], WORK_BRANCH, wt["path"]))
+            say("%-10s %s - %s" % ("kept", wt["path"], reason))
+            kept += 1
+            continue
+        fresh = work_tip and git_tip(root, "refs/heads/%s" % wt["branch"]) == work_tip
+        out = sh(["git", "-C", str(root), "worktree", "remove", wt["path"]])
+        if out.returncode == 0:
+            say("%-10s %s - %sbranch %s kept" % ("removed", wt["path"], "no commits yet; " if fresh else "", wt["branch"]))
+            removed += 1
+        else:
+            say("%-10s %s - %s" % ("kept", wt["path"], (out.stderr or "").strip()))
+            kept += 1
+    sh(["git", "-C", str(root), "worktree", "prune"])
+    say("%d removed, %d kept" % (removed, kept))
+
+
 def cmd_landing(args):
     import html
     import webbrowser
@@ -2682,6 +2822,11 @@ def main():
     p.add_argument("--repo")
     p.add_argument("--no-open", action="store_true")
     p.set_defaults(fn=cmd_landing)
+    p = sub.add_parser("worktree", help="git worktrees for parallel sessions: new <branch> | list | clean (removes merged, keeps dirty)")
+    p.add_argument("verb", choices=["new", "list", "clean"])
+    p.add_argument("branch", nargs="?", help="branch for 'new'; created off the work branch if it doesn't exist")
+    p.add_argument("--repo")
+    p.set_defaults(fn=cmd_worktree)
     p = sub.add_parser("update", help="fetch the latest kit release from GitHub and install it (config kept)")
     p.add_argument("--force", action="store_true", help="reinstall even if already on the latest version")
     p.add_argument("--no-cli", action="store_true")

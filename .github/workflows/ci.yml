@@ -13,6 +13,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m py_compile repo_setup.py worklog_agent.py
+      - run: python -m unittest discover -s tests
       - run: python repo_setup.py --help > /dev/null && python worklog_agent.py --help > /dev/null
       - name: Install to a temporary home (neutral defaults, no CLIs, no logins)
         run: HOME=$RUNNER_TEMP/h python repo_setup.py install --yes --no-cli --no-login --no-presence
