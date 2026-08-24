@@ -51,3 +51,34 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 | UAT-45 | Unit tests — version parsing and comparison | Run VersionOfTests | All test methods pass; version_of() reads VERSION line correctly; tuple comparison ranks versions |
 | UAT-46 | Unit tests — upgrade guard comparison | Run UpgradeGuardComparisonTests | All test methods pass; upgrade logic: newer > current (adopt), equal (no-op), older < current (no downgrade) |
 | UAT-47 | .githooks/checks includes v1.15 unit tests | Run `.githooks/checks` | Script completes successfully; python -m unittest passes with 75 tests; py_compile passes |
+| UAT-48 | worktree new — directory created | Run `python repo_setup.py worktree new <branch>` in a repo | Directory <repo>-wt-<branch> is created as a sibling of the repo |
+| UAT-49 | worktree new — branch checked out | Create a worktree with new branch, check HEAD | Worktree is on the requested branch |
+| UAT-50 | worktree new — existing branch reused | Create a worktree on a branch that already exists | Worktree is created on the existing branch with all prior commits |
+| UAT-51 | worktree new — branch sanitisation | Create a worktree with branch name containing slashes or special characters | Directory name has branch name sanitised: slashes become dashes, weird chars collapse to one dash |
+| UAT-52 | worktree new — worklog stamped with parent project | Create a worktree, check .worklog/worklog.json | File contains {"project": "<repo-name>"} by default |
+| UAT-53 | worktree new — worklog inherits parent project name | Parent repo has .worklog/worklog.json with custom project name; create a worktree | Worktree's .worklog/worklog.json inherits the parent's project name |
+| UAT-54 | worktree new — info/exclude updated to share .worklog/ | Create a worktree in a kit-standardised repo | .git/info/exclude contains ".worklog/" to keep worktree's .worklog/ from reading as dirty |
+| UAT-55 | worktree new — duplicate branch fails gracefully | Try to create two worktrees with the same branch name | Second attempt exits with error message mentioning the directory already exists |
+| UAT-56 | worktree list — main worktree flagged and shown first | Run `python repo_setup.py worktree list` | First line shows main worktree marked "(main worktree)" |
+| UAT-57 | worktree list — fresh worktree marked "no commits yet" | Create a worktree with a new branch, make no commits | List shows "no commits yet" for the worktree |
+| UAT-58 | worktree list — merged worktree shown as merged | Create a worktree, commit in it, merge into work branch, run list | Worktree shows "merged into work" |
+| UAT-59 | worktree list — unmerged worktree shown as unmerged | Create a worktree, commit in it, do NOT merge into work branch, run list | Worktree shows "not merged into work" |
+| UAT-60 | worktree list — dirty worktree shown as uncommitted changes | Create a worktree and add an untracked file without staging or committing | List shows "uncommitted changes" |
+| UAT-61 | worktree list — missing directory shown as stale | Create a worktree, manually delete its directory, run list | List shows "directory gone (run worktree clean)" |
+| UAT-62 | worktree clean — removes merged+clean worktrees | Create merged+clean and dirty worktrees, run clean | Merged worktree is removed; dirty one is kept with reason |
+| UAT-63 | worktree clean — keeps unmerged worktrees | Create an unmerged worktree, run clean | Worktree is kept with "not merged into work" message |
+| UAT-64 | worktree clean — keeps dirty worktrees | Create a dirty worktree, run clean | Worktree is kept with "uncommitted changes" message |
+| UAT-65 | worktree clean — prunes stale records | Create a worktree, delete its directory, run clean | Output shows "stale record pruned"; worktree no longer appears in list |
+| UAT-66 | worktree clean — never deletes branches | Clean a merged+clean worktree, verify the branch survives | Branch still exists in git; output says "branch <name> kept" |
+| UAT-67 | worktree clean — leaves main worktree untouched | Run clean from the main worktree | Main worktree is not removed or altered |
+| UAT-68 | worktree clean — detached worktrees kept with reason | Create a detached worktree, run clean | Worktree is kept with message about detached HEAD; remove-by-hand instruction provided |
+| UAT-69 | worktree clean — squash-merged branches kept with note | Create a worktree, squash-merge into work, run clean | Worktree is kept with "not merged into work" message (safe: branch survives) |
+| UAT-70 | worktree clean — tag shadowing branch name does not fool merge check | Create branch "feat", commit on it, create tag "feat" at work's tip, run clean | Worktree is kept as "not merged" (tag does not shadow branch in merge check) |
+| UAT-71 | worklog v1.16 — install in main repo succeeds | Copy worklog_agent.py into a repo .worklog/ and run install | post-commit hook is written to .git/hooks/ without error |
+| UAT-72 | worklog v1.16 — install in linked worktree succeeds | Create a linked worktree, copy worklog_agent.py, run install | post-commit hook lands in the shared hooks directory; no OSError raised |
+| UAT-73 | worklog v1.16 — commit hook fires in worktree | Create a worktree with worklog installed, make a commit | Post-commit hook runs without error; agent.log shows session was logged |
+| UAT-74 | /worktree command in kit pipeline | Apply kit standards to a repo, check .claude/commands/worktree.md | File exists with description of worktree command (new, list, clean verbs) |
+| UAT-75 | Unit tests — repo_setup worktree functions | Run `python -m unittest tests.test_repo_setup_worktree` | All tests pass (wt_dirname, wt_list, wt_state, cmd_worktree) |
+| UAT-76 | Unit tests — worklog worktree hook install | Run `python -m unittest tests.test_worklog_worktree` | Both tests pass (install in main repo and in linked worktree) |
+| UAT-77 | .githooks/checks includes worktree tests | Run `.githooks/checks` | Script passes; python -m unittest discover runs all tests including worktree (98 total); py_compile passes |
+| UAT-78 | Kit repo scenario — worktree new/list/clean on this kit repo | Create a worktree on the kit repo, make commits, merge, clean | Worktree creation, listing, and cleanup work as expected on the kit repo itself |

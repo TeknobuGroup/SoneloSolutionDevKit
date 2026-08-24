@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-worklog_agent.py  (v1.15)  -  per-repo work reporter for Claude Code
+worklog_agent.py  (v1.16)  -  per-repo work reporter for Claude Code
 
 Lives at <repo>/.worklog/worklog_agent.py. Claude Code hooks run it at the start and end of every
 session in this repo, and after each response (throttled). Each run:
@@ -60,9 +60,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.15"
-WHATS_NEW = "agent usage grouped by project with friendly team names; the worklog now upgrades itself mid-session and announces what's new"
-WHATS_NEW_SHORT = "per-project agent usage with friendly names; self-upgrading"   # header strip only; keep under ~60 chars
+VERSION = "1.16"
+WHATS_NEW = "works inside git worktrees; agent usage grouped by project with friendly team names; self-upgrades mid-session"
+WHATS_NEW_SHORT = "worktree support; per-project agents; self-upgrading"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -2048,8 +2048,22 @@ def hooks_installed(root):
     return found
 
 
+def git_dir_path(root, rel):
+    """Worktree-safe path under the repo's git dir (in a worktree, .git is a pointer file, not a directory)."""
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-path", rel],
+                             **NOWIN, capture_output=True, text=True, timeout=15)
+        if out.returncode == 0 and out.stdout.strip():
+            p = Path(out.stdout.strip())
+            return p if p.is_absolute() else root / p
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return root / ".git" / rel
+
+
 def install_git_hook(root):
-    hook = root / ".git" / "hooks" / "post-commit"
+    hook = git_dir_path(root, "hooks/post-commit")
+    hook.parent.mkdir(parents=True, exist_ok=True)
     py = python_for_hooks()
     line = '"%s" "$(git rev-parse --show-toplevel)/.worklog/worklog_agent.py" run --event post-commit >/dev/null 2>&1 &' % py
     if hook.exists():
@@ -2069,7 +2083,7 @@ def install_git_hook(root):
 
 def exclude_locally(root, rel):
     """Hide a path from git for this clone only (.git/info/exclude), without touching the shared .gitignore."""
-    ex = root / ".git" / "info" / "exclude"
+    ex = git_dir_path(root, "info/exclude")
     try:
         ex.parent.mkdir(parents=True, exist_ok=True)
         text = ex.read_text(encoding="utf-8") if ex.exists() else ""
@@ -2396,7 +2410,7 @@ def cmd_presence(args):
 def cmd_uninstall(args):
     root = repo_root()
     removed = remove_hooks(root)
-    hook = root / ".git" / "hooks" / "post-commit"
+    hook = git_dir_path(root, "hooks/post-commit")
     if hook.exists() and MARK in hook.read_text(encoding="utf-8", errors="replace"):
         lines = [l for l in hook.read_text(encoding="utf-8", errors="replace").splitlines() if MARK not in l]
         if len([l for l in lines if l.strip() and not l.startswith("#!")]) == 0:
