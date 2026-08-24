@@ -28,3 +28,26 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 | UAT-22 | Status and docs structure | Verify docs structure: STATUS.md, ARCHITECTURE.md, UAT_PLAN.md, decisions/, etc. | All files/directories exist and are readable |
 | UAT-23 | CLAUDE.md conventions | Open CLAUDE.md and verify content | Contains Session start, Commands, Conventions, Where knowledge lives sections |
 | UAT-24 | .teknobu.json config | Open .teknobu.json | Valid JSON; project metadata present; ignored by git |
+| UAT-25 | Self-upgrade from older pot binary | Run v1.15 repo agent against v1.14 pot binary; check pot bin upgrades and log records it | Pot binary is atomically replaced; agent.log shows "self-upgrade 1.14 -> 1.15" |
+| UAT-26 | Refuse to adopt a corrupt pot binary | Corrupt the pot binary's tail while keeping VERSION line; run agent | Agent detects version but fails to parse/import corrupted file, logs "self-upgrade skipped" with traceback, continues using repo copy |
+| UAT-27 | No upgrade if versions are equal | Run agent when pot binary and repo copy are both v1.15 | No "self-upgrade" message logged; version check skips upgrade |
+| UAT-28 | No downgrade if pot binary is older | Run v1.15 agent against v1.13 pot binary | Version check prevents downgrade; no upgrade attempted |
+| UAT-29 | Atomic write: concurrent reads during upgrade | Background process loops reading pot binary while agent upgrades it | All reads succeed without corruption; pot transitions cleanly from old to new version |
+| UAT-30 | Session-start message on first install (new repo) | Run install command in a repo with no .worklog/ | Stdout prints "Worklog agent v1.15 installed in this repo; it now reports to <pot>." |
+| UAT-31 | Session-start message on upgrade (bootstrap) | Run install on a repo with older v1.14 .worklog/agent | Stdout prints "Worklog agent upgraded v1.14 to v1.15 in this repo - new: <WHATS_NEW>" |
+| UAT-32 | Dashboard header: 7-day what's-new window | Render with fresh version state, check dashboard meta line for "· worklog v1.15 · new: ..." | Meta line includes version and what's-new note; hand-edit first_render 8 days back and re-render to see note expire |
+| UAT-33 | Dashboard header: version marker persists after expiration | After what's-new expires, check dashboard meta line | Meta line shows "· worklog v1.15" without "new: ..." suffix (version remains, note is gone) |
+| UAT-34 | Morning page: 3-day what's-new window | Render with fresh version state and check morning.html for upgrade announcement | Announcement appears ("Worklog upgraded to v1.15 — ..."); hand-edit first_render 4 days back to see it expire |
+| UAT-35 | What's-new state: version mismatch restamps the clock | Set .whats-new.json to v1.14, render with v1.15 agent | File restamps to current version and time: {"version": "1.15", "first_render": "<now>"} |
+| UAT-36 | What's-new state: equal version with no recorded date restamps once | Set .whats-new.json to {"version": "1.15"} with no first_render, render twice | First render adds first_render timestamp; second render does not change it |
+| UAT-37 | What's-new state: older agent does not reset the clock | Set .whats-new.json to v1.15 with a recorded date, run older v1.14 agent render | File unchanged; older version check prevents restamp (shared-pot safety) |
+| UAT-38 | What's-new state: malformed JSON is recovered | Set .whats-new.json to invalid JSON, run render | Render succeeds; file is overwritten with valid JSON |
+| UAT-39 | What's-new state: nonexistent pot/.whats-new.json on first render | Create test pot with no .whats-new.json, run render | File is created with {"version": "1.15", "first_render": "<render-time>"}; what's-new content appears in dashboard and morning page |
+| UAT-40 | Unit tests — all 75 pass | Run `python -m unittest discover -s tests` | Output shows "Ran 75 tests" and "OK" (no FAIL or ERROR lines) |
+| UAT-41 | Unit tests — what's-new note tests | Run WhatsNewNoteTests | All test methods pass (includes: missing state file, custom text, old/equal/fresh versions, malformed state) |
+| UAT-42 | Unit tests — what's-new constants | Run WhatsNewConstantsTests | All test methods pass; WHATS_NEW and WHATS_NEW_SHORT are nonempty, single-line, within 80 chars |
+| UAT-43 | Unit tests — render restamp logic | Run RenderRestampTests | All test methods pass; end-to-end render tests verify version bump, equal version, and older agent clock safety |
+| UAT-44 | Unit tests — dashboard payload | Run DashboardDataVersionTests | All test methods pass; payload embeds "version" and "whats_new" fields with correct values |
+| UAT-45 | Unit tests — version parsing and comparison | Run VersionOfTests | All test methods pass; version_of() reads VERSION line correctly; tuple comparison ranks versions |
+| UAT-46 | Unit tests — upgrade guard comparison | Run UpgradeGuardComparisonTests | All test methods pass; upgrade logic: newer > current (adopt), equal (no-op), older < current (no downgrade) |
+| UAT-47 | .githooks/checks includes v1.15 unit tests | Run `.githooks/checks` | Script completes successfully; python -m unittest passes with 75 tests; py_compile passes |
