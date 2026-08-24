@@ -1,19 +1,33 @@
-"""Unit tests for the v1.14 changes to worklog_agent.py.
+"""Unit tests for the v1.14 and v1.15 changes to worklog_agent.py.
 
-Covers:
+v1.14 coverage:
   - agent_name_map(cfg): built-in names merged with cfg["agent_names"] overrides,
     sanitisation, malformed-config tolerance, no mutation of the module constant.
   - build_report(): the per-project "Agents and commands" table (friendly names,
     bold project totals, wall-time ordering, unknown ids, agent-less sessions).
   - dashboard_data(): embeds the merged agent-name map in the payload.
 
-Stdlib only; hermetic: nothing is read or written outside the repo (build_report
-and agent_name_map touch no files; dashboard_data is given a pot path that does
-not exist, which its glob tolerates).
+v1.15 coverage:
+  - whatsnew_note(pot, days, text): every state-file shape (missing, malformed,
+    non-dict, version mismatch, fresh/old/unparsable first_render), the default
+    text, and the WHATS_NEW / WHATS_NEW_SHORT constants.
+  - render(): the .whats-new.json restamp rules, exercised end to end against a
+    temp pot holding one minimal slice (older version restamps, newer never,
+    equal only when the recorded date is unreadable).
+  - dashboard_data(): the new "version" / "whats_new" payload fields and the
+    default when the new parameter is omitted.
+  - version_of() and the tuple comparison the cmd_run self-upgrade guard relies on.
+
+Stdlib only; hermetic: nothing is read or written outside the repo or per-test
+temp dirs (never ~/Worklog or ~/.claude); the render tests point wa.LOG into
+their temp pot for the duration of the test.
 Run from the repo root with:  python -m unittest discover -s tests
 """
 
+import json
+import shutil
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -217,6 +231,238 @@ class DashboardDataAgentNamesTests(unittest.TestCase):
         cfg = dict(CFG, agent_names={"code-reviewer": "Custom Carl"})
         data = wa.dashboard_data([], [], cfg, MISSING_POT)
         self.assertEqual(data["agent_names"]["code-reviewer"], "Custom Carl")
+
+
+# ---------------------------------------------------------------------------- v1.15 helpers
+
+def make_temp_dir(testcase, prefix="worklog-test-"):
+    """A per-test temp dir, removed on cleanup; nothing outside it is touched."""
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    testcase.addCleanup(shutil.rmtree, str(d), ignore_errors=True)
+    return d
+
+
+def write_state(pot, content):
+    """Write <pot>/.whats-new.json; dicts are serialised, strings written verbatim
+    so tests can plant malformed JSON."""
+    p = Path(pot) / ".whats-new.json"
+    p.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+    return p
+
+
+def iso_ago(**kwargs):
+    return (datetime.now(TZ) - timedelta(**kwargs)).isoformat()
+
+
+class WhatsNewNoteTests(unittest.TestCase):
+    """whatsnew_note(pot, days, text=None) against .whats-new.json fixtures in a temp pot."""
+
+    def setUp(self):
+        self.pot = make_temp_dir(self, "worklog-test-pot-")
+
+    def test_missing_state_file_returns_the_default_whats_new(self):
+        self.assertEqual(wa.whatsnew_note(self.pot, 7), wa.WHATS_NEW)
+
+    def test_missing_state_file_returns_the_given_text(self):
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_malformed_json_state_returns_text(self):
+        write_state(self.pot, "{not json")
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_non_dict_json_state_returns_text(self):
+        write_state(self.pot, "[1, 2, 3]")
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_version_mismatch_returns_text_even_with_an_old_stamp(self):
+        write_state(self.pot, {"version": "0.1", "first_render": iso_ago(days=30)})
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_matching_version_with_fresh_stamp_returns_text_within_days(self):
+        write_state(self.pot, {"version": wa.VERSION, "first_render": datetime.now(TZ).isoformat()})
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_matching_version_with_stamp_older_than_days_returns_empty(self):
+        write_state(self.pot, {"version": wa.VERSION, "first_render": iso_ago(days=8)})
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "")
+
+    def test_matching_version_with_unparsable_stamp_returns_text(self):
+        write_state(self.pot, {"version": wa.VERSION, "first_render": "not-a-date"})
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_matching_version_with_missing_stamp_returns_text(self):
+        write_state(self.pot, {"version": wa.VERSION})
+        self.assertEqual(wa.whatsnew_note(self.pot, 7, "custom"), "custom")
+
+    def test_zero_days_window_is_already_closed_for_a_past_stamp(self):
+        write_state(self.pot, {"version": wa.VERSION, "first_render": iso_ago(seconds=5)})
+        self.assertEqual(wa.whatsnew_note(self.pot, 0, "custom"), "")
+
+
+class WhatsNewConstantsTests(unittest.TestCase):
+
+    def test_whats_new_is_a_nonempty_string(self):
+        self.assertTrue(isinstance(wa.WHATS_NEW, str) and wa.WHATS_NEW.strip())
+
+    def test_whats_new_short_is_a_nonempty_string(self):
+        self.assertTrue(isinstance(wa.WHATS_NEW_SHORT, str) and wa.WHATS_NEW_SHORT.strip())
+
+    def test_whats_new_short_is_a_single_line(self):
+        self.assertNotIn("\n", wa.WHATS_NEW_SHORT)
+
+    def test_whats_new_short_fits_the_header_strip(self):
+        self.assertLessEqual(len(wa.WHATS_NEW_SHORT), 80)
+
+
+class RenderRestampTests(unittest.TestCase):
+    """render()'s restamp of <pot>/.whats-new.json, verified through the file it
+    leaves behind. The pot holds one minimal valid slice so render() runs end to
+    end; wa.LOG is pointed into the temp pot so nothing lands outside it."""
+
+    def setUp(self):
+        self.pot = make_temp_dir(self, "worklog-test-pot-")
+        (self.pot / "slices").mkdir()
+        (self.pot / "slices" / "alpha.json").write_text(
+            json.dumps({"project": "Alpha", "repo": "alpha", "sessions": [], "commits": []}),
+            encoding="utf-8")
+        self.cfg = dict(CFG, pot=str(self.pot))
+        self.state = self.pot / ".whats-new.json"
+        original_log = wa.LOG
+        wa.LOG = self.pot / "agent.log"
+        self.addCleanup(setattr, wa, "LOG", original_log)
+
+    def read_state(self):
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+    def assert_fresh(self, stamp):
+        t = wa.parse_iso(stamp)
+        self.assertIsNotNone(t)
+        self.assertLess(abs((datetime.now(TZ) - t).total_seconds()), 600)
+
+    def test_missing_state_file_is_created_with_the_current_version(self):
+        wa.render(self.cfg)
+        self.assertEqual(self.read_state()["version"], wa.VERSION)
+
+    def test_missing_state_file_gets_a_fresh_first_render(self):
+        wa.render(self.cfg)
+        self.assert_fresh(self.read_state()["first_render"])
+
+    def test_older_recorded_version_is_restamped_to_current(self):
+        write_state(self.pot, {"version": "1.0", "first_render": iso_ago(days=30)})
+        wa.render(self.cfg)
+        self.assertEqual(self.read_state()["version"], wa.VERSION)
+
+    def test_older_recorded_version_gets_a_fresh_first_render(self):
+        write_state(self.pot, {"version": "1.0", "first_render": iso_ago(days=30)})
+        wa.render(self.cfg)
+        self.assert_fresh(self.read_state()["first_render"])
+
+    def test_newer_recorded_version_is_not_restamped(self):
+        p = write_state(self.pot, {"version": "9.9", "first_render": iso_ago(days=30)})
+        before = p.read_text(encoding="utf-8")
+        wa.render(self.cfg)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+    def test_newer_patch_version_is_not_restamped(self):
+        p = write_state(self.pot, {"version": wa.VERSION + ".1", "first_render": iso_ago(days=30)})
+        before = p.read_text(encoding="utf-8")
+        wa.render(self.cfg)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+    def test_equal_version_with_valid_date_is_untouched(self):
+        p = write_state(self.pot, {"version": wa.VERSION, "first_render": iso_ago(days=2)})
+        before = p.read_text(encoding="utf-8")
+        wa.render(self.cfg)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+    def test_equal_version_with_unparsable_date_is_restamped(self):
+        write_state(self.pot, {"version": wa.VERSION, "first_render": "not-a-date"})
+        wa.render(self.cfg)
+        self.assert_fresh(self.read_state()["first_render"])
+
+    def test_non_numeric_recorded_version_is_restamped(self):
+        write_state(self.pot, {"version": "v1.x!", "first_render": iso_ago(days=30)})
+        wa.render(self.cfg)
+        self.assertEqual(self.read_state()["version"], wa.VERSION)
+
+
+class DashboardDataVersionTests(unittest.TestCase):
+
+    def test_payload_version_is_the_module_version(self):
+        self.assertEqual(wa.dashboard_data([], [], dict(CFG), MISSING_POT)["version"], wa.VERSION)
+
+    def test_payload_whats_new_echoes_the_argument(self):
+        data = wa.dashboard_data([], [], dict(CFG), MISSING_POT, whats_new="fresh out")
+        self.assertEqual(data["whats_new"], "fresh out")
+
+    def test_payload_whats_new_defaults_to_empty_when_omitted(self):
+        self.assertEqual(wa.dashboard_data([], [], dict(CFG), MISSING_POT)["whats_new"], "")
+
+
+class VersionOfTests(unittest.TestCase):
+
+    def setUp(self):
+        self.dir = make_temp_dir(self)
+
+    def agent_file(self, version_line):
+        p = self.dir / "agent.py"
+        p.write_text('#!/usr/bin/env python3\n"""doc"""\n%s\nX = 1\n' % version_line, encoding="utf-8")
+        return p
+
+    def test_valid_version_line_parses_to_an_int_tuple(self):
+        self.assertEqual(wa.version_of(self.agent_file('VERSION = "1.15"')), (1, 15))
+
+    def test_three_part_version_parses(self):
+        self.assertEqual(wa.version_of(self.agent_file('VERSION = "1.15.1"')), (1, 15, 1))
+
+    def test_unquoted_version_line_yields_the_zero_tuple(self):
+        self.assertEqual(wa.version_of(self.agent_file('VERSION = 1.15')), (0,))
+
+    def test_indented_version_line_yields_the_zero_tuple(self):
+        self.assertEqual(wa.version_of(self.agent_file('    VERSION = "1.15"')), (0,))
+
+    def test_dots_only_version_yields_the_zero_tuple(self):
+        self.assertEqual(wa.version_of(self.agent_file('VERSION = "..."')), (0,))
+
+    def test_missing_file_yields_the_zero_tuple(self):
+        self.assertEqual(wa.version_of(self.dir / "no-such-file.py"), (0,))
+
+
+class UpgradeGuardComparisonTests(unittest.TestCase):
+    """The cmd_run self-upgrade guard adopts the machine copy only when
+    version_of(machine copy) > tuple(int(x) for x in VERSION.split("."))."""
+
+    def setUp(self):
+        self.dir = make_temp_dir(self)
+
+    def parsed(self, version):
+        p = self.dir / ("v-%s.py" % version.replace(".", "_"))
+        p.write_text('VERSION = "%s"\n' % version, encoding="utf-8")
+        return wa.version_of(p)
+
+    def running(self):
+        return tuple(int(x) for x in wa.VERSION.split("."))
+
+    def test_nine_nine_outranks_one_fifteen(self):
+        self.assertGreater(self.parsed("9.9"), self.parsed("1.15"))
+
+    def test_equal_versions_do_not_outrank_so_no_upgrade(self):
+        self.assertFalse(self.parsed("1.15") > self.parsed("1.15"))
+
+    def test_a_patch_release_outranks_its_base(self):
+        self.assertGreater(self.parsed("1.15.1"), self.parsed("1.15"))
+
+    def test_ordering_is_numeric_not_lexicographic(self):
+        self.assertGreater(self.parsed("1.15"), self.parsed("1.4"))
+
+    def test_version_of_agrees_with_the_guard_parse_of_the_running_version(self):
+        self.assertEqual(self.parsed(wa.VERSION), self.running())
+
+    def test_machine_copy_at_the_running_version_does_not_trigger(self):
+        self.assertFalse(self.parsed(wa.VERSION) > self.running())
+
+    def test_machine_copy_newer_than_the_running_version_triggers(self):
+        self.assertGreater(self.parsed("9.9"), self.running())
 
 
 if __name__ == "__main__":

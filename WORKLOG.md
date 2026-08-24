@@ -1,4 +1,4 @@
-# Worklog agent · v1.14 (part of the Sonelo Solution DevKit v4.0)
+# Worklog agent · v1.15 (part of the Sonelo Solution DevKit v4.0)
 
 Installed and updated through the kit: `python repo_setup.py install` does the machine setup, `/repo-setup` or `apply` puts it in a repo. The rest of this file is the reference.
 
@@ -117,7 +117,8 @@ python .worklog/worklog_agent.py stamp lock        # what the tasks call; you wo
 - Session folders are matched case-insensitively, because VS Code's terminal reports `c:\` where other launches say `C:\`, and Claude Code keeps those as separate folders. An old slice for the same repo under a previous project name is removed when the repo next reports.
 - Editor time is attributed by the folder name in the VS Code title bar (`file - folder - Visual Studio Code`), so it lines up with the repo name or the project label. Cursor and Windsurf are matched too. A custom `window.title` setting without the folder will leave it unattributed.
 - If the pot isn't reachable at the time (say it's later moved onto a synced or network drive), the run is logged and skipped; the next one catches up. If ActivityWatch isn't running, cached days are kept and the error is noted in `status`.
-- Updating the agent: with auto-install on, replace `worklog_agent.py` in any one repo and run `install` there; `bin/` is refreshed and the other repos upgrade themselves at their next session start. Without it, replace the file in each repo and run `install` in each. `status` shows the version.
+- Updating the agent: with auto-install on, replace `worklog_agent.py` in any one repo and run `install` there; `bin/` is refreshed and every other repo upgrades itself — at its next session start, and since v1.15 also mid-session (each hook run adopts a newer `bin/` copy for the next run, so always-on machines with long-lived sessions catch up within minutes). Without auto-install, replace the file in each repo and run `install` in each. `status` shows the version.
+- What's new after an upgrade (v1.15): the session-start message says what changed, the dashboard header shows "worklog vX · new: ..." for 7 days after a version first renders, and the morning page carries the same line for 3 days (first-render date kept in `<pot>/.whats-new.json`).
 - Windows: Claude Code runs hooks through Git Bash (from Git for Windows, which you already have). The installer writes the full path of the Python it was run with, so PATH differences between shells don't matter.
 - Every run logs to `.worklog/agent.log` in the repo; the scheduled tasks log to `<pot>/bin/agent.log`.
 

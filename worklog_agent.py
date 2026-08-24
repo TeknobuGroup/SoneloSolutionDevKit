@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-worklog_agent.py  (v1.14)  -  per-repo work reporter for Claude Code
+worklog_agent.py  (v1.15)  -  per-repo work reporter for Claude Code
 
 Lives at <repo>/.worklog/worklog_agent.py. Claude Code hooks run it at the start and end of every
 session in this repo, and after each response (throttled). Each run:
@@ -60,7 +60,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.14"
+VERSION = "1.15"
+WHATS_NEW = "agent usage grouped by project with friendly team names; the worklog now upgrades itself mid-session and announces what's new"
+WHATS_NEW_SHORT = "per-project agent usage with friendly names; self-upgrading"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -1151,6 +1153,16 @@ def write_csv(path, rows):
     atomic_write(path, buf.getvalue())
 
 
+def whatsnew_note(pot, days, text=None):
+    """The what's-new line while the running version is younger than `days` in this pot, else ""."""
+    text = WHATS_NEW if text is None else text
+    d = read_json(Path(pot) / ".whats-new.json", {})
+    if not isinstance(d, dict) or d.get("version") != VERSION:
+        return text                               # first render of this version not recorded yet
+    t = parse_iso(d.get("first_render"))
+    return text if t is None or (datetime.now(local_tz()) - t) < timedelta(days=days) else ""
+
+
 def render(cfg):
     pot = Path(cfg["pot"])
     slices, machines = load_slices(pot)
@@ -1160,6 +1172,18 @@ def render(cfg):
     now = datetime.now(local_tz())
     today = now.date()
     monday = today - timedelta(days=today.weekday())
+    try:
+        wn = read_json(pot / ".whats-new.json", {})
+        wn = wn if isinstance(wn, dict) else {}
+        seen = str(wn.get("version") or "0")
+        # only a NEWER version restamps (an older agent on a shared pot must not reset the clock);
+        # a matching version with an unreadable date restamps so the window can ever close
+        stale = (not re.match(r"^[0-9.]+$", seen)
+                 or tuple(int(x) for x in seen.split(".") if x) < tuple(int(x) for x in VERSION.split(".")))
+        if stale or (seen == VERSION and parse_iso(wn.get("first_render")) is None):
+            atomic_write(pot / ".whats-new.json", json.dumps({"version": VERSION, "first_render": now.isoformat()}) + "\n")
+    except Exception:
+        log("whats-new state write failed\n" + traceback.format_exc())
 
     y_since, y_until = day_window(today - timedelta(days=1))
     md, _, _ = build_report(slices, machines, y_since, y_until, cfg)
@@ -1226,7 +1250,7 @@ def read_weekly_csvs(pot):
     return weeks
 
 
-def dashboard_data(slices, machines, cfg, pot):
+def dashboard_data(slices, machines, cfg, pot, whats_new=""):
     projects = {}
     for sl in sorted(slices, key=lambda x: (x["project"].lower(), x.get("repo") or "")):
         projects.setdefault(sl["project"], []).append({
@@ -1243,6 +1267,7 @@ def dashboard_data(slices, machines, cfg, pot):
         "window_days": int(cfg["window_days"]), "window_start": window_start_dt.isoformat() if window_start_dt else None,
         "idle_minutes": int(cfg["idle_minutes"]), "currency": cfg.get("currency", "$"), "prices": cfg.get("prices") or {},
         "agent_names": agent_name_map(cfg),
+        "version": VERSION, "whats_new": whats_new,
         "repo_count": len(slices),
         "projects": [{"project": k, "repos": v} for k, v in projects.items()],
         "machine": {"aw_days": aw_days, "presence": presence},
@@ -1251,7 +1276,7 @@ def dashboard_data(slices, machines, cfg, pot):
 
 
 def write_dashboard(slices, machines, cfg, pot):
-    payload = json.dumps(dashboard_data(slices, machines, cfg, pot), separators=(",", ":")).replace("<", "\\u003c")
+    payload = json.dumps(dashboard_data(slices, machines, cfg, pot, whatsnew_note(pot, 7, WHATS_NEW_SHORT)), separators=(",", ":")).replace("<", "\\u003c")
     atomic_write(Path(pot) / "dashboard.html", DASHBOARD_HTML.replace("__DATA__", payload))
 
 
@@ -1739,7 +1764,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   el('prev').onclick = function () { state.start = addDays(state.start, -state.preset.step); render(); };
   el('next').onclick = function () { state.start = addDays(state.start, state.preset.step); render(); };
   el('potName').textContent = DATA.pot || '';
-  el('meta').textContent = 'rendered ' + new Date(DATA.generated).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' · ' + DATA.repo_count + ' repo' + (DATA.repo_count === 1 ? '' : 's') + ' reporting' + (haveAw ? '' : ' · no ActivityWatch data') + ' · refresh the page after a run';
+  el('meta').textContent = 'rendered ' + new Date(DATA.generated).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' · ' + DATA.repo_count + ' repo' + (DATA.repo_count === 1 ? '' : 's') + ' reporting' + (haveAw ? '' : ' · no ActivityWatch data') + ' · refresh the page after a run' + (DATA.version ? ' · worklog v' + DATA.version : '') + (DATA.whats_new ? ' · new: ' + DATA.whats_new : '');
   renderTrend();
   render();
 })();
@@ -1822,7 +1847,7 @@ def build_morning(slices, machines, cfg, pot):
              'body{margin:0;font:15px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1b1f24;background:#f7f7f5}'
              'main{max-width:820px;margin:0 auto;padding:36px 28px 48px}'
              '.date{color:#6b7280;font-size:13px;letter-spacing:.3px}h1{font-size:26px;font-weight:600;margin:4px 0 6px;letter-spacing:-.3px}'
-             '.facts{color:#6b7280;margin-bottom:26px}h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:#6b7280;margin:26px 0 10px;font-weight:600}'
+             '.facts{color:#6b7280;margin-bottom:26px}.facts+.facts{margin-top:-18px}h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:#6b7280;margin:26px 0 10px;font-weight:600}'
              '.p{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 16px;margin-bottom:10px;display:grid;grid-template-columns:1fr auto;gap:4px 16px}'
              '.p .n{font-weight:600}.p .n small{color:#6b7280;font-weight:400;margin-left:8px}.p .m{color:#6b7280;font-size:13px;text-align:right;white-space:nowrap}'
              '.p .t{grid-column:1/-1;color:#374151;font-size:14px}.p .t b{color:#0f766e;font-weight:600}'
@@ -1840,6 +1865,9 @@ def build_morning(slices, machines, cfg, pot):
             day_name, len(rows), "" if len(rows) == 1 else "s", sum(r["commits"] for r in rows), "" if sum(r["commits"] for r in rows) == 1 else "s"))
     if facts:
         L.append('<div class="facts">%s \u00b7 %s</div>' % (esc(day_name), esc(" \u00b7 ".join(facts))))
+    wn = whatsnew_note(pot, 3)
+    if wn:
+        L.append('<div class="facts">Worklog upgraded to v%s \u2014 %s.</div>' % (VERSION, esc(wn)))
     if rows:
         L.append("<h2>Where you left off</h2>")
         for r in rows:
@@ -2057,7 +2085,18 @@ def machine_copy(pot):
     dst.parent.mkdir(parents=True, exist_ok=True)
     src = Path(__file__).resolve()
     if src != dst.resolve():
-        shutil.copyfile(str(src), str(dst))
+        # atomic: the self-upgrade in cmd_run reads this file concurrently and must never see a torn copy
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-bin-", suffix=".py", dir=str(dst.parent))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(src.read_bytes())
+            os.replace(tmp, str(dst))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     return dst
 
 
@@ -2233,7 +2272,7 @@ def cmd_bootstrap(args):
         if reason == "new repo":
             say("Worklog agent v%s installed in this repo; it now reports to %s." % (VERSION, central_cfg()["pot"]))
         else:
-            say("Worklog agent %s in this repo." % reason.replace("upgrade ", "upgraded v").replace(" -> ", " to v"))
+            say("Worklog agent %s in this repo - new: %s." % (reason.replace("upgrade ", "upgraded v").replace(" -> ", " to v"), WHATS_NEW))
     except Exception:
         log("bootstrap failed\n" + traceback.format_exc())
 
@@ -2513,6 +2552,28 @@ def cmd_run(args):
             event or "manual", data["project"], len(data["commits"]), len(data["sessions"]),
             "ok" if aw.get("ok") else (aw.get("error") or "n/a"),
             ("%dc %ds %s" % (totals[0], totals[1], fmt_dur(totals[2]))) if totals else "-"))
+        # self-upgrade: long-lived sessions never hit SessionStart, so each worker run adopts a newer
+        # machine copy for the NEXT run; atomic replace so a spawning worker can't read a torn file
+        try:
+            bin_copy = Path(cfg["pot"]) / "bin" / "worklog_agent.py"
+            me = Path(__file__).resolve()
+            mine = tuple(int(x) for x in VERSION.split("."))
+            if bin_copy.exists() and me != bin_copy.resolve() and version_of(bin_copy) > mine:
+                fd, tmp = tempfile.mkstemp(prefix=".tmp-upgrade-", suffix=".py", dir=str(me.parent))
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(bin_copy.read_bytes())
+                    compile(Path(tmp).read_text(encoding="utf-8", errors="replace"), tmp, "exec")   # never promote a torn copy
+                    os.replace(tmp, str(me))
+                except BaseException:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+                log("self-upgrade %s -> %s from %s (next run uses it)" % (VERSION, ".".join(map(str, version_of(me))), bin_copy))
+        except Exception:
+            log("self-upgrade skipped\n" + traceback.format_exc())
         if event == "manual" and sys.stdout and sys.stdout.isatty():
             say("%s: %d commits, %d sessions -> %s" % (data["project"], len(data["commits"]), len(data["sessions"]),
                                                        Path(cfg["pot"]) / "latest-week.md"))
