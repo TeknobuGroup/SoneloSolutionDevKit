@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Worklog 1.15: the agent upgrades itself mid-session — every hook run adopts a newer machine copy for the next run, so always-on machines no longer wait for a session restart — with compile-verified atomic writes preventing torn copies (both the pot bin copy and the running copy are written atomically); upgrades announce themselves: the session-start message says what changed, the dashboard header shows "worklog vX · new: ..." for 7 days after a version first renders, and the morning page carries the same line for 3 days. Adds 39 new unit tests covering the upgrade guard, what's-new state management, version parsing, and render restamp logic (75 total).
 - Worklog 1.14: the dashboard's Agents card and the weekly report group agent usage by project (project totals with agents beneath, share bars), agents display friendly persona names with raw agent IDs on hover — built-in map overridable via `"agent_names"` in `~/.claude/worklog.json` (malformed config ignored safely). New stdlib unit-test suite wired into .githooks/checks alongside py_compile. History renders with the new names.
 - Teknobu standards kit v3.2: CLAUDE.md project instructions, .teknobu.json configuration, git hooks for commit format and branch protection, GitHub workflows and PR template, documentation structure, and .gitignore rules for standard artifacts.
 
