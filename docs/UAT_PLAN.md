@@ -2,6 +2,25 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
+## Changed in this cycle (kit v4.2)
+
+### New: Event-driven pipeline with stop gate and review verdicts
+- Stop gate now blocks when code changes exist without a fresh /post-change verdict
+- Session start briefly reports outstanding review debt; silent on clean repo
+- /post-change records a content signature so gate detects stale verdicts
+- /release-ready cuts a GitHub release on merge to main (automated CI)
+- `repo_setup.py update` offers the new version at session start; consent required for install
+- First code-path edit on a branch produces an advisory nudge; second edit is silent
+- Editing .github/workflows files marks the security reviewer as due
+
+### Scenarios affected by new stop gate behaviour
+UAT-4 (CI gates): no change, still tests the ci-gates workflow.
+
+### New scenarios for kit v4.2
+- UAT-79 to UAT-100: Stop gate, session start, update loop, post-edit nudge, workflow reviewer trigger, and auto-release. Full test procedures in docs/uat/prelive-2026-08-25-kit-4-2-pipeline.md.
+
+---
+
 | ID | Area | Flow | Expected |
 |----|------|------|----------|
 | UAT-1 | Git hooks | Try to commit with invalid format | Commit is rejected; message explains Conventional Commits format |
@@ -82,3 +101,41 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 | UAT-76 | Unit tests — worklog worktree hook install | Run `python -m unittest tests.test_worklog_worktree` | Both tests pass (install in main repo and in linked worktree) |
 | UAT-77 | .githooks/checks includes worktree tests | Run `.githooks/checks` | Script passes; python -m unittest discover runs all tests including worktree (98 total); py_compile passes |
 | UAT-78 | Kit repo scenario — worktree new/list/clean on this kit repo | Create a worktree on the kit repo, make commits, merge, clean | Worktree creation, listing, and cleanup work as expected on the kit repo itself |
+| UAT-79 | Stop gate — initial block: code changes without verdict | Edit a .py file under supabase/ or functions/, do not run /post-change, attempt to push to prelive | Push is blocked with "reviewers due" message; block is counted (block 1/2) |
+| UAT-80 | Stop gate — second block: stale verdict not refreshed | Re-push without running /post-change again | Push is blocked again with "reviewers due" message; block is counted (block 2/2 — disclosure mode next) |
+| UAT-81 | Stop gate — disclosure demand: third attempt without refresh | Third push attempt without /post-change | Push is blocked with a disclosure message asking user to confirm they understand review is due; block is marked as disclosure |
+| UAT-82 | Stop gate — allow after disclosure: gate can pass after disclosure demand | After disclosure block, run /post-change to record fresh verdict, then push | Push succeeds; gate clears; block counter resets on new signature |
+| UAT-83 | Stop gate — fresh verdict clears block: /post-change refreshes the gate | Edit a .py file, push (blocked), run /post-change, push again | Second push attempt succeeds; fresh verdict in review.json matches current sig |
+| UAT-84 | Stop gate — changelog-only debt still blocks | Edit only CHANGELOG.md (no code changes), attempt to push | Push is blocked with changelog debt message; gate maintains v4.1 changelog-blocking behavior |
+| UAT-85 | Stop gate — detached HEAD or no pipeline-state.sh: fallback to legacy gate | On a branch without .claude/hooks/pipeline-state.sh or in detached HEAD state, attempt push | Gate falls back to v4.1 semantics: session can stop without verdict (signature-less state) |
+| UAT-86 | Session start — report outstanding debt | Start a session (run repo_setup.py or clone a repo with review debt) in a kit repo with pending verdict | First line of output shows brief debt summary (e.g., "Code review pending: code reviewer"); clean output if no debt |
+| UAT-87 | Session start — clean repo silent | Start a session in a kit repo with all review debt cleared | No debt message is printed; startup is silent |
+| UAT-88 | apply --update-pipeline — docs survival | Run `repo_setup.py apply --update-pipeline` on a repo with filled-in docs/STATUS.md, ARCHITECTURE.md, decisions/ | Docs files are preserved; only hook/workflow/config files in managed sections are updated |
+| UAT-89 | post-edit nudge — first edit advisory | Edit a file under supabase/ or functions/ on a branch without impact.json | Advisory message appears once, mentioning the impact-report requirement |
+| UAT-90 | post-edit nudge — second edit silent | Make a second edit to supabase/ or functions/ without running impact-report | No advisory message is printed; nudge fires only once per branch |
+| UAT-91 | post-edit nudge — impact.json suppresses advisory | Create impact.json, edit supabase/ or functions/ | No advisory message appears; nudge is skipped when impact report exists |
+| UAT-92 | Editing .github/workflows makes security reviewer due | Edit .github/workflows/release.yml (or any file in .github/workflows/), do not run /post-change | Stop gate: security reviewer is listed as due; /post-change requires security sign-off |
+| UAT-93 | Auto-update: release published on main merge (CI) | Merge a PR from prelive to main, check GitHub Actions | release.yml workflow is triggered; release is published with a tag and binary/zip artifact (CLIENT-SIDE VERIFICATION: GitHub UI) |
+| UAT-94 | Auto-update: next session offers update (daily throttled) | Within 24 hours of a release, start a new session on a machine with v4.2 kit installed, in a different repo | Session start message offers "run `repo_setup.py update`" (throttled: once per day per machine, 3s network timeout) (CLIENT-SIDE VERIFICATION: network, release download) |
+| UAT-95 | Auto-update: update from release zip succeeds | Run `repo_setup.py update` when prompted | Tool downloads latest release, extracts it, updates worklog_agent.py and repo_setup.py atomically in the machine home; consent is required (no auto-apply) (CLIENT-SIDE VERIFICATION: network, file system write) |
+| UAT-96 | Auto-update: update consent required | Run `repo_setup.py update` | Tool prompts for consent before any file is modified; updating proceeds only on user approval |
+| UAT-97 | Auto-update: offline update silent | With network disabled (or 3s timeout exhausted), run `repo_setup.py update` | Tool exits gracefully with no error; next session with network available will retry (CLIENT-SIDE VERIFICATION: network simulation or air-gapped machine) |
+| UAT-98 | Unit tests — all 98+ pass | Run `python -m unittest discover -s tests` | Output shows "Ran 98 tests" (or higher) and "OK" with no FAIL or ERROR lines |
+| UAT-99 | Unit tests — pipeline-state and stop-gate tests | Run pipeline-state test suite | All tests pass covering signature computation, verdict matching, block counting, and fallback logic |
+| UAT-100 | Unit tests — auto-update and release tests | Run worklog update tests | All tests pass covering version checks, release download logic, consent flow, and offline handling |
+
+## Client-Side Verification (Real accounts, live integrations, third-party services)
+
+The following scenarios require real GitHub accounts, live network, or third-party integrations and must be verified manually or in CI:
+
+- **UAT-93**: Verify GitHub Actions publishes a release artifact (requires GitHub org/repo, release.yml execution, artifact visibility)
+- **UAT-94**: Verify session start offers update prompt on a real machine within 24h of release (requires machine with internet, throttling logic, release availability)
+- **UAT-95**: Verify release zip can be downloaded and extracted successfully; file permissions and atomicity on real file system (requires network, write access to `~/.claude/sonelo/`)
+- **UAT-97**: Verify offline graceful exit and retry behavior; requires network simulation or air-gapped machine
+
+## Notes
+
+- Verdicts are no longer committed (`.claude/state/` is gitignored); old `review.json` files in git are stale and harmless
+- Scenario IDs are stable; if a scenario retires, it moves to an Archive section rather than being renumbered
+- The stop gate uses content signatures (`sig` field in `review.json`) to detect stale verdicts independent of file timestamps
+- Block counter resets on every new signature; a fresh /post-change recording a new sig clears all prior blocks

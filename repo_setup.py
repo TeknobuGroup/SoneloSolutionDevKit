@@ -58,7 +58,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.1"
+VERSION = "4.2"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -73,6 +73,7 @@ NEW_COMMAND_FILE = Path("~/.claude/commands/new-repo.md").expanduser()
 USER_SETTINGS = Path("~/.claude/settings.json").expanduser()
 HOOK_MARK = "repo_setup.py"
 CONFIG_FILE = HOME_DIR / "config.json"
+UPDATE_STAMP = HOME_DIR / "latest-release"          # newest release tag seen; mtime = last check (daily throttle for the nudge)
 
 DEFAULTS = {
     "mode": "full",                       # full: standards + agents + infrastructure | worklog: the worklog only
@@ -550,8 +551,11 @@ CLAUDE_SECTION = '''<!-- {MARK}:start v{VERSION} (managed by repo_setup.py; edit
 <!-- {MARK}:end -->
 '''
 
+# the sh hooks break under a CRLF checkout; merge_gitattributes writes its own header
+GITATTRIBUTES_LINES = ["*.sh text eol=lf", ".githooks/* text eol=lf"]
+
 GITIGNORE_LINES = [
-    "# sonelo standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".worklog/",
+    "# sonelo standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".claude/state/", ".worklog/",
     "node_modules/", "dist/", "build/", ".vercel/", "supabase/.temp/", "supabase/.branches/",
     ".DS_Store", "Thumbs.db", "*.log", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
 ]
@@ -559,7 +563,7 @@ GITIGNORE_LINES = [
 DESIGN_REVIEWER_MD = r"""---
 name: design-reviewer
 description: Reviews UI work as a user would meet it - can they finish the task, can they read it, does it hold up in the states that actually occur - and checks it against this repo's design contract in .claude/rules/design.md. Use before finishing any change that alters what appears on screen. Reports; never edits.
-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*)
+tools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)
 ---
 
 You review interface work. You **report and recommend - you never edit**. You have no Write or Edit
@@ -691,23 +695,253 @@ project alive until {WORK} has proven out.
 """
 
 
+# The shipped pipeline hooks. Shell rule (ADR-0003): lowercase, unbraced variables only —
+# fill() rewrites {TOKEN} substrings, so an uppercase ${...} would be silently corrupted
+# (pinned by tests/test_pipeline_state.py::TemplatesTokenSafe).
+
+PIPELINE_STATE_SH = r'''#!/bin/sh
+# sonelo-devkit pipeline: shared state helper for stop-gate.sh, session-brief.sh and /post-change.
+# Subcommands: changed | code-changed | due | sig | verdict [sig]. Always exits 0; empty output means
+# "cannot compute" and callers fall back. See docs/decisions/0003 in the kit repo for the contract.
+py=python
+command -v python >/dev/null 2>&1 || py=python3
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+changed() { { git -c core.quotePath=false diff --name-only; git -c core.quotePath=false diff --name-only --cached; git -c core.quotePath=false ls-files --others --exclude-standard; } 2>/dev/null | sort -u; }
+codechanged() { { changed | grep -Ev '^(docs/|CHANGELOG\.md|README|\.claude/|\.github/|PRELIVE\.md|STAGING\.md|[A-Z]+\.md|.*\.md$)' | grep -Ev '^\.(env|teknobu)'; changed | grep -E '^\.github/workflows/'; } | sort -u; }
+case "$1" in
+  changed) changed ;;
+  code-changed) codechanged ;;
+  due)
+    files=$(codechanged)
+    [ -z "$files" ] && exit 0
+    out="code"
+    printf '%s\n' "$files" | grep -Eq '\.(tsx|jsx|css|scss)$|(^|/)tailwind\.config\.' && out="$out design"
+    printf '%s\n' "$files" | grep -Eq '^supabase/|(^|/)functions/|(^|/)auth(/|\.)|^\.github/workflows/' && out="$out security"
+    printf '%s\n' "$out"
+    ;;
+  sig)
+    # Content signature of the reviewable work: diffs of only the code-changed list plus a
+    # hash line per untracked member. Docs/changelog/state writes cannot move it.
+    files=$(codechanged)
+    {
+      printf 'v1\n'
+      if [ -n "$files" ]; then
+        oldifs=$IFS
+        IFS='
+'
+        set -f
+        set -- $files
+        IFS=$oldifs
+        GIT_LITERAL_PATHSPECS=1 git diff --cached --no-color --no-ext-diff -- "$@" 2>/dev/null
+        GIT_LITERAL_PATHSPECS=1 git diff --no-color --no-ext-diff -- "$@" 2>/dev/null
+        set +f
+        others=$(git ls-files --others --exclude-standard 2>/dev/null | sort -u)
+        printf '%s\n' "$files" | while IFS= read -r f; do
+          [ -f "$f" ] || continue
+          printf '%s\n' "$others" | grep -Fxq "$f" || continue
+          printf '== %s %s\n' "$f" "$(git hash-object -- "$f" 2>/dev/null)"
+        done
+      fi
+    } | git hash-object --stdin 2>/dev/null
+    ;;
+  verdict)
+    branch=$(git branch --show-current 2>/dev/null)
+    [ -z "$branch" ] && { echo none; exit 0; }
+    vf=".claude/state/$branch/review.json"
+    [ -f "$vf" ] || { echo none; exit 0; }
+    cur=$2
+    [ -n "$cur" ] || cur=$(sh "$0" sig)
+    due=$(sh "$0" due)
+    $py - "$vf" "$cur" "$due" <<'PYEOF' 2>/dev/null || echo none
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("none"); raise SystemExit
+cur = sys.argv[2]
+due = sys.argv[3].split() if len(sys.argv) > 3 else []
+if not d.get("sig") or d.get("sig") != cur:
+    print("stale"); raise SystemExit
+rev = d.get("reviewers") or {}
+if d.get("verdict") == "blocked" or d.get("tests") == "red" or any(rev.get(k) == "blocked" for k in due):
+    print("blocked"); raise SystemExit
+missing = [k for k in due if rev.get(k) in (None, "skipped")]
+print("clear-partial " + " ".join(missing) if missing else "clear")
+PYEOF
+    ;;
+esac
+exit 0
+'''
+
+STOP_GATE_SH = r'''#!/bin/sh
+# sonelo-devkit pipeline: Stop hook. Blocks the session from stopping while "done" is not true.
+# Checks: (1) code changed -> CHANGELOG.md entry; (2) migrations changed -> generated types regenerated;
+# (3) a review verdict exists for this branch, covers the reviewers the diff makes due, and matches the
+# current work (sig from pipeline-state.sh). Blocks at most twice per work-state (marker in
+# .claude/state/<branch>/disclosed), then demands plain disclosure to the user and allows the stop.
+{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0
+input=$(cat)
+py=python
+command -v python >/dev/null 2>&1 || py=python3
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+active=$(printf '%s' "$input" | $py -c "import json,sys; print(1 if json.load(sys.stdin).get('stop_hook_active') else 0)" 2>/dev/null)
+[ "$active" = "1" ] || active=0
+branch=$(git branch --show-current 2>/dev/null)
+types=$($py -c "import json,sys,re; v=json.load(open(sys.argv[1])).get('generated_types') or ''; print(v if re.fullmatch(r'[A-Za-z0-9._/-]+', v) else '')" .teknobu.json 2>/dev/null)
+[ -n "$types" ] || types=src/types/database.ts
+ps=.claude/hooks/pipeline-state.sh
+changed=$( { git diff --name-only 2>/dev/null; git diff --name-only --cached 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u)
+mfile=""
+[ -n "$branch" ] && mfile=".claude/state/$branch/disclosed"
+if [ -z "$changed" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
+if [ -f "$ps" ]; then
+  code=$(sh "$ps" code-changed | head -1)
+else
+  code=$(printf '%s\n' "$changed" | grep -Ev '^(docs/|CHANGELOG\.md|README|\.claude/|\.github/|PRELIVE\.md|STAGING\.md|[A-Z]+\.md|.*\.md$)' | grep -Ev '^\.(env|teknobu)' | head -1)
+fi
+reasons=""
+if [ -n "$code" ] && ! printf '%s\n' "$changed" | grep -q '^CHANGELOG\.md$'; then
+  reasons="$reasons
+- Code changed but CHANGELOG.md has no entry for it. Run changelog-scribe (or /post-change)."
+fi
+if printf '%s\n' "$changed" | grep -q '^supabase/migrations/' && ! printf '%s\n' "$changed" | grep -Fxq "$types"; then
+  reasons="$reasons
+- A migration changed but $types was not regenerated. Run the types generation command from .claude/rules/supabase.md and commit it."
+fi
+sig=""
+if [ -f "$ps" ] && [ -n "$branch" ] && [ -n "$code" ]; then
+  sig=$(sh "$ps" sig)
+  due=$(sh "$ps" due)
+  v=$(sh "$ps" verdict "$sig")
+  word=${v%% *}
+  case "$word" in
+    none|stale) reasons="$reasons
+- No fresh review covers this work (reviewers due: $due). Run /post-change." ;;
+    blocked) reasons="$reasons
+- The pipeline verdict for $branch is blocked (see .claude/state/$branch/review.json). Fix the blocking findings and re-run /post-change." ;;
+    clear-partial) reasons="$reasons
+- Reviewers still due for this work: ${v#clear-partial }. Run /post-change." ;;
+  esac
+elif [ -n "$branch" ] && [ -f ".claude/state/$branch/review.json" ]; then
+  old=$($py -c "import json,sys; print(json.load(open(sys.argv[1])).get('verdict',''))" ".claude/state/$branch/review.json" 2>/dev/null)
+  [ "$old" = "blocked" ] && reasons="$reasons
+- The pipeline verdict for $branch is blocked (see .claude/state/$branch/review.json). Fix the blocking findings and re-run /post-change."
+fi
+if [ -z "$reasons" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
+if [ -z "$sig" ]; then printf '%s\n' "Not done yet:$reasons" >&2; exit 2; fi
+msig=""
+mcount=0
+if [ -f "$mfile" ]; then read -r msig mcount < "$mfile" 2>/dev/null; fi
+case "$mcount" in ''|*[!0-9]*) mcount=0 ;; esac
+if [ "$msig" = "$sig" ] && [ "$mcount" -ge 2 ]; then exit 0; fi
+if [ "$msig" = "$sig" ]; then n=$((mcount+1)); else n=1; fi
+mkdir -p "$(dirname "$mfile")" 2>/dev/null
+if ! printf '%s %s\n' "$sig" "$n" > "$mfile" 2>/dev/null; then
+  [ "$active" = "1" ] && exit 0
+fi
+extra=""
+[ "$n" -ge 2 ] && extra="
+If these gates cannot be met now, state plainly to the user which are unmet and why, then stop."
+printf '%s\n' "Not done yet:$reasons$extra" >&2
+exit 2
+'''
+
+SESSION_BRIEF_SH = r'''#!/bin/sh
+# sonelo-devkit pipeline: SessionStart hook. One line of review debt so the session starts
+# knowing what the Stop gate will require; silent when there is nothing to say. stdout
+# becomes session context.
+{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+ps=.claude/hooks/pipeline-state.sh
+[ -f "$ps" ] || exit 0
+branch=$(git branch --show-current 2>/dev/null)
+[ -n "$branch" ] || exit 0
+files=$(sh "$ps" code-changed)
+[ -n "$files" ] || exit 0
+n=$(printf '%s\n' "$files" | grep -c .)
+due=$(sh "$ps" due)
+v=$(sh "$ps" verdict)
+word=${v%% *}
+[ "$word" = "clear" ] && exit 0
+printf '%s\n' "$n changed code file(s) on $branch; reviewers due: $due; verdict: $word. The Stop gate will require a fresh /post-change verdict before this session can end."
+exit 0
+'''
+
+POST_EDIT_SH = r'''#!/bin/sh
+# sonelo-devkit pipeline: PostToolUse hook on Edit/Write/MultiEdit.
+# Type-checks and lints the edited file's project so errors surface immediately, and nudges
+# once per branch when a full-pipeline path is edited without an impact report on record.
+# Exit 2 feeds the output back to Claude.
+{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0
+input=$(cat)
+py=python
+command -v python >/dev/null 2>&1 || py=python3
+file=$(printf '%s' "$input" | $py -c "import json,sys; d=json.load(sys.stdin); print((d.get('tool_input') or {}).get('file_path') or '')" 2>/dev/null)
+[ -z "$file" ] && exit 0
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$root" || exit 0
+out=""
+p=$(printf '%s' "$file" | tr '\\' '/')
+branch=$(git branch --show-current 2>/dev/null)
+case "$p" in
+  *.md) ;;
+  */supabase/*|supabase/*|*/functions/*|functions/*|*/auth/*|auth/*|*/auth.*|auth.*)
+    if [ -n "$branch" ] && [ ! -f ".claude/state/$branch/impact.json" ] && [ ! -f ".claude/state/$branch/impact-nudged" ]; then
+      mkdir -p ".claude/state/$branch" 2>/dev/null
+      : > ".claude/state/$branch/impact-nudged" 2>/dev/null
+      out="$out
+[pipeline]
+Full-pipeline path touched ($p). The impact-analyst report is due for this change - run it and record .claude/state/$branch/impact.json before continuing."
+    fi
+    ;;
+esac
+case "$p" in
+  *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts)
+    if [ -f tsconfig.json ]; then
+      tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v '^$' | head -40)
+      [ -n "$tsc_out" ] && out="$out
+[typecheck]
+$tsc_out"
+    fi
+    if [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then
+      es_out=$(timeout 60 npx --no-install eslint -- "$file" 2>&1 | grep -v '^$' | head -40)
+      [ -n "$es_out" ] && out="$out
+[lint]
+$es_out"
+    fi
+    ;;
+esac
+if [ -n "$out" ]; then
+  printf '%s\n' "Fix or act on these before continuing (from the post-edit hook on $file):$out" >&2
+  exit 2
+fi
+exit 0
+'''
+
+
 BUILTIN_PIPELINE = {
     '.claude/agents/impact-analyst.md': '---\nname: impact-analyst\ndescription: Before any full-pipeline change, maps what the change touches and what depends on it. Use in plan mode, before editing. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git log:*), Bash(git diff:*)\n---\n\nYou map blast radius. The user is about to change something; your job is to say what else moves.\n\n1. From the request, name the files and symbols that will change.\n2. For each, find every importer and caller (`Grep` for the symbol and the module path). List them with file:line.\n3. Find shared contracts the change crosses: database tables and columns, RLS policies, edge-function request/response shapes, shared types, environment variables, routes.\n4. Name the tests that cover the touched code, and the touched code that has no tests.\n5. Name what could break that nobody asked about: callers with different assumptions, a null that becomes possible, an ordering that matters, a migration that needs a backfill.\n\nReport as: **Touches** (files) · **Depends on it** (callers, with file:line) · **Contracts crossed** · **Test coverage** (covered / uncovered) · **Risks** (one line each, most likely first) · **Recommended order of edits**. Short lines. If the change is genuinely local, say so in two lines and stop.\n',
-    '.claude/agents/code-reviewer.md': '---\nname: code-reviewer\ndescription: Reviews a change for correctness - logic errors, unhandled states, regressions in neighbouring code, and whether it does what was asked and nothing else. Use after implementing, before tests. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*)\n---\n\nYou review the diff (`git diff` against the base branch, plus any untracked files) for whether it is *right*, not whether it is pretty. You never edit.\n\nWork through, in order, and stop escalating once something fails:\n\n1. **Does it do what was asked, and only that?** Compare the change to the request. Anything extra is a finding; anything missing is a finding.\n2. **Logic.** Off-by-ones, inverted conditions, wrong operator, async not awaited, a promise whose rejection goes nowhere, state updated from stale values, a loop that mutates what it iterates.\n3. **States the code does not handle.** Null, empty, one, many, duplicate, concurrent, slow, failed. For every external call: what happens when it fails, and does the user see it?\n4. **Neighbours.** Read the callers of anything whose signature or behaviour changed. A regression in a file the diff does not touch is the finding that matters most.\n5. **Data.** Migrations append-only; RLS on new tables; types regenerated; no secret in code; no `service_role` in a client path.\n6. **Tests.** Is the changed behaviour tested? Would the tests fail if the change were reverted? A test that cannot fail is not a test.\n\nReport findings ordered by user cost. For each: `file:line` · one sentence naming the defect · who it costs and how · the specific fix · severity **blocks the task** / **hurts the task** / **inconsistency** / **polish**. End with one line: `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. If it is genuinely fine, say so in a line; do not manufacture findings.\n',
-    '.claude/agents/security-reviewer.md': '---\nname: security-reviewer\ndescription: Reviews a change for security - RLS and policies, auth paths, secrets, input handling, edge-function exposure. Use after implementing any change that touches data, auth, edge functions or user input. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git diff:*)\n---\n\nYou review the diff for how it could be abused. You never edit.\n\nCheck, in order:\n1. **Row Level Security.** Every new or altered table has RLS enabled and policies for each operation that is meant to be allowed, scoped to the owner or tenant. Policies that use `true`, or that trust a client-supplied id, are findings.\n2. **Auth.** Protected routes and edge functions verify the session server-side. Roles are checked on the server, never only in the UI.\n3. **Secrets.** No keys, tokens or passwords in code, config, logs or client bundles. `service_role` only inside edge functions, never in anything shipped to a browser.\n4. **Input.** Everything from a request, form, webhook or file is validated before use; SQL and shell built from input are findings; uploads have type and size limits.\n5. **Exposure.** New edge functions: CORS, rate limits, what happens on malformed input, what is returned in errors (no stack traces, no internal ids that enable enumeration).\n6. **Third parties.** Webhooks verify signatures; outbound calls have timeouts; retries are bounded.\n\nReport as `file:line` · the hole · what an attacker does with it · the fix · severity **blocks the task** / **hurts the task** / **polish**. End with `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. Two lines if it is fine.\n',
+    '.claude/agents/code-reviewer.md': '---\nname: code-reviewer\ndescription: Reviews a change for correctness - logic errors, unhandled states, regressions in neighbouring code, and whether it does what was asked and nothing else. Use after implementing, before tests. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)\n---\n\nYou review the diff (`git diff` against the base branch, plus any untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for whether it is *right*, not whether it is pretty. You never edit.\n\nWork through, in order, and stop escalating once something fails:\n\n1. **Does it do what was asked, and only that?** Compare the change to the request. Anything extra is a finding; anything missing is a finding.\n2. **Logic.** Off-by-ones, inverted conditions, wrong operator, async not awaited, a promise whose rejection goes nowhere, state updated from stale values, a loop that mutates what it iterates.\n3. **States the code does not handle.** Null, empty, one, many, duplicate, concurrent, slow, failed. For every external call: what happens when it fails, and does the user see it?\n4. **Neighbours.** Read the callers of anything whose signature or behaviour changed. A regression in a file the diff does not touch is the finding that matters most.\n5. **Data.** Migrations append-only; RLS on new tables; types regenerated; no secret in code; no `service_role` in a client path.\n6. **Tests.** Is the changed behaviour tested? Would the tests fail if the change were reverted? A test that cannot fail is not a test.\n\nReport findings ordered by user cost. For each: `file:line` · one sentence naming the defect · who it costs and how · the specific fix · severity **blocks the task** / **hurts the task** / **inconsistency** / **polish**. End with one line: `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. If it is genuinely fine, say so in a line; do not manufacture findings.\n',
+    '.claude/agents/security-reviewer.md': '---\nname: security-reviewer\ndescription: Reviews a change for security - RLS and policies, auth paths, secrets, input handling, edge-function exposure. Use after implementing any change that touches data, auth, edge functions or user input. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*)\n---\n\nYou review the diff (plus untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for how it could be abused. You never edit.\n\nCheck, in order:\n1. **Row Level Security.** Every new or altered table has RLS enabled and policies for each operation that is meant to be allowed, scoped to the owner or tenant. Policies that use `true`, or that trust a client-supplied id, are findings.\n2. **Auth.** Protected routes and edge functions verify the session server-side. Roles are checked on the server, never only in the UI.\n3. **Secrets.** No keys, tokens or passwords in code, config, logs or client bundles. `service_role` only inside edge functions, never in anything shipped to a browser.\n4. **Input.** Everything from a request, form, webhook or file is validated before use; SQL and shell built from input are findings; uploads have type and size limits.\n5. **Exposure.** New edge functions: CORS, rate limits, what happens on malformed input, what is returned in errors (no stack traces, no internal ids that enable enumeration).\n6. **Third parties.** Webhooks verify signatures; outbound calls have timeouts; retries are bounded.\n\nReport as `file:line` · the hole · what an attacker does with it · the fix · severity **blocks the task** / **hurts the task** / **polish**. End with `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. Two lines if it is fine.\n',
     '.claude/agents/test-writer.md': "---\nname: test-writer\ndescription: Writes or extends tests for changed code - unit and integration - and a failing test first for every bug fix. The only agent that writes files, and only test files. Use after a change is implemented, before test-runner.\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\n---\n\nYou write tests. You write nothing else: only files under the project's test locations (`tests/`, `__tests__/`, `*.test.*`, `*.spec.*`, `e2e/`). If a test needs a change to source code, report it; do not make it.\n\n1. Read the diff. For every changed behaviour, decide the smallest test that would fail if the change were reverted.\n2. For a bug fix: write the reproducing test first and confirm it fails on the old behaviour (reason from the code if you cannot run it), then that it passes.\n3. Cover the states: empty, one, many, null, failure of any external call. Prefer one assertion per test and names that read as sentences.\n4. Use the project's existing test framework and conventions; look at a neighbouring test before writing one. Never hit production data; use the local or work-branch database, fixtures, or mocks at the boundary.\n5. Do not write tests that cannot fail, tests of the framework, or tests of private details that would break on a harmless refactor.\n\nReport: files written, what each test proves, and any source change a test would need (as a request, not an edit).\n",
     '.claude/agents/test-runner.md': '---\nname: test-runner\ndescription: Runs the project\'s checks and tests and reports the truth of them - what ran, what failed, and why. Use after implementation and after fixes. Never edits.\ntools: Read, Bash(npm:*), Bash(npx:*), Bash(pnpm:*), Bash(yarn:*), Bash(bun:*), Bash(flutter:*), Bash(python:*), Bash(pytest:*), Bash(git diff:*)\n---\n\nYou run the checks and report what actually happened. You never edit and never "fix" a test by weakening it.\n\n1. Run, in order, stopping at the first red: the type check, the linter, the unit/integration tests, using the commands in `.githooks/checks` (the same list the pre-push hook and CI run). Never against production; the work-branch database or local only.\n2. For every failure: the test name, the assertion, the first relevant line of the stack, and your reading of the cause in one sentence. Do not paste whole logs.\n3. Say what did not run and why (no tests for this area, a missing service, a timeout).\n\nEnd with `TESTS: green (<n> passed)` or `TESTS: red (<n> failed of <m>)`, then the failures. Three lines if everything is green.\n',
     '.claude/agents/qa-runner.md': "---\nname: qa-runner\ndescription: Exercises the running app the way a user would, on the work-branch URL, through Playwright - the flows in docs/UAT_PLAN.md and the ones the change touches - and reports what a user would hit. Use after tests are green and the branch is deployed. Never edits.\ntools: Read, Grep, Glob, Bash(npx playwright:*), Bash(npx:*), Bash(curl:*)\n---\n\nYou are the tester of what was built, as opposed to the code. You never edit.\n\n1. Find the base URL: `QA_BASE_URL` in the environment, else the work-branch URL in `.teknobu.json` or the work-branch `.env` file. If none, say so and stop.\n2. If the repo has Playwright (`@playwright/test` in package.json, or `e2e/`), run the end-to-end suite against that URL and report as test-runner would. If it has none, say so once and recommend `npm init playwright@latest` with a smoke suite of the UAT plan's top flows; then do the walkthrough below with `curl` for what can be checked without a browser (routes respond, auth redirects, API errors are shaped).\n3. Walk the flows in `docs/UAT_PLAN.md` that the change touches, and the three most important flows regardless. For each: the steps, what happened, what a user would think. Look specifically at empty states, a failed request, a slow request, a refresh mid-flow, a deep link.\n4. Never create data in production. Never use real customer data.\n\nReport per flow: **pass** / **fail** / **could not test** with one line of why, ordered by user cost. End with `QA: pass` or `QA: fail (<n> flows)`.\n",
     '.claude/agents/uat-writer.md': '---\nname: uat-writer\ndescription: Writes the UAT document for the current branch\'s pull request from the diff and the changelog - preconditions, test data, cases with steps and expected results, sign-off. Use before creating a PR. Haiku; formatting work.\nmodel: haiku\ntools: Read, Grep, Glob, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou write `docs/uat/<branch>-<YYYY-MM-DD>.md` for the current branch, for a tester who did not build the feature. Plain English; no code.\n\nFrom `git diff <base>...HEAD`, the CHANGELOG.md entry, and docs/UAT_PLAN.md:\n\n```\n# UAT - <feature or branch> - <date>\n\n**Branch:** <branch>   **Environment:** <work-branch URL>   **Prepared by:** Claude Code   **Status:** awaiting sign-off\n\n## What changed\nTwo to five sentences a client understands.\n\n## Preconditions\nAccounts, roles, data that must exist, feature flags.\n\n## Test data\nExactly what to type or upload, so two testers get the same result.\n\n| ID | Area | Steps | Expected | Result | Tester | Date |\n|----|------|-------|----------|--------|--------|------|\n| UAT-1 | ... | 1. ... 2. ... | ... | | | |\n\n## Not covered here\nWhat this change does not touch and why it is out of scope.\n\n## Sign-off\nName / role / date / decision (accept, accept with notes, reject).\n```\n\nOne row per behaviour a user can observe, including the failure paths. Number steps. Expected results are specific ("the row shows Verified in green", not "it works"). Also add the new cases to docs/UAT_PLAN.md so the master plan stays current. Report the path of the file written.\n',
     '.claude/agents/changelog-scribe.md': '---\nname: changelog-scribe\ndescription: Adds or updates the CHANGELOG.md entry for the current branch from the diff. Use after a change, before the Stop gate. Haiku; formatting work. Writes only CHANGELOG.md.\nmodel: haiku\ntools: Read, Edit, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou maintain CHANGELOG.md (Keep a Changelog shape: `## [Unreleased]` with Added / Changed / Fixed / Removed / Security). From `git diff <base>...HEAD` write one line per user-visible or operator-visible change, in plain language, with the area in front: `- Case search: results now deduplicate across BAILII and the National Archives.` Migrations get a line under Changed naming the table. No internal refactor chatter unless it changes behaviour. Edit only CHANGELOG.md; report the lines added.\n',
     '.claude/agents/docs-maintainer.md': '---\nname: docs-maintainer\ndescription: Keeps docs/STATUS.md current and updates docs/ARCHITECTURE.md when the shape of the system changed. Use at the end of a work block. Haiku; formatting work. Writes only under docs/.\nmodel: haiku\ntools: Read, Edit, Write, Grep, Glob, Bash(git diff:*), Bash(git log:*)\n---\n\nYou keep two documents truthful, editing nothing else.\n\n- `docs/STATUS.md`: what is being worked on now, what was finished in this block (one line each, dated), what is blocked and on whom, the next three things. Delete what is stale; keep it to one screen.\n- `docs/ARCHITECTURE.md`: only when the diff adds or removes a service, table, edge function, integration, route group, or environment variable. Update the relevant section; never rewrite the document.\n\nReport what you changed in two lines.\n',
-    '.claude/commands/post-change.md': '---\ndescription: Run the change pipeline on the current work block - parallel review, fix loop (max 2), tests, verdict, docs. Once per block, not per edit.\n---\nRun the pipeline on everything changed since the last commit on this branch (plus any uncommitted work). Do not ask questions; report each stage in a line or two.\n\n1. **Tier.** Decide fast lane or full pipeline per CLAUDE.md. Say which and why in one line.\n2. **Review, in parallel.** Launch `code-reviewer` and `security-reviewer` together (and `design-reviewer` if anything under the UI changed). Wait for all three.\n3. **Fix loop.** Fix every finding marked *blocks the task* or *hurts the task*. Re-run only the reviewer(s) that reported them. At most two rounds; if a blocker survives two rounds, stop and ask the user with the finding quoted.\n4. **Tests.** Run `test-writer` for the changed behaviour (and the failing-test-first rule for any bug fix), then `test-runner`. Red means fix and re-run; same two-round cap.\n5. **Verdict.** Write `.claude/state/<branch>/review.json`: `{"branch": "...", "at": "<ISO time>", "verdict": "clear" | "blocked", "blocking": ["..."], "reviewers": {"code": "clear|blocked", "security": "clear|blocked", "design": "clear|blocked|skipped"}, "tests": "green|red"}`. The Stop gate reads it.\n6. **Tail, in parallel.** `changelog-scribe` and `docs-maintainer` together. Then, if this block is heading for a pull request, `uat-writer`.\n7. **Summary.** Five lines: tier, findings fixed, tests, what is in the changelog, what is still open.\n\nRules: reviewers never edit; only the lead (you) and test-writer write. Never weaken a test to pass it. Never print secrets or env values.\n',
+    '.claude/agents/uat-plan-maintainer.md': '---\nname: uat-plan-maintainer\ndescription: Updates docs/UAT_PLAN.md after a change - flags invalidated scenarios, adds new ones, marks what needs client-side re-testing. Use as part of /post-change.\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\nmodel: haiku\n---\n\nYou maintain `docs/UAT_PLAN.md` only - do not modify any other file.\n\nGiven the current branch\'s diff (`git diff` against the base branch), changelog entry, and impact report:\n\n1. Mark existing UAT scenarios touched by this change as **RE-TEST REQUIRED**, with the\n   reason and date.\n2. Add scenarios for any new behaviour: ID, preconditions, steps, expected result,\n   tenant/role to test as.\n3. Flag anything that needs **client-side verification** (real accounts, live\n   integrations, third-party services) separately from internal testing.\n4. Keep a short "Changed in this cycle" list at the top so a human can brief UAT in\n   two minutes.\n\nScenario IDs are stable - never renumber existing ones. Retired scenarios are moved to\nan Archive section, not deleted.\n',
+    '.claude/commands/post-change.md': '---\ndescription: Run the change pipeline on the current work block - parallel review, fix loop (max 2), tests, verdict, docs. Once per block, not per edit.\n---\nRun the pipeline on everything changed since the last commit on this branch (plus any uncommitted work). Do not ask questions; report each stage in a line or two.\n\n1. **Tier.** Decide fast lane or full pipeline per CLAUDE.md. Say which and why in one line.\n2. **Review, in parallel.** Launch `code-reviewer` and `security-reviewer` together (and `design-reviewer` if anything under the UI changed). Wait for all three.\n3. **Fix loop.** Fix every finding marked *blocks the task* or *hurts the task*. Re-run only the reviewer(s) that reported them. At most two rounds; if a blocker survives two rounds, stop and ask the user with the finding quoted.\n4. **Tests.** Run `test-writer` for the changed behaviour (and the failing-test-first rule for any bug fix), then `test-runner`. Red means fix and re-run; same two-round cap.\n5. **Verdict.** After the last code or test edit of the block, run `sh .claude/hooks/pipeline-state.sh sig` from the repo root, then write `.claude/state/<branch>/review.json`: `{"branch": "...", "at": "<ISO time>", "sig": "<the sig output>", "verdict": "clear" | "blocked", "blocking": ["..."], "reviewers": {"code": "clear|blocked", "security": "clear|blocked", "design": "clear|blocked|skipped"}, "tests": "green|red"}`. The Stop gate blocks until this exists, covers the reviewers the diff makes due, and matches the current sig - any later code edit makes it stale.\n6. **Tail, in parallel.** `changelog-scribe`, `docs-maintainer` and `uat-plan-maintainer` together. Then, if this block is heading for a pull request, `uat-writer`.\n7. **Summary.** Five lines: tier, findings fixed, tests, what is in the changelog, what is still open.\n\nRules: reviewers never edit; only the lead (you) and test-writer write. Never weaken a test to pass it. Never print secrets or env values.\n',
     '.claude/commands/design-pass.md': "---\ndescription: Design-led polish of a screen within the design contract - applies the design-reviewer's polish and consistency findings in the fast lane; leaves anything that blocks or hurts the task for a human.\nargument-hint: <screen or component path>\n---\nRun `design-reviewer` on $ARGUMENTS (or on the screens touched since the last commit if no argument).\n\nThen, in the fast lane and without asking:\n- Apply every finding marked **polish** or **inconsistency**: spacing, hierarchy by size/weight/space, empty/loading/error states, reuse of the existing component for the same job, tokens instead of literals, accessible names, focus rings.\n- Do not touch data flow, contracts, handlers, or logic. If a finding needs any of those, leave it and list it.\n- Do not apply findings marked **blocks the task** or **hurts the task**; list them for the user with the reviewer's wording.\n\nRe-run `design-reviewer` once on the result. Report: what was applied (file:line), what was left and why, and the screens a human should open to see the result. Commit message if asked: `style: design pass on <screen>`.\n",
     '.claude/commands/worktree.md': '---\ndescription: Manage git worktrees for parallel sessions - new <branch> creates a sibling worktree wired for the worklog, list shows state, clean removes merged ones\nargument-hint: new <branch> | list | clean\n---\nRun `python "$HOME/.claude/sonelo/repo_setup.py" worktree $ARGUMENTS` from the repo root (default to `list` when no argument was given) and relay its output plainly.\n- `new <branch>`: report the created path and tell the user to open their next Claude Code session there; the worklog is pre-stamped to report under this repo\'s project.\n- `clean`: a "kept" line is information for the user - uncommitted work, or a branch git cannot prove merged (squash merges look unmerged). Never force-remove a worktree and never delete branches to make clean succeed.\n',
     '.claude/commands/pr.md': '---\ndescription: Create the pull request for this branch into production - pipeline verdict must be clear, UAT document required, PR body is the UAT document.\n---\n1. Confirm `.claude/state/<branch>/review.json` exists with `"verdict": "clear"` and `"tests": "green"` from this branch\'s latest work. If not, run `/post-change` first.\n2. Run `uat-writer` if `docs/uat/` has no document for this branch dated today. Commit it: `docs: UAT for <branch>`.\n3. Push the branch. Create the PR with `gh pr create --base <production branch> --head <branch> --title "<conventional summary>" --body-file docs/uat/<the document>`. Add the changelog lines under a "## Changes" heading in the body if the PR template asks for them.\n4. Report the PR URL, the gates that must pass, and the UAT document path. Never print secrets.\n',
-    '.claude/hooks/post-edit.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PostToolUse hook on Edit/Write/MultiEdit.\n# Type-checks and lints the edited file\'s project so errors surface immediately. Exit 2 feeds the output back to Claude.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\n[ -z "$file" ] && exit 0\ncase "$file" in\n  *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts) ;;\n  *) exit 0 ;;\nesac\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nout=""\nif [ -f tsconfig.json ]; then\n  tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$tsc_out" ] && out="$out\n[typecheck]\n$tsc_out"\nfi\nif [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then\n  es_out=$(timeout 60 npx --no-install eslint "$file" 2>&1 | grep -v \'^$\' | head -40)\n  [ -n "$es_out" ] && out="$out\n[lint]\n$es_out"\nfi\nif [ -n "$out" ]; then\n  printf \'%s\\n\' "Fix these before continuing (from the post-edit hook on $file):$out" >&2\n  exit 2\nfi\nexit 0\n',
+    '.claude/hooks/post-edit.sh': POST_EDIT_SH,
     '.claude/hooks/guard-migrations.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PreToolUse hook on Edit/Write/MultiEdit. Migrations are append-only.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\ncase "$file" in\n  *supabase/migrations/*|*supabase\\\\migrations\\\\*) ;;\n  *) exit 0 ;;\nesac\nif [ -f "$file" ]; then\n  echo "Blocked: $file is an existing migration. Migrations are append-only - create a new file under supabase/migrations/ instead. (SONELO_SKIP_HOOKS=1 overrides, say why in the commit.)" >&2\n  exit 2\nfi\nexit 0\n',
-    '.claude/hooks/stop-gate.sh': '#!/bin/sh\n# sonelo-devkit pipeline: Stop hook. Blocks the session from stopping while "done" is not true.\n# Checks: (1) code changed -> CHANGELOG.md changed; (2) migrations changed -> generated types changed;\n# (3) the pipeline verdict for this branch is not "blocked". Exit 2 with the reason keeps Claude working.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0\ncd "$root" || exit 0\nbranch=$(git branch --show-current 2>/dev/null)\nmain=$(python -c "import json; print((json.load(open(\'.teknobu.json\')).get(\'protected\') or [\'main\'])[0])" 2>/dev/null || echo main)\ntypes=$(python -c "import json; print(json.load(open(\'.teknobu.json\')).get(\'generated_types\') or \'src/types/database.ts\')" 2>/dev/null || echo src/types/database.ts)\n# The working tree is this session\'s work; the branch-level check (code vs changelog vs UAT across the whole PR) is CI\'s job.\nchanged=$( { git diff --name-only 2>/dev/null; git diff --name-only --cached 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u)\n[ -z "$changed" ] && exit 0\ncode=$(printf \'%s\\n\' "$changed" | grep -Ev \'^(docs/|CHANGELOG\\.md|README|\\.claude/|\\.github/|PRELIVE\\.md|STAGING\\.md|[A-Z]+\\.md|.*\\.md$)\' | grep -Ev \'^\\.(env|teknobu)\' | head -1)\nreasons=""\nif [ -n "$code" ] && ! printf \'%s\\n\' "$changed" | grep -q \'^CHANGELOG\\.md$\'; then\n  reasons="$reasons\n- Code changed but CHANGELOG.md has no entry for it. Run changelog-scribe (or /post-change)."\nfi\nif printf \'%s\\n\' "$changed" | grep -q \'^supabase/migrations/\' && ! printf \'%s\\n\' "$changed" | grep -q "^$types\\$"; then\n  reasons="$reasons\n- A migration changed but $types was not regenerated. Run the types generation command from .claude/rules/supabase.md and commit it."\nfi\nverdict=".claude/state/$branch/review.json"\nif [ -f "$verdict" ]; then\n  v=$(python -c "import json; print(json.load(open(\'$verdict\')).get(\'verdict\',\'\'))" 2>/dev/null)\n  if [ "$v" = "blocked" ]; then\n    reasons="$reasons\n- The pipeline verdict for $branch is blocked (see $verdict). Fix the blocking findings and re-run /post-change."\n  fi\nfi\nif [ -n "$reasons" ]; then\n  printf \'%s\\n\' "Not done yet:$reasons" >&2\n  exit 2\nfi\nexit 0\n',
+    '.claude/hooks/stop-gate.sh': STOP_GATE_SH,
+    '.claude/hooks/pipeline-state.sh': PIPELINE_STATE_SH,
+    '.claude/hooks/session-brief.sh': SESSION_BRIEF_SH,
     '.claude/rules/supabase.md': '---\npaths: ["supabase/**", "src/integrations/supabase/**", "src/lib/supabase*"]\n---\n# Supabase rules\n- Migrations are append-only files under `supabase/migrations/`; never edit an existing one, never change schema in a dashboard. After any migration change regenerate types: `{GEN_TYPES}` and commit the result.\n- Every table has RLS enabled with a policy per allowed operation, scoped to the owner or tenant. No `using (true)` outside intentionally public reads.\n- `service_role` only in edge functions. Clients use the publishable/anon key.\n- Edge functions validate input, return shaped errors (no stack traces), set CORS explicitly, and read secrets from `Deno.env.get`, never from code.\n- Local development and tests point at the work-branch database or `supabase start`; never at production.\n',
     '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
     '.github/pull_request_template.md': '<!-- sonelo-devkit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n',
@@ -715,7 +949,7 @@ BUILTIN_PIPELINE = {
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
 }
-PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Hooks, the Stop gate and CI still apply.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing.\n- If unsure which tier a change is, it is full pipeline.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user.\n'
+PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/ | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
 
 LANDING_COMMAND_MD = '''---
 description: Open this repo's landing page - commands, agents, state, environments, docs, worklog - in the browser
@@ -892,6 +1126,20 @@ class Report:
 
     def note(self, action, what):
         self.rows.append((action, what))
+
+
+def merge_gitattributes(root, rep):
+    path = root / ".gitattributes"
+    existing = read(path) or ""
+    have = set(l.strip() for l in existing.splitlines())
+    missing = [l for l in GITATTRIBUTES_LINES if l not in have and not l.startswith("#")]
+    if not missing:
+        rep.note("unchanged", path)
+        return
+    text = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + "# sonelo standards\n" + "\n".join(missing) + "\n"
+    if not rep.dry:
+        write(path, text)
+    rep.note("updated" if existing else "created", path)
 
 
 def merge_gitignore(root, rep):
@@ -1119,13 +1367,14 @@ def copy_pipeline(root, rep, d=None, update=False):
             n_starter += 1
         rep.note("starter: %d file%s copied" % (n_starter, "" if n_starter == 1 else "s"), PIPELINE_DIR)
     vars_ = pipeline_vars(root, d)
+    seed_only = {"docs/STATUS.md", "docs/ARCHITECTURE.md", "docs/UAT_PLAN.md"}   # living documents: created once, never refreshed
     n_new = n_upd = 0
     backup = root / ".claude" / ".backup" / datetime.now().strftime("%Y%m%d-%H%M%S")
     for rel, tpl in BUILTIN_PIPELINE.items():
         dst = root / rel
         text = fill(tpl, **vars_)
         if dst.exists():
-            if not update or (read(dst) or "") == text:
+            if not update or rel in seed_only or (read(dst) or "") == text:
                 continue
             if not rep.dry:
                 backup.mkdir(parents=True, exist_ok=True)
@@ -1150,7 +1399,7 @@ def copy_pipeline(root, rep, d=None, update=False):
 
 
 def merge_settings_hooks(root, rep):
-    """Register the three hooks in the repo's .claude/settings.json without disturbing anything else in it."""
+    """Register the four hooks in the repo's .claude/settings.json without disturbing anything else in it."""
     path = root / ".claude" / "settings.json"
     data = read_json(path, None) if path.exists() else {}
     if data is None:
@@ -1161,6 +1410,7 @@ def merge_settings_hooks(root, rep):
         "PreToolUse": ("Edit|Write|MultiEdit", 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-migrations.sh"', 10),
         "PostToolUse": ("Edit|Write|MultiEdit", 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/post-edit.sh"', 120),
         "Stop": ("", 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-gate.sh"', 30),
+        "SessionStart": ("", 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/session-brief.sh"', 15),
     }
     changed = False
     for event, (matcher, cmd, timeout) in wanted.items():
@@ -1183,7 +1433,7 @@ def merge_settings_hooks(root, rep):
     if changed:
         if not rep.dry:
             write(path, json.dumps(data, indent=2) + "\n")
-        rep.note("hooks registered (PreToolUse migrations guard, PostToolUse typecheck+lint, Stop gate)", path)
+        rep.note("hooks registered (PreToolUse migrations guard, PostToolUse typecheck+lint, Stop gate, SessionStart brief)", path)
     else:
         rep.note("unchanged (hooks present)", path)
 
@@ -1210,14 +1460,25 @@ def supabase_init(root):
     return (root / "supabase" / "config.toml").exists()
 
 
-def design_files(root, d, rep):
+def design_files(root, d, rep, update=False):
     agent = root / ".claude" / "agents" / "design-reviewer.md"
     if not agent.exists():
         if not rep.dry:
             write(agent, DESIGN_REVIEWER_MD)
         rep.note("created", agent)
     else:
-        rep.note("unchanged (yours)", agent)
+        # The body may carry per-repo brand edits and is never regenerated; --update-pipeline
+        # refreshes only the tools: line so kit-wide tool additions still propagate.
+        text = read(agent) or ""
+        prior = "tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*)"   # the line every kit before v4.2 shipped
+        m = re.search(r"(?m)^tools: .*$", text)
+        wanted = re.search(r"(?m)^tools: .*$", DESIGN_REVIEWER_MD).group(0)
+        if update and m and m.group(0) == prior and m.group(0) != wanted:
+            if not rep.dry:
+                write(agent, text.replace(m.group(0), wanted, 1))
+            rep.note("tools line refreshed (body kept - yours)", agent)
+        else:
+            rep.note("unchanged (yours)", agent)
     rule = root / ".claude" / "rules" / "design.md"
     if not rule.exists():
         if not rep.dry:
@@ -1442,9 +1703,10 @@ def cmd_apply(args):
     copy_pipeline(root, rep, d, update=args.update_pipeline)   # starter first, built-ins fill the gaps
     claude_md(root, rep, update=args.update_pipeline)
     merge_gitignore(root, rep)
+    merge_gitattributes(root, rep)
     env_example(root, rep)
     env_prelive(root, rep)
-    design_files(root, d, rep)
+    design_files(root, d, rep, update=args.update_pipeline)
     fill_placeholders(root, d, rep)
     spa_rewrites(root, d, rep)
     lovable_notes(root, d, rep)
@@ -1489,7 +1751,7 @@ def status(root):
     items.append((env_doc(), (root / env_doc()).exists()))
     cfg = read_json(root / ".teknobu.json", {})
     items.append((".teknobu.json (kit v%s)" % cfg.get("kit", "?"), bool(cfg)))
-    items.append(("pipeline (agents, /post-change, /pr, hooks)", (root / ".claude" / "agents" / "code-reviewer.md").exists() and (root / ".claude" / "hooks" / "stop-gate.sh").exists()))
+    items.append(("pipeline (agents, /post-change, /pr, hooks)", (root / ".claude" / "agents" / "code-reviewer.md").exists() and (root / ".claude" / "hooks" / "stop-gate.sh").exists() and (root / ".claude" / "hooks" / "pipeline-state.sh").exists()))
     if WORKLOG.exists():
         items.append(("worklog agent", (root / ".worklog" / "worklog_agent.py").exists()))
     return items, cfg
@@ -1510,6 +1772,31 @@ def cmd_check(args):
     sys.exit(0 if not missing else 1)
 
 
+def update_available(now=None, fetch=None):
+    """The newest released kit tag when it is newer than this install, else None.
+    The network is asked at most once a day (UPDATE_STAMP mtime is the throttle); the last
+    seen tag is cached in the stamp so every session start can still speak without a
+    request. Silent on every failure - the nudge must never delay or break a session."""
+    try:
+        now = time.time() if now is None else now
+        if UPDATE_STAMP.exists() and now - UPDATE_STAMP.stat().st_mtime < 86400:
+            tag = UPDATE_STAMP.read_text(encoding="utf-8").strip()
+        else:
+            if fetch is None:
+                fetch = lambda: latest_tag(CONFIG.get("source") or DEFAULTS["source"], to=3)
+            try:
+                tag = (fetch() or "").strip()
+            except Exception:
+                tag = ""                          # failed check still stamps: retry tomorrow, not every session
+            write(UPDATE_STAMP, tag + "\n")
+        ver = tag.lstrip("v")
+        if ver and re.fullmatch(r"[0-9]+(\.[0-9]+)*", ver) and tuple(map(int, ver.split("."))) > tuple(map(int, VERSION.split("."))):
+            return tag
+    except Exception:
+        pass
+    return None
+
+
 def cmd_nudge(args):
     """User-level SessionStart hook. Prints one line only when something is worth saying; stdout becomes session context."""
     try:
@@ -1523,6 +1810,10 @@ def cmd_nudge(args):
             cur = sh(["git", "-C", str(root), "config", "--get", "core.hooksPath"]).stdout.strip()
             if cur != ".githooks":
                 sh(["git", "-C", str(root), "config", "core.hooksPath", ".githooks"])  # fresh clone: activate the committed hooks
+            tag = update_available()
+            if tag:
+                say("Sonelo kit %s is released; this machine has v%s. Ask the user: update now? If yes, run `python \"%s\" update`, then offer `apply --update-pipeline` in this repo." % (tag, VERSION, INSTALLED.as_posix()))
+                return
             if cfg.get("kit") and tuple(map(int, str(cfg["kit"]).split("."))) < tuple(map(int, VERSION.split("."))):
                 say("Teknobu standards kit v%s is installed but this repo was set up with v%s. Offer to run /repo-setup to refresh the generated files." % (VERSION, cfg["kit"]))
             return
@@ -2149,10 +2440,10 @@ def http_get(url, to=60):
         return resp.read()
 
 
-def latest_tag(repo):
+def latest_tag(repo, to=60):
     """Version of the latest release without the API (which rate-limits anonymous callers): follow the /releases/latest redirect."""
     req = urllib.request.Request("https://github.com/%s/releases/latest" % repo, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=to) as resp:
         m = re.search(r"/releases/tag/([^/?#]+)", resp.geturl())
         return m.group(1) if m else None
 

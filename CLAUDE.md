@@ -37,18 +37,30 @@ At the start of every session, read `docs/STATUS.md` before doing anything else.
 <!-- sonelo-devkit:pipeline:start -->
 ## Change pipeline
 
-Every change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block, not per edit.
+Every change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.
 
 ### Risk tiers
-- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Hooks, the Stop gate and CI still apply.
-- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing.
+- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply.
+- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.
 - If unsure which tier a change is, it is full pipeline.
+
+### Reviewers are triggered by the diff, not by memory
+The hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:
+
+| Changed | Reviewer due |
+|---|---|
+| any code | `code-reviewer` |
+| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |
+| supabase/, functions/, auth paths, .github/workflows/ | `security-reviewer` |
+
+Run the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.
 
 ### Rules that prevent bugs
 - Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.
 - Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.
 - Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.
 - The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.
+- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.
 - "Done" means: reviewers' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.
 
 ### Design-led, build-safe
@@ -57,10 +69,10 @@ Every change goes through: plan -> implement -> review -> test -> verdict -> doc
 - `/design-pass <screen>` applies the design-reviewer's polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.
 
 ### Loop cap
-- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user.
+- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.
 <!-- sonelo-devkit:pipeline:end -->
 
-<!-- sonelo-devkit:start v4.1 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:start v4.2 (managed by repo_setup.py; edit outside these markers) -->
 ## Sonelo standards
 
 **Branches.** Work on `prelive`; it deploys to its own URL and database. `main` is production and only changes through a pull request from `prelive` (`gh pr create --base main --head prelive --fill`). Never push to `main` directly and never force-push `prelive` or `main`. If you find yourself on `main` with uncommitted work, switch to `prelive` first.
