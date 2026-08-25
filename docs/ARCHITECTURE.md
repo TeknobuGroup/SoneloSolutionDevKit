@@ -18,6 +18,9 @@ None in the kit. Kit provides: `/repo-setup` Claude Code command, `/landing` pag
 - Vercel: Project creation from repo, branch domain binding, per-environment secrets
 - Claude Code: Session tracking for worklog
 
+## Change pipeline
+Event-driven: `.claude/hooks/pipeline-state.sh` derives the changed set, reviewable subset, and due reviewers (code always; design on tsx/jsx/css/tailwind; security on supabase/functions/auth paths); computes a content signature ("sig") of the filtered diff. `stop-gate.sh` requires a fresh verdict covering every due reviewer with matching sig (count-based valve: at most two blocks per sig, second demands disclosure). `session-brief.sh` states outstanding debt at session open. Verdicts and sig stored in `.claude/state/<branch>/review.json`, not committed. Releases cut by `.github/workflows/release.yml` on every main merge. SessionStart nudge offers `update` (daily throttled, 3s timeout, silent offline) and `apply --update-pipeline` per target repo — both require consent, never auto-applied.
+
 ## Environments
 - Local: dev machine, `~/.claude/sonelo/` config, Python + CLIs
 - Prelive (configured branch, default `staging`): separate Supabase project/branch and Vercel preview URL

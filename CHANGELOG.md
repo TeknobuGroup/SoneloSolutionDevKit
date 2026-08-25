@@ -3,11 +3,23 @@
 ## [Unreleased]
 
 ### Added
+- Kit 4.2: event-driven pipeline — new hooks pipeline-state.sh (computes the changed set, due reviewers, work signature, and verdict state) and session-brief.sh (SessionStart line stating review debt); uat-plan-maintainer now ships to target repos and runs in /post-change's tail; CI workflow (release.yml) cuts a GitHub release on every merge to main; session-start nudge offers `update` when a newer release exists (daily check, offline-silent, always asks first); ships .gitattributes (LF for sh hooks); .claude/state/ now gitignored. Decision recorded in docs/decisions/0003.
 - Kit 4.1: worktree management for parallel sessions — `repo_setup.py worktree new <branch> | list | clean` creates sibling worktrees pre-wired to report under the parent repo's worklog project, uses tag-proof fully-qualified refs to detect merge state with no false positives from same-named tags, identifies "no commits yet" for fresh branches, and removes only clean, provably-merged worktrees (branches never deleted); new worktrees get shared info/exclude stamping so non-kit repos don't read `.worklog/` as dirt; work_branch config is validated before git operations; ships to every repo as the `/worktree` command. Decision recorded in docs/decisions/0002. Adds 21 unit tests (98 total); CI now runs the suite.
 - Worklog 1.16: works inside git worktrees — the post-commit hook and local excludes now resolve the real git directory via `git rev-parse --git-path` (a worktree's `.git` is a pointer file, which crashed install); failing-test-first fix.
 - Worklog 1.15: the agent upgrades itself mid-session — every hook run adopts a newer machine copy for the next run, so always-on machines no longer wait for a session restart — with compile-verified atomic writes preventing torn copies (both the pot bin copy and the running copy are written atomically); upgrades announce themselves: the session-start message says what changed, the dashboard header shows "worklog vX · new: ..." for 7 days after a version first renders, and the morning page carries the same line for 3 days. Adds 39 new unit tests covering the upgrade guard, what's-new state management, version parsing, and render restamp logic (75 total).
 - Worklog 1.14: the dashboard's Agents card and the weekly report group agent usage by project (project totals with agents beneath, share bars), agents display friendly persona names with raw agent IDs on hover — built-in map overridable via `"agent_names"` in `~/.claude/worklog.json` (malformed config ignored safely). New stdlib unit-test suite wired into .githooks/checks alongside py_compile. History renders with the new names.
 - Teknobu standards kit v3.2: CLAUDE.md project instructions, .teknobu.json configuration, git hooks for commit format and branch protection, GitHub workflows and PR template, documentation structure, and .gitignore rules for standard artifacts.
+
+### Changed
+- Kit 4.2: Stop gate now requires a fresh review verdict covering the reviewers the diff makes due; blocks at most twice per work-state then demands plain disclosure.
+- Kit 4.2: post-edit hook nudges once per branch when a full-pipeline path is edited without an impact report; eslint invocation hardened (`--`).
+- Kit 4.2: Reviewer agents (code, security, design) can now see untracked files via `git status` and `ls-files`.
+- Kit 4.2: .github/workflows/ counts as code and triggers the security reviewer.
+- Kit 4.2: --update-pipeline no longer overwrites living docs (STATUS/ARCHITECTURE/UAT_PLAN) — it wiped them before.
+- VERSION 4.1 -> 4.2.
+
+### Fixed
+- Kit 4.2: missing review verdict used to pass silently at Stop gate.
 
 ## 4.0
 - Renamed: the kit is now the **Sonelo Solution DevKit** (repo `TeknobuGroup/SoneloSolutionDevKit`). Machine home moves to `~/.claude/sonelo` with automatic migration; old markers, `.teknobu.json` and `TEKNOBU_*` escape hatches remain recognised. New escape hatches: `SONELO_SKIP`, `SONELO_ALLOW_MAIN`, `SONELO_SKIP_HOOKS`. Presets: `sonelo` (alias of `teknobu`).
