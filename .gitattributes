@@ -1,0 +1,3 @@
+# sonelo standards
+*.sh text eol=lf
+.githooks/* text eol=lf

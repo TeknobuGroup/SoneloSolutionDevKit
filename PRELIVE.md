@@ -1,4 +1,4 @@
-<!-- sonelo-devkit v4.1 -->
+<!-- sonelo-devkit v4.2 -->
 # Prelive setup for teknobu-kit
 
 Branch model: work on **prelive**, which deploys to its own URL and database. **main** is production and only moves by pull request.

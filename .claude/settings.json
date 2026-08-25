@@ -50,6 +50,17 @@
         ],
         "matcher": "Edit|Write|MultiEdit"
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-brief.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   },
   "workflowSizeGuideline": "small"

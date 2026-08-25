@@ -1,13 +1,13 @@
 ---
 name: uat-plan-maintainer
-description: Updates docs/UAT_PLAN.md after a change — flags invalidated scenarios, adds new ones, marks what needs client-side re-testing. Use as part of /post-change.
-tools: Read, Grep, Glob, Write, Edit
+description: Updates docs/UAT_PLAN.md after a change - flags invalidated scenarios, adds new ones, marks what needs client-side re-testing. Use as part of /post-change.
+tools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)
 model: haiku
 ---
 
-You maintain `docs/UAT_PLAN.md` only — do not modify any other file.
+You maintain `docs/UAT_PLAN.md` only - do not modify any other file.
 
-Given the current branch's diff, changelog entry, and impact report:
+Given the current branch's diff (`git diff` against the base branch), changelog entry, and impact report:
 
 1. Mark existing UAT scenarios touched by this change as **RE-TEST REQUIRED**, with the
    reason and date.
@@ -18,5 +18,5 @@ Given the current branch's diff, changelog entry, and impact report:
 4. Keep a short "Changed in this cycle" list at the top so a human can brief UAT in
    two minutes.
 
-Scenario IDs are stable — never renumber existing ones. Retired scenarios are moved to
+Scenario IDs are stable - never renumber existing ones. Retired scenarios are moved to
 an Archive section, not deleted.

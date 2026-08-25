@@ -1,0 +1,45 @@
+# sonelo-devkit: cut a GitHub release on every merge to main so `repo_setup.py update`
+# and the SessionStart nudge on every machine can see it (ADR-0003). The tag comes from
+# VERSION in repo_setup.py; a merge that does not bump it (docs, fixes batched for the
+# next cut) is skipped because the tag already exists. The zip keeps worklog_agent.py
+# next to repo_setup.py - install's bundled-worklog path requires that layout.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: read VERSION and check the tag
+        run: |
+          ver=$(python3 -c "import re; print(re.search(r'^VERSION = \"([0-9.]+)\"', open('repo_setup.py').read(), re.M).group(1))")
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if git ls-remote --tags origin "refs/tags/v$ver" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$ver already released - nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.ver.outputs.exists == 'false'
+        name: package the kit
+        run: |
+          mkdir -p SoneloSolutionDevKit
+          cp repo_setup.py worklog_agent.py install.sh install.cmd README.md LICENSE SoneloSolutionDevKit/
+          zip -r "SoneloSolutionDevKit-v${{ steps.ver.outputs.ver }}.zip" SoneloSolutionDevKit
+      - if: steps.ver.outputs.exists == 'false'
+        name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.ver }}" \
+            "SoneloSolutionDevKit-v${{ steps.ver.outputs.ver }}.zip" \
+            --title "Kit v${{ steps.ver.outputs.ver }}" --generate-notes
