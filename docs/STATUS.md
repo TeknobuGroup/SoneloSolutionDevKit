@@ -1,6 +1,9 @@
 # STATUS - teknobu-kit
 
 ## Now
+- **kit v4.4 is PARKED on branch `kit-4.4`** (commit d881136, unmerged, not released). It fixes real damage v4.3 caused — see Done recently. 151 tests green, but it is NOT reviewed to a clear verdict: two review rounds, and a new defect was introduced in each (round 1 corrupted YAML block lists; round 2 overwrote edited files, reproducing the MediaStack incident on the release written to prevent it). Both were caught by review, neither by the author. security-reviewer's final verdict is clear and it independently confirmed the round-2 blocker fixed; code-reviewer's last word was blocked and it never re-confirmed; five edits landed after both. **Before merging: get code-reviewer to confirm the `keep` policy and `merge_frontmatter`.** Read `docs/decisions/0005` on that branch first.
+- v4.3 is the released version and what every machine runs. Nothing in flight affects it.
+
 - kit v4.3 shipped: PR #5 merged, release.yml cut v4.3 in 13s, this machine updated. Rollout outstanding per repo (see Next 1). Every shipped agent declares its model, the two heavyweight reviewers have a reading budget, and `refresh` is the narrow verb for taking a release. ADR-0004 records why.
 
 ## Done recently
