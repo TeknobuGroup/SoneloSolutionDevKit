@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   checks:
     name: checks
@@ -23,3 +25,21 @@ jobs:
           echo '{"name":"r","scripts":{"build":"echo build","test":"echo test"}}' > package.json && git add -A && git commit -qm "chore: init"
           HOME=$RUNNER_TEMP/h WORKLOG_NO_OPEN=1 python $RUNNER_TEMP/h/.claude/sonelo/repo_setup.py apply
           HOME=$RUNNER_TEMP/h python $RUNNER_TEMP/h/.claude/sonelo/repo_setup.py check
+      - name: Refresh the scratch repo (dry run, then for real, then still healthy)
+        run: |
+          cd "$RUNNER_TEMP/r"
+          cp .github/workflows/ci.yml "$RUNNER_TEMP/ci-before.yml"
+          # Downgrade what refresh is supposed to restore, or the assertions below cannot fail:
+          # the preceding `apply` already wrote this frontmatter from the same kit.
+          sed -i '/^model: sonnet$/d' .claude/agents/design-reviewer.md
+          # a pre-v4.3 repo has no .claude/.backup/ line; the self-ignoring file is what must cover it
+          sed -i '\#^\.claude/\.backup/$#d' .gitignore
+          echo '# hand edit' >> .githooks/checks
+          HOME=$RUNNER_TEMP/h python "$RUNNER_TEMP/h/.claude/sonelo/repo_setup.py" refresh --dry-run
+          if grep -q '^model: sonnet$' .claude/agents/design-reviewer.md; then echo "::error::--dry-run wrote to the repo"; exit 1; fi
+          HOME=$RUNNER_TEMP/h python "$RUNNER_TEMP/h/.claude/sonelo/repo_setup.py" refresh
+          grep -q '^model: sonnet$' .claude/agents/design-reviewer.md || { echo "::error::design-reviewer frontmatter did not reach the repo"; exit 1; }
+          cmp -s "$RUNNER_TEMP/ci-before.yml" .github/workflows/ci.yml || { echo "::error::refresh rewrote the repo's own ci.yml"; exit 1; }
+          grep -q '# hand edit' .githooks/checks || { echo "::error::refresh clobbered .githooks/checks"; exit 1; }
+          if git status --porcelain | grep -q '\.claude/\.backup'; then echo "::error::backups are not ignored"; exit 1; fi
+          HOME=$RUNNER_TEMP/h python "$RUNNER_TEMP/h/.claude/sonelo/repo_setup.py" check

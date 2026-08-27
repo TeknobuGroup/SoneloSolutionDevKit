@@ -12,6 +12,7 @@ import atexit
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -187,6 +188,195 @@ class SeedDocsNeverRefreshed(unittest.TestCase):
             self.assertEqual((root / rel).read_text(encoding="utf-8"), "# living content\n", rel)
         self.assertNotEqual((root / ".claude/hooks/stop-gate.sh").read_text(encoding="utf-8"),
                             "# stale hook\n", "shipped hooks must still refresh")
+
+class AgentModelsDeclared(unittest.TestCase):
+    """v4.3: every shipped agent declares the model it runs on, so a reviewer does not
+    silently inherit the session's Opus. The three that gate correctness deliberately
+    declare nothing and inherit - pinned here so nobody "tidies" them onto a cheap model."""
+
+    SONNET = ("design-reviewer", "test-writer", "test-runner", "qa-runner")
+    HAIKU = ("changelog-scribe", "docs-maintainer", "uat-writer", "uat-plan-maintainer")
+    INHERITS = ("code-reviewer", "security-reviewer", "impact-analyst")
+
+    def body(self, name):
+        rel = ".claude/agents/%s.md" % name
+        self.assertIn(rel, rs.BUILTIN_PIPELINE, "%s must ship from BUILTIN_PIPELINE" % name)
+        return rs.BUILTIN_PIPELINE[rel]
+
+    def test_sonnet_agents(self):
+        for name in self.SONNET:
+            self.assertIn("\nmodel: sonnet\n", self.body(name), name)
+
+    def test_haiku_agents(self):
+        for name in self.HAIKU:
+            self.assertIn("\nmodel: haiku\n", self.body(name), name)
+
+    def test_gating_agents_inherit(self):
+        for name in self.INHERITS:
+            self.assertNotIn("\nmodel:", self.body(name),
+                             "%s gates correctness and must inherit the session model" % name)
+
+
+class DesignReviewerRefreshes(unittest.TestCase):
+    """design-reviewer used to be carved out of the refresh path (design_files kept the body and
+    rewrote only a hardcoded `tools:` line), so kit-wide frontmatter changes never reached a repo
+    that already had the file. It now ships from BUILTIN_PIPELINE like every other agent."""
+
+    REL = ".claude/agents/design-reviewer.md"
+
+    def test_frontmatter_change_reaches_an_existing_repo(self):
+        root = make_temp_dir(self)
+        rs.copy_pipeline(root, rs.Report(False), update=False)
+        agent = root / self.REL
+        self.assertTrue(agent.exists(), "design-reviewer must ship on a plain apply")
+        agent.write_text(agent.read_text(encoding="utf-8").replace("\nmodel: sonnet\n", "\n"),
+                         encoding="utf-8")
+        rs.copy_pipeline(root, rs.Report(False), update=True)
+        self.assertIn("\nmodel: sonnet\n", agent.read_text(encoding="utf-8"),
+                      "--update-pipeline must restore the kit's design-reviewer frontmatter")
+
+    def test_design_contract_is_not_overwritten(self):
+        """The per-repo brand file stays the repo's own - the real reason for the old carve-out.
+        design_files() is the function that decides, so it is the one under test."""
+        root = make_temp_dir(self)
+        rules = root / ".claude" / "rules" / "design.md"
+        rules.parent.mkdir(parents=True, exist_ok=True)
+        rules.write_text("# our brand\n", encoding="utf-8")
+        rs.design_files(root, {}, rs.Report(False), update=True)
+        self.assertEqual(rules.read_text(encoding="utf-8"), "# our brand\n")
+        self.assertNotIn(".claude/rules/design.md", rs.BUILTIN_PIPELINE,
+                         "the brand contract must never be a refreshable kit file")
+
+
+class RefreshIsNarrow(unittest.TestCase):
+    """`refresh` exists so a repo can take the current agents/commands/hooks without the rest of
+    `apply`. Anything it touches beyond the pipeline is a bug."""
+
+    def args(self, root, dry_run=False):
+        import argparse
+        return argparse.Namespace(repo=str(root), dry_run=dry_run)
+
+    def make_repo(self):
+        """cmd_refresh resolves its root through git, so the fixture has to be a real repo.
+
+        ensure_installed() and use_repo_config() are neutralised: a unit test must not install
+        the kit onto the machine running it, and use_repo_config mutates module globals that
+        would otherwise leak into every later test in the process."""
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not on PATH")
+        self.addCleanup(setattr, rs, "ensure_installed", rs.ensure_installed)
+        rs.ensure_installed = lambda: False
+        self.addCleanup(setattr, rs, "WORK_BRANCH", rs.WORK_BRANCH)
+        self.addCleanup(setattr, rs, "PROTECTED", list(rs.PROTECTED))
+        root = make_temp_dir(self)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run([git, "init", str(root)], capture_output=True, text=True, env=env,
+                       check=True, **rs.NOWIN)
+        return root
+
+    def test_leaves_non_pipeline_files_alone(self):
+        root = self.make_repo()
+        rs.copy_pipeline(root, rs.Report(False), update=False)
+        untouched = {
+            ".githooks/checks": "# my own checks\n",
+            ".github/workflows/ci.yml": "# my ci\n",          # ci-gates.yml IS refreshed; this is not
+            ".env.example": "MY_VAR=\n",
+            rs.env_doc(): "# mine\n",                          # PRELIVE.md or STAGING.md per config
+            ".claude/rules/design.md": "# our brand\n",
+        }
+        for rel, text in untouched.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text, encoding="utf-8")
+        (root / ".claude" / "hooks" / "stop-gate.sh").write_text("# stale\n", encoding="utf-8")
+        rs.cmd_refresh(self.args(root))
+        for rel, text in untouched.items():
+            self.assertEqual((root / rel).read_text(encoding="utf-8"), text, rel)
+        self.assertNotEqual((root / ".claude" / "hooks" / "stop-gate.sh").read_text(encoding="utf-8"),
+                            "# stale\n", "the pipeline itself must refresh")
+
+    def test_replaced_files_are_backed_up_and_the_backup_is_ignored(self):
+        """A refresh overwrites kit-owned files, including a GitHub workflow. Every replacement
+        must leave a copy, and the copies must not appear as untracked work in the repo - refresh
+        does not touch .gitignore, so a repo set up before v4.3 has no line for them."""
+        root = self.make_repo()
+        rs.copy_pipeline(root, rs.Report(False), update=False)
+        agent = root / ".claude" / "agents" / "code-reviewer.md"
+        agent.write_text("# our own reviewer\n", encoding="utf-8")
+        (root / "CLAUDE.md").write_text("# house policy, no markers\n", encoding="utf-8")
+        rs.cmd_refresh(self.args(root))
+        backups = sorted((root / ".claude" / ".backup").glob("*/"))
+        self.assertTrue(backups, "a replacement must leave a backup")
+        saved = {p.name for b in backups for p in b.iterdir()}
+        self.assertIn("claude__agents__code-reviewer.md", saved)
+        self.assertIn("CLAUDE.md", saved, "CLAUDE.md is rewritten in place and must be saved too")
+        self.assertEqual((root / ".claude" / ".backup" / ".gitignore").read_text(encoding="utf-8"), "*\n")
+
+    def test_ci_gates_refresh_but_the_repos_own_workflow_does_not(self):
+        """ci-gates.yml is the pipeline's half of .github and is meant to refresh; ci.yml is the
+        repo's own and is not. The command's output claims exactly this, so it is pinned."""
+        root = self.make_repo()
+        rs.copy_pipeline(root, rs.Report(False), update=False)
+        gates = root / ".github" / "workflows" / "ci-gates.yml"
+        own = root / ".github" / "workflows" / "ci.yml"
+        gates.write_text("# stale gates\n", encoding="utf-8")
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text("# my ci\n", encoding="utf-8")
+        rs.cmd_refresh(self.args(root))
+        self.assertNotEqual(gates.read_text(encoding="utf-8"), "# stale gates\n")
+        self.assertEqual(own.read_text(encoding="utf-8"), "# my ci\n")
+
+    def test_the_github_files_refresh_claims_are_the_only_ones(self):
+        """cmd_refresh's Refreshed/Untouched summary names the two .github files in prose. Add a
+        third BUILTIN_PIPELINE key under .github/ and that prose becomes the same class of false
+        claim this release removed - so the set is pinned here rather than left to memory."""
+        github = {rel for rel in rs.BUILTIN_PIPELINE if rel.startswith(".github/")}
+        self.assertEqual(github, {".github/workflows/ci-gates.yml", ".github/pull_request_template.md"},
+                         "refresh's output names these two by hand - update it before adding another")
+
+    def test_apply_and_refresh_do_not_fight_over_the_same_file(self):
+        """cmd_apply used to write its own pull_request_template.md while BUILTIN_PIPELINE held a
+        different one, so apply and refresh replaced each other's copy on every run. A second
+        producer for any pipeline path is the bug; this pins that there is only one."""
+        self.assertFalse(hasattr(rs, "PR_TEMPLATE"),
+                         "a second template for a BUILTIN_PIPELINE path is how the flip-flop started")
+        root = self.make_repo()
+        rs.copy_pipeline(root, rs.Report(False), update=False)
+        rep = rs.Report(False)
+        rs.copy_pipeline(root, rep, update=True)
+        replaced = [w for a, w in rep.rows if str(a).startswith("replaced")]
+        self.assertEqual(replaced, [], "a freshly written pipeline must have nothing to replace")
+
+    def test_survives_a_teknobu_json_that_is_not_an_object(self):
+        root = self.make_repo()
+        (root / ".teknobu.json").write_text('["not", "an", "object"]\n', encoding="utf-8")
+        rs.cmd_refresh(self.args(root))          # must not raise part-way through
+        self.assertTrue((root / ".claude" / "agents" / "code-reviewer.md").exists())
+
+    def test_dry_run_writes_nothing(self):
+        root = self.make_repo()
+
+        def tree():   # .git churns on any git call; the question is what the kit writes
+            return sorted(str(q.relative_to(root)) for q in root.rglob("*")
+                          if ".git" not in q.relative_to(root).parts)
+
+        before = tree()
+        rs.cmd_refresh(self.args(root, dry_run=True))
+        self.assertEqual(before, tree(), "--dry-run must not write")
+
+    def test_marks_the_repo_as_current(self):
+        """cmd_nudge compares .teknobu.json's kit against VERSION; a refreshed repo that does not
+        record the new version nags every session and points back at the heavy command."""
+        root = self.make_repo()
+        (root / ".teknobu.json").write_text(
+            json.dumps({"kit": "0.1", "work_branch": "prelive"}) + "\n", encoding="utf-8")
+        rs.cmd_refresh(self.args(root))
+        cfg = json.loads((root / ".teknobu.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["kit"], rs.VERSION)
+        self.assertEqual(cfg["work_branch"], "prelive", "refresh must not rewrite the repo's own keys")
+
 
 
 if __name__ == "__main__":
