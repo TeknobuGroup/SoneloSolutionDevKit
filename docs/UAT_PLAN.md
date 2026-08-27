@@ -2,7 +2,29 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
-## Changed in this cycle (kit v4.2)
+## Changed in this cycle (kit v4.3)
+
+### New: `repo_setup.py refresh` — take a release without the rest of apply
+- UAT-4.3-1: In a repo already on the kit, `refresh --dry-run` reports what would change and writes nothing.
+- UAT-4.3-2: `refresh` updates `.claude/agents/`, `.claude/commands/`, `.claude/hooks/`, the kit's gates (`.github/workflows/ci-gates.yml`, `.github/pull_request_template.md`) and the managed CLAUDE.md section. It leaves the repo's **own** `.github/workflows/ci.yml`, the deploy workflow, the environment doc, `.githooks/`, `.env*` and `.claude/rules/design.md` byte-identical.
+- UAT-4.3-2b: every file `refresh` replaced is named in its output, not just counted — a rewritten workflow or agent must be visible to the operator.
+- UAT-4.3-2c: a CLAUDE.md carrying hand-written policy outside the kit markers is backed up before the managed section is rewritten.
+- UAT-4.3-3: `refresh` never creates or checks out a branch. The branch you were on is the branch you are on.
+- UAT-4.3-4: A hand-edited `.githooks/checks` survives `refresh`; a hand-edited shipped agent is replaced, with the original in `.claude/.backup/<timestamp>/`.
+- UAT-4.3-5: After `refresh`, `.teknobu.json` records the new kit version and the session-start nudge stops reporting the repo as out of date. Other keys in that file are unchanged.
+- UAT-4.3-6: `.claude/.backup/` does not appear in `git status` after a refresh.
+- UAT-4.3-7: In a worklog-only repo, `refresh` says so and does nothing.
+
+### Fixed: apply and refresh no longer fight over the PR template
+- UAT-4.3-15: run `apply` then `refresh` immediately. The refresh reports `0 files added` with nothing replaced and no backup directory — previously it replaced `.github/pull_request_template.md` every time, and an `apply` afterwards replaced it back.
+
+### Changed: agent model routing
+- UAT-4.3-8: Every file in `.claude/agents/` carries a `model:` line except code-reviewer, security-reviewer and impact-analyst, which carry none by design.
+- UAT-4.3-9: `/landing` shows the model against each agent; four now read `sonnet`, four `haiku`, three blank.
+- UAT-4.3-10: A repo whose `design-reviewer.md` predates v4.3 gets the new frontmatter on `refresh` — this never used to happen. Its `.claude/rules/design.md` is untouched.
+- UAT-4.3-11 (judgement, needs a real change): code-reviewer still reports a regression in a file the diff does not touch, when a changed signature has callers there. The reading budget must not have cost that.
+
+## Changed in a previous cycle (kit v4.2)
 
 ### New: Event-driven pipeline with stop gate and review verdicts
 - Stop gate now blocks when code changes exist without a fresh /post-change verdict
