@@ -4,6 +4,8 @@ repo_setup.py  (v3.2)  -  Teknobu repo standards kit
 
 One file, standard library only. Lives at ~/.claude/sonelo/repo_setup.py and is driven by the
 /repo-setup command in Claude Code (or run by hand from a repo root).
+  `refresh` takes a new kit release's agents, commands, hooks and CI gates into an existing
+  repo - and nothing else; `apply` is the full lay-down.
 
   python repo_setup.py install          # once per machine: copies itself to ~/.claude/sonelo/, writes the
                                         #   /repo-setup command, registers the session-start nudge
@@ -58,7 +60,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.2"
+VERSION = "4.3"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -196,10 +198,14 @@ def write(path, text, executable=False):
 
 
 def read_json(path, default):
+    """Every caller wants a JSON object. A file holding a valid list, string or number is as
+    unusable as a malformed one, so it takes the same path - otherwise the .get() is a crash
+    several writes into a command."""
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
+    return data if isinstance(data, dict) else default
 
 
 def repo_root(start=None):
@@ -484,17 +490,9 @@ jobs:
         run: supabase functions deploy --project-ref "$PROJECT_REF"
 '''
 
-PR_TEMPLATE = '''<!-- {MARK} v{VERSION} -->
-## What changed
-
-## Checked on {WORK}
-- [ ] CI green
-- [ ] Tried on the {WORK} URL
-- [ ] Migrations applied to the {WORK} database (if any)
-
-## Risk
-<!-- fast lane (docs/copy/styling) or full pipeline (db, auth, edge functions, shared types) -->
-'''
+# The pull-request template lives in BUILTIN_PIPELINE, which is its only producer. cmd_apply used
+# to write a second, different version of the same path, so `apply` and a pipeline refresh each
+# replaced the other's copy on every run - flip-flop, with a spurious backup each time (v4.3).
 
 PRELIVE_MD = '''<!-- {MARK} v{VERSION} -->
 # Prelive setup for {REPO}
@@ -555,13 +553,14 @@ CLAUDE_SECTION = '''<!-- {MARK}:start v{VERSION} (managed by repo_setup.py; edit
 GITATTRIBUTES_LINES = ["*.sh text eol=lf", ".githooks/* text eol=lf"]
 
 GITIGNORE_LINES = [
-    "# sonelo standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".claude/state/", ".worklog/",
+    "# sonelo standards", ".env", ".env.*", "!.env.example", ".claude/settings.local.json", ".claude/state/", ".claude/.backup/", ".worklog/",
     "node_modules/", "dist/", "build/", ".vercel/", "supabase/.temp/", "supabase/.branches/",
     ".DS_Store", "Thumbs.db", "*.log", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
 ]
 
 DESIGN_REVIEWER_MD = r"""---
 name: design-reviewer
+model: sonnet
 description: Reviews UI work as a user would meet it - can they finish the task, can they read it, does it hold up in the states that actually occur - and checks it against this repo's design contract in .claude/rules/design.md. Use before finishing any change that alters what appears on screen. Reports; never edits.
 tools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)
 ---
@@ -923,12 +922,13 @@ exit 0
 
 
 BUILTIN_PIPELINE = {
+    '.claude/agents/design-reviewer.md': DESIGN_REVIEWER_MD,
     '.claude/agents/impact-analyst.md': '---\nname: impact-analyst\ndescription: Before any full-pipeline change, maps what the change touches and what depends on it. Use in plan mode, before editing. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git log:*), Bash(git diff:*)\n---\n\nYou map blast radius. The user is about to change something; your job is to say what else moves.\n\n1. From the request, name the files and symbols that will change.\n2. For each, find every importer and caller (`Grep` for the symbol and the module path). List them with file:line.\n3. Find shared contracts the change crosses: database tables and columns, RLS policies, edge-function request/response shapes, shared types, environment variables, routes.\n4. Name the tests that cover the touched code, and the touched code that has no tests.\n5. Name what could break that nobody asked about: callers with different assumptions, a null that becomes possible, an ordering that matters, a migration that needs a backfill.\n\nReport as: **Touches** (files) · **Depends on it** (callers, with file:line) · **Contracts crossed** · **Test coverage** (covered / uncovered) · **Risks** (one line each, most likely first) · **Recommended order of edits**. Short lines. If the change is genuinely local, say so in two lines and stop.\n',
-    '.claude/agents/code-reviewer.md': '---\nname: code-reviewer\ndescription: Reviews a change for correctness - logic errors, unhandled states, regressions in neighbouring code, and whether it does what was asked and nothing else. Use after implementing, before tests. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)\n---\n\nYou review the diff (`git diff` against the base branch, plus any untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for whether it is *right*, not whether it is pretty. You never edit.\n\nWork through, in order, and stop escalating once something fails:\n\n1. **Does it do what was asked, and only that?** Compare the change to the request. Anything extra is a finding; anything missing is a finding.\n2. **Logic.** Off-by-ones, inverted conditions, wrong operator, async not awaited, a promise whose rejection goes nowhere, state updated from stale values, a loop that mutates what it iterates.\n3. **States the code does not handle.** Null, empty, one, many, duplicate, concurrent, slow, failed. For every external call: what happens when it fails, and does the user see it?\n4. **Neighbours.** Read the callers of anything whose signature or behaviour changed. A regression in a file the diff does not touch is the finding that matters most.\n5. **Data.** Migrations append-only; RLS on new tables; types regenerated; no secret in code; no `service_role` in a client path.\n6. **Tests.** Is the changed behaviour tested? Would the tests fail if the change were reverted? A test that cannot fail is not a test.\n\nReport findings ordered by user cost. For each: `file:line` · one sentence naming the defect · who it costs and how · the specific fix · severity **blocks the task** / **hurts the task** / **inconsistency** / **polish**. End with one line: `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. If it is genuinely fine, say so in a line; do not manufacture findings.\n',
-    '.claude/agents/security-reviewer.md': '---\nname: security-reviewer\ndescription: Reviews a change for security - RLS and policies, auth paths, secrets, input handling, edge-function exposure. Use after implementing any change that touches data, auth, edge functions or user input. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*)\n---\n\nYou review the diff (plus untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for how it could be abused. You never edit.\n\nCheck, in order:\n1. **Row Level Security.** Every new or altered table has RLS enabled and policies for each operation that is meant to be allowed, scoped to the owner or tenant. Policies that use `true`, or that trust a client-supplied id, are findings.\n2. **Auth.** Protected routes and edge functions verify the session server-side. Roles are checked on the server, never only in the UI.\n3. **Secrets.** No keys, tokens or passwords in code, config, logs or client bundles. `service_role` only inside edge functions, never in anything shipped to a browser.\n4. **Input.** Everything from a request, form, webhook or file is validated before use; SQL and shell built from input are findings; uploads have type and size limits.\n5. **Exposure.** New edge functions: CORS, rate limits, what happens on malformed input, what is returned in errors (no stack traces, no internal ids that enable enumeration).\n6. **Third parties.** Webhooks verify signatures; outbound calls have timeouts; retries are bounded.\n\nReport as `file:line` · the hole · what an attacker does with it · the fix · severity **blocks the task** / **hurts the task** / **polish**. End with `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. Two lines if it is fine.\n',
-    '.claude/agents/test-writer.md': "---\nname: test-writer\ndescription: Writes or extends tests for changed code - unit and integration - and a failing test first for every bug fix. The only agent that writes files, and only test files. Use after a change is implemented, before test-runner.\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\n---\n\nYou write tests. You write nothing else: only files under the project's test locations (`tests/`, `__tests__/`, `*.test.*`, `*.spec.*`, `e2e/`). If a test needs a change to source code, report it; do not make it.\n\n1. Read the diff. For every changed behaviour, decide the smallest test that would fail if the change were reverted.\n2. For a bug fix: write the reproducing test first and confirm it fails on the old behaviour (reason from the code if you cannot run it), then that it passes.\n3. Cover the states: empty, one, many, null, failure of any external call. Prefer one assertion per test and names that read as sentences.\n4. Use the project's existing test framework and conventions; look at a neighbouring test before writing one. Never hit production data; use the local or work-branch database, fixtures, or mocks at the boundary.\n5. Do not write tests that cannot fail, tests of the framework, or tests of private details that would break on a harmless refactor.\n\nReport: files written, what each test proves, and any source change a test would need (as a request, not an edit).\n",
-    '.claude/agents/test-runner.md': '---\nname: test-runner\ndescription: Runs the project\'s checks and tests and reports the truth of them - what ran, what failed, and why. Use after implementation and after fixes. Never edits.\ntools: Read, Bash(npm:*), Bash(npx:*), Bash(pnpm:*), Bash(yarn:*), Bash(bun:*), Bash(flutter:*), Bash(python:*), Bash(pytest:*), Bash(git diff:*)\n---\n\nYou run the checks and report what actually happened. You never edit and never "fix" a test by weakening it.\n\n1. Run, in order, stopping at the first red: the type check, the linter, the unit/integration tests, using the commands in `.githooks/checks` (the same list the pre-push hook and CI run). Never against production; the work-branch database or local only.\n2. For every failure: the test name, the assertion, the first relevant line of the stack, and your reading of the cause in one sentence. Do not paste whole logs.\n3. Say what did not run and why (no tests for this area, a missing service, a timeout).\n\nEnd with `TESTS: green (<n> passed)` or `TESTS: red (<n> failed of <m>)`, then the failures. Three lines if everything is green.\n',
-    '.claude/agents/qa-runner.md': "---\nname: qa-runner\ndescription: Exercises the running app the way a user would, on the work-branch URL, through Playwright - the flows in docs/UAT_PLAN.md and the ones the change touches - and reports what a user would hit. Use after tests are green and the branch is deployed. Never edits.\ntools: Read, Grep, Glob, Bash(npx playwright:*), Bash(npx:*), Bash(curl:*)\n---\n\nYou are the tester of what was built, as opposed to the code. You never edit.\n\n1. Find the base URL: `QA_BASE_URL` in the environment, else the work-branch URL in `.teknobu.json` or the work-branch `.env` file. If none, say so and stop.\n2. If the repo has Playwright (`@playwright/test` in package.json, or `e2e/`), run the end-to-end suite against that URL and report as test-runner would. If it has none, say so once and recommend `npm init playwright@latest` with a smoke suite of the UAT plan's top flows; then do the walkthrough below with `curl` for what can be checked without a browser (routes respond, auth redirects, API errors are shaped).\n3. Walk the flows in `docs/UAT_PLAN.md` that the change touches, and the three most important flows regardless. For each: the steps, what happened, what a user would think. Look specifically at empty states, a failed request, a slow request, a refresh mid-flow, a deep link.\n4. Never create data in production. Never use real customer data.\n\nReport per flow: **pass** / **fail** / **could not test** with one line of why, ordered by user cost. End with `QA: pass` or `QA: fail (<n> flows)`.\n",
+    '.claude/agents/code-reviewer.md': '---\nname: code-reviewer\ndescription: Reviews a change for correctness - logic errors, unhandled states, regressions in neighbouring code, and whether it does what was asked and nothing else. Use after implementing, before tests. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)\n---\n\nYou review the diff (`git diff` against the base branch, plus any untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for whether it is *right*, not whether it is pretty. You never edit.\n\nBudget your reading. The diff is the source, not the repo: read the files it touches, and follow callers only as far as the change actually reaches. Do not sweep the repo by reading it - grep to find callers, then read only the ones the change reaches. Do not read unrelated modules, and do not open a file you have no reason to suspect. Breadth is what costs; depth where the change lands is the job.\n\nWork through, in order, and stop escalating once something fails:\n\n1. **Does it do what was asked, and only that?** Compare the change to the request. Anything extra is a finding; anything missing is a finding.\n2. **Logic.** Off-by-ones, inverted conditions, wrong operator, async not awaited, a promise whose rejection goes nowhere, state updated from stale values, a loop that mutates what it iterates.\n3. **States the code does not handle.** Null, empty, one, many, duplicate, concurrent, slow, failed. For every external call: what happens when it fails, and does the user see it?\n4. **Neighbours.** Read the callers of anything whose signature or behaviour changed. A regression in a file the diff does not touch is the finding that matters most.\n5. **Data.** Migrations append-only; RLS on new tables; types regenerated; no secret in code; no `service_role` in a client path.\n6. **Tests.** Is the changed behaviour tested? Would the tests fail if the change were reverted? A test that cannot fail is not a test.\n\nReport findings ordered by user cost. For each: `file:line` · one sentence naming the defect · who it costs and how · the specific fix · severity **blocks the task** / **hurts the task** / **inconsistency** / **polish**. End with one line: `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. If it is genuinely fine, say so in a line; do not manufacture findings.\n',
+    '.claude/agents/security-reviewer.md': '---\nname: security-reviewer\ndescription: Reviews a change for security - RLS and policies, auth paths, secrets, input handling, edge-function exposure. Use after implementing any change that touches data, auth, edge functions or user input. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*)\n---\n\nYou review the diff (plus untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for how it could be abused. You never edit.\n\nBudget your reading. The diff is the source, not the repo: read the files it touches, and follow callers only as far as the change actually reaches. Do not sweep the repo by reading it - grep to find callers, then read only the ones the change reaches. Do not read unrelated modules, and do not open a file you have no reason to suspect. Breadth is what costs; depth where the change lands is the job. Two things are always in scope even though the diff does not name them: the migration that created a table you alter, and both sides of an import you change.\n\nCheck, in order:\n1. **Row Level Security.** Every new or altered table has RLS enabled and policies for each operation that is meant to be allowed, scoped to the owner or tenant. Policies that use `true`, or that trust a client-supplied id, are findings.\n2. **Auth.** Protected routes and edge functions verify the session server-side. Roles are checked on the server, never only in the UI.\n3. **Secrets.** No keys, tokens or passwords in code, config, logs or client bundles. `service_role` only inside edge functions, never in anything shipped to a browser.\n4. **Input.** Everything from a request, form, webhook or file is validated before use; SQL and shell built from input are findings; uploads have type and size limits.\n5. **Exposure.** New edge functions: CORS, rate limits, what happens on malformed input, what is returned in errors (no stack traces, no internal ids that enable enumeration).\n6. **Third parties.** Webhooks verify signatures; outbound calls have timeouts; retries are bounded.\n\nReport as `file:line` · the hole · what an attacker does with it · the fix · severity **blocks the task** / **hurts the task** / **polish**. End with `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. Two lines if it is fine.\n',
+    '.claude/agents/test-writer.md': "---\nname: test-writer\ndescription: Writes or extends tests for changed code - unit and integration - and a failing test first for every bug fix. The only agent that writes files, and only test files. Use after a change is implemented, before test-runner.\nmodel: sonnet\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\n---\n\nYou write tests. You write nothing else: only files under the project's test locations (`tests/`, `__tests__/`, `*.test.*`, `*.spec.*`, `e2e/`). If a test needs a change to source code, report it; do not make it.\n\n1. Read the diff. For every changed behaviour, decide the smallest test that would fail if the change were reverted.\n2. For a bug fix: write the reproducing test first and confirm it fails on the old behaviour (reason from the code if you cannot run it), then that it passes.\n3. Cover the states: empty, one, many, null, failure of any external call. Prefer one assertion per test and names that read as sentences.\n4. Use the project's existing test framework and conventions; look at a neighbouring test before writing one. Never hit production data; use the local or work-branch database, fixtures, or mocks at the boundary.\n5. Do not write tests that cannot fail, tests of the framework, or tests of private details that would break on a harmless refactor.\n\nReport: files written, what each test proves, and any source change a test would need (as a request, not an edit).\n",
+    '.claude/agents/test-runner.md': '---\nname: test-runner\ndescription: Runs the project\'s checks and tests and reports the truth of them - what ran, what failed, and why. Use after implementation and after fixes. Never edits.\nmodel: sonnet\ntools: Read, Bash(npm:*), Bash(npx:*), Bash(pnpm:*), Bash(yarn:*), Bash(bun:*), Bash(flutter:*), Bash(python:*), Bash(pytest:*), Bash(git diff:*)\n---\n\nYou run the checks and report what actually happened. You never edit and never "fix" a test by weakening it.\n\n1. Run, in order, stopping at the first red: the type check, the linter, the unit/integration tests, using the commands in `.githooks/checks` (the same list the pre-push hook and CI run). Never against production; the work-branch database or local only.\n2. For every failure: the test name, the assertion, the first relevant line of the stack, and your reading of the cause in one sentence. Do not paste whole logs.\n3. Say what did not run and why (no tests for this area, a missing service, a timeout).\n\nEnd with `TESTS: green (<n> passed)` or `TESTS: red (<n> failed of <m>)`, then the failures. Three lines if everything is green.\n',
+    '.claude/agents/qa-runner.md': "---\nname: qa-runner\ndescription: Exercises the running app the way a user would, on the work-branch URL, through Playwright - the flows in docs/UAT_PLAN.md and the ones the change touches - and reports what a user would hit. Use after tests are green and the branch is deployed. Never edits.\nmodel: sonnet\ntools: Read, Grep, Glob, Bash(npx playwright:*), Bash(npx:*), Bash(curl:*)\n---\n\nYou are the tester of what was built, as opposed to the code. You never edit.\n\n1. Find the base URL: `QA_BASE_URL` in the environment, else the work-branch URL in `.teknobu.json` or the work-branch `.env` file. If none, say so and stop.\n2. If the repo has Playwright (`@playwright/test` in package.json, or `e2e/`), run the end-to-end suite against that URL and report as test-runner would. If it has none, say so once and recommend `npm init playwright@latest` with a smoke suite of the UAT plan's top flows; then do the walkthrough below with `curl` for what can be checked without a browser (routes respond, auth redirects, API errors are shaped).\n3. Walk the flows in `docs/UAT_PLAN.md` that the change touches, and the three most important flows regardless. For each: the steps, what happened, what a user would think. Look specifically at empty states, a failed request, a slow request, a refresh mid-flow, a deep link.\n4. Never create data in production. Never use real customer data.\n\nReport per flow: **pass** / **fail** / **could not test** with one line of why, ordered by user cost. End with `QA: pass` or `QA: fail (<n> flows)`.\n",
     '.claude/agents/uat-writer.md': '---\nname: uat-writer\ndescription: Writes the UAT document for the current branch\'s pull request from the diff and the changelog - preconditions, test data, cases with steps and expected results, sign-off. Use before creating a PR. Haiku; formatting work.\nmodel: haiku\ntools: Read, Grep, Glob, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou write `docs/uat/<branch>-<YYYY-MM-DD>.md` for the current branch, for a tester who did not build the feature. Plain English; no code.\n\nFrom `git diff <base>...HEAD`, the CHANGELOG.md entry, and docs/UAT_PLAN.md:\n\n```\n# UAT - <feature or branch> - <date>\n\n**Branch:** <branch>   **Environment:** <work-branch URL>   **Prepared by:** Claude Code   **Status:** awaiting sign-off\n\n## What changed\nTwo to five sentences a client understands.\n\n## Preconditions\nAccounts, roles, data that must exist, feature flags.\n\n## Test data\nExactly what to type or upload, so two testers get the same result.\n\n| ID | Area | Steps | Expected | Result | Tester | Date |\n|----|------|-------|----------|--------|--------|------|\n| UAT-1 | ... | 1. ... 2. ... | ... | | | |\n\n## Not covered here\nWhat this change does not touch and why it is out of scope.\n\n## Sign-off\nName / role / date / decision (accept, accept with notes, reject).\n```\n\nOne row per behaviour a user can observe, including the failure paths. Number steps. Expected results are specific ("the row shows Verified in green", not "it works"). Also add the new cases to docs/UAT_PLAN.md so the master plan stays current. Report the path of the file written.\n',
     '.claude/agents/changelog-scribe.md': '---\nname: changelog-scribe\ndescription: Adds or updates the CHANGELOG.md entry for the current branch from the diff. Use after a change, before the Stop gate. Haiku; formatting work. Writes only CHANGELOG.md.\nmodel: haiku\ntools: Read, Edit, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou maintain CHANGELOG.md (Keep a Changelog shape: `## [Unreleased]` with Added / Changed / Fixed / Removed / Security). From `git diff <base>...HEAD` write one line per user-visible or operator-visible change, in plain language, with the area in front: `- Case search: results now deduplicate across BAILII and the National Archives.` Migrations get a line under Changed naming the table. No internal refactor chatter unless it changes behaviour. Edit only CHANGELOG.md; report the lines added.\n',
     '.claude/agents/docs-maintainer.md': '---\nname: docs-maintainer\ndescription: Keeps docs/STATUS.md current and updates docs/ARCHITECTURE.md when the shape of the system changed. Use at the end of a work block. Haiku; formatting work. Writes only under docs/.\nmodel: haiku\ntools: Read, Edit, Write, Grep, Glob, Bash(git diff:*), Bash(git log:*)\n---\n\nYou keep two documents truthful, editing nothing else.\n\n- `docs/STATUS.md`: what is being worked on now, what was finished in this block (one line each, dated), what is blocked and on whom, the next three things. Delete what is stale; keep it to one screen.\n- `docs/ARCHITECTURE.md`: only when the diff adds or removes a service, table, edge function, integration, route group, or environment variable. Update the relevant section; never rewrite the document.\n\nReport what you changed in two lines.\n',
@@ -943,8 +943,8 @@ BUILTIN_PIPELINE = {
     '.claude/hooks/pipeline-state.sh': PIPELINE_STATE_SH,
     '.claude/hooks/session-brief.sh': SESSION_BRIEF_SH,
     '.claude/rules/supabase.md': '---\npaths: ["supabase/**", "src/integrations/supabase/**", "src/lib/supabase*"]\n---\n# Supabase rules\n- Migrations are append-only files under `supabase/migrations/`; never edit an existing one, never change schema in a dashboard. After any migration change regenerate types: `{GEN_TYPES}` and commit the result.\n- Every table has RLS enabled with a policy per allowed operation, scoped to the owner or tenant. No `using (true)` outside intentionally public reads.\n- `service_role` only in edge functions. Clients use the publishable/anon key.\n- Edge functions validate input, return shaped errors (no stack traces), set CORS explicitly, and read secrets from `Deno.env.get`, never from code.\n- Local development and tests point at the work-branch database or `supabase start`; never at production.\n',
-    '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
-    '.github/pull_request_template.md': '<!-- sonelo-devkit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n',
+    '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\npermissions:\n  contents: read\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
+    '.github/pull_request_template.md': '<!-- sonelo-devkit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n- [ ] Migrations applied to the {WORK} database (if any)\n\n## Risk\n<!-- fast lane (docs/copy/styling) or full pipeline (db, auth, edge functions, shared types) -->\n',
     'docs/STATUS.md': '# STATUS - {NAME}\n\n## Now\n- <the one thing being worked on>\n\n## Done recently\n\n## Blocked\n\n## Next\n1.\n2.\n3.\n',
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
@@ -1046,7 +1046,7 @@ Confirm the plan in four lines, including that Supabase projects may be billable
 
 Do, reporting each step's output:
 1. `python "$HOME/.claude/sonelo/repo_setup.py" doctor` - stop and tell the user if a login the plan needs is missing; don't work around it.
-2. `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down hooks, CI, {ENVDOC}, CLAUDE.md, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, add `--update-pipeline` to refresh the kit's agents, commands and hooks (backups are kept; filled-in values elsewhere are untouched). Never pass `--force` unless asked.
+2. `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down hooks, CI, {ENVDOC}, CLAUDE.md, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, prefer `repo_setup.py refresh`: it takes the kit's current agents, commands, hooks and CI *gates* (ci-gates.yml, pull_request_template.md), keeps a backup of everything it replaces, and touches nothing else - not the repo's own ci.yml, env files, design contract or branches. Never pass `--force` unless asked.
 3. Brand: write the guidelines verbatim to `docs/BRAND.md` if given, and rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the one call-to-action colour, the off-brand list, the design lint command if any). Put the product's one-line description and voice rules into CLAUDE.md and the pipeline's ARCHITECTURE/STATUS/UAT placeholders. Take the stack from the repo, not from the guidelines; if they disagree (e.g. the document still says Lovable Cloud), say so in the summary.
 4. Fill every remaining `TODO` in the pipeline files from what is true of the repo. Ask nothing; leave a TODO only if it is genuinely unknowable.
 5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply sonelo repo standards` on `{WORK}`.
@@ -1369,6 +1369,7 @@ def copy_pipeline(root, rep, d=None, update=False):
     vars_ = pipeline_vars(root, d)
     seed_only = {"docs/STATUS.md", "docs/ARCHITECTURE.md", "docs/UAT_PLAN.md"}   # living documents: created once, never refreshed
     n_new = n_upd = 0
+    replaced = []
     backup = root / ".claude" / ".backup" / datetime.now().strftime("%Y%m%d-%H%M%S")
     for rel, tpl in BUILTIN_PIPELINE.items():
         dst = root / rel
@@ -1378,8 +1379,13 @@ def copy_pipeline(root, rep, d=None, update=False):
                 continue
             if not rep.dry:
                 backup.mkdir(parents=True, exist_ok=True)
+                # self-ignoring: refresh does not touch .gitignore, and a repo set up before
+                # v4.3 has no .claude/.backup/ line in it
+                if not (backup.parent / ".gitignore").exists():
+                    write(backup.parent / ".gitignore", "*\n")
                 shutil.copyfile(str(dst), str(backup / rel.replace("/", "__").lstrip(".")))
                 write(dst, text, executable=rel.endswith(".sh"))
+            replaced.append(rel)
             n_upd += 1
             continue
         if not rep.dry:
@@ -1395,7 +1401,10 @@ def copy_pipeline(root, rep, d=None, update=False):
             write(keep, "")
     rep.note("built-in pipeline: %d file%s added%s (agents, /post-change, /design-pass, /pr, hooks, gates)" % (
         n_new, "" if n_new == 1 else "s", (", %d refreshed (backup in .claude/.backup/)" % n_upd) if n_upd else ""), "pipeline")
+    for rel in replaced:              # named, not counted: a replaced workflow or agent must be visible
+        rep.note("would be replaced (original kept)" if rep.dry else "replaced (yours backed up)", root / rel)
     merge_settings_hooks(root, rep)
+    return backup if (replaced and not rep.dry) else None
 
 
 def merge_settings_hooks(root, rep):
@@ -1461,24 +1470,10 @@ def supabase_init(root):
 
 
 def design_files(root, d, rep, update=False):
-    agent = root / ".claude" / "agents" / "design-reviewer.md"
-    if not agent.exists():
-        if not rep.dry:
-            write(agent, DESIGN_REVIEWER_MD)
-        rep.note("created", agent)
-    else:
-        # The body may carry per-repo brand edits and is never regenerated; --update-pipeline
-        # refreshes only the tools: line so kit-wide tool additions still propagate.
-        text = read(agent) or ""
-        prior = "tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*)"   # the line every kit before v4.2 shipped
-        m = re.search(r"(?m)^tools: .*$", text)
-        wanted = re.search(r"(?m)^tools: .*$", DESIGN_REVIEWER_MD).group(0)
-        if update and m and m.group(0) == prior and m.group(0) != wanted:
-            if not rep.dry:
-                write(agent, text.replace(m.group(0), wanted, 1))
-            rep.note("tools line refreshed (body kept - yours)", agent)
-        else:
-            rep.note("unchanged (yours)", agent)
+    """The design contract only. design-reviewer.md ships from BUILTIN_PIPELINE like every other
+    agent (v4.3): it used to be carved out here so a repo could edit the body, but the brand facts
+    live in design.md, and the carve-out meant kit-wide frontmatter changes - the model it runs on,
+    a new tool - never reached a repo that already had the file."""
     rule = root / ".claude" / "rules" / "design.md"
     if not rule.exists():
         if not rep.dry:
@@ -1604,9 +1599,16 @@ def ensure_installed():
         return False
     if INSTALLED.exists() and version_of(INSTALLED) >= version_of(me) and COMMAND_FILE.exists():
         return False
-    class A:
-        no_presence = False
+    class A:                        # a silent bootstrap: never fetch CLIs, log in, or ask
+        no_presence = True
+        no_cli = True
+        no_login = True
+        yes = True
+        mode = None
+        preset = None
+        set = None
     say("kit not installed on this machine yet (or this copy is newer): installing first")
+    say("(CLIs and logins skipped - run `install` for gh / supabase / vercel.)")
     cmd_install(A())
     say("")
     return True
@@ -1681,7 +1683,7 @@ def cmd_apply(args):
             d = detect(root)
     if d["supabase"]:
         deploy_workflow(root, rep, args.force)
-    rep.put(root / ".github" / "pull_request_template.md", fill(PR_TEMPLATE), force=args.force)
+    # pull_request_template.md is a BUILTIN_PIPELINE file; copy_pipeline below is its only writer.
 
     # docs + config
     rep.put(root / env_doc(), fill(PRELIVE_MD, REPO=root.name, WORK=WORK_BRANCH, WORKU=WORK_BRANCH.upper(), MAIN=main,
@@ -1729,6 +1731,85 @@ def cmd_apply(args):
     if created:
         say("PRELIVE_BRANCH_CREATED")
     say("Next: read %s for the manual wiring, commit these files on %s, then `git push -u origin %s`." % (env_doc(), WORK_BRANCH, WORK_BRANCH))
+
+
+def cmd_refresh(args):
+    """Take the current kit's pipeline and nothing else.
+
+    `apply --update-pipeline` refreshes the pipeline too, but it is a flag on a command that also
+    rewrites CI, the environment doc, .gitignore, .env.example and the design contract, and ends by
+    creating and checking out the work branch. On a repo that only wants this release's agents,
+    commands and hooks, that is a lot of blast radius for a small want - so this is the narrow verb.
+
+    It does exactly three things: the built-in pipeline files (backups kept in .claude/.backup/),
+    the hook registrations in .claude/settings.json, and the managed section of CLAUDE.md. It also
+    records the kit version in .teknobu.json - without that the session-start nudge would keep
+    reporting the repo as out of date and pointing back at the heavy command.
+
+    "The pipeline" includes the two kit-owned files under .github/: ci-gates.yml and
+    pull_request_template.md. They are the gates half of the pipeline, so refreshing them is the
+    point - but a workflow is the highest-privilege thing this command rewrites, so every replaced
+    file is named in the output rather than counted, and the repo's own ci.yml is never touched."""
+    root = repo_root(args.repo)
+    if not root:
+        sys.exit("not inside a git repository (run from the repo, or pass --repo)")
+    use_repo_config(root)                      # WORK_BRANCH/PROTECTED from this repo, not this machine
+    dry = getattr(args, "dry_run", False)
+    if not dry:
+        ensure_installed()
+        me = Path(__file__).resolve()
+        try:
+            rel = me.parent.relative_to(root)
+            exclude_locally(root, str(rel).replace("\\", "/") + "/")
+        except ValueError:
+            pass
+    if CONFIG.get("mode") == "worklog":
+        say("worklog-only mode: there is no pipeline in this repo. Run `install --mode full` first.")
+        return
+    rep = Report(dry)
+    backups = copy_pipeline(root, rep, update=True)   # also registers the hooks in .claude/settings.json
+    # claude_md writes in place. Only BUILTIN_PIPELINE files get backed up by copy_pipeline, so a
+    # repo whose CLAUDE.md carries hand-written policy outside the markers would lose it with no
+    # copy anywhere - and refresh, unlike --update-pipeline, is now the recommended path.
+    before = read(root / "CLAUDE.md")
+    claude_md(root, rep, update=True)
+    if before is not None and not dry and read(root / "CLAUDE.md") != before:
+        backups = backups or (root / ".claude" / ".backup" / datetime.now().strftime("%Y%m%d-%H%M%S"))
+        backups.mkdir(parents=True, exist_ok=True)
+        if not (backups.parent / ".gitignore").exists():
+            write(backups.parent / ".gitignore", "*\n")
+        write(backups / "CLAUDE.md", before)
+        rep.note("replaced (yours backed up)", root / "CLAUDE.md")
+    cfg_path = root / ".teknobu.json"
+    cfg = read_json(cfg_path, {})
+    if isinstance(cfg, dict) and cfg and (cfg.get("kit") != VERSION):
+        cfg["kit"] = VERSION                    # only these two keys: the rest is the repo's own
+        cfg["applied"] = datetime.now().strftime("%Y-%m-%d")
+        if not dry:
+            write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+        rep.note("kit version recorded (v%s)" % VERSION, cfg_path)
+
+    say("Pipeline %srefreshed from kit v%s: %s" % ("(dry run) " if dry else "", VERSION, root))
+    say("")
+    if rep.rows:
+        width = max(len(a) for a, _ in rep.rows)
+        for action, what in rep.rows:
+            w = str(what)
+            try:
+                w = str(Path(what).relative_to(root))
+            except (ValueError, TypeError):
+                pass
+            say("  %-*s  %s" % (width, action, w))
+        say("")
+    say("Refreshed: .claude/agents, .claude/commands, .claude/hooks, the CI *gates* "
+        "(.github/workflows/ci-gates.yml, pull_request_template.md) and the managed CLAUDE.md section.")
+    say("Untouched: your CI workflow (ci.yml), the deploy workflow, %s, .githooks/, .env*, "
+        ".claude/rules/design.md, branches, the worklog." % env_doc())
+    if backups:
+        say("Replaced files are backed up in %s (self-ignoring)." % backups)
+    if dry:
+        say("Dry run: nothing was written. Files that differ would be replaced, the original kept "
+            "under .claude/.backup/ - CLAUDE.md included, which is rewritten in place.")
 
 
 # ----------------------------------------------------------------------------- check / nudge / protect
@@ -1812,7 +1893,7 @@ def cmd_nudge(args):
                 sh(["git", "-C", str(root), "config", "core.hooksPath", ".githooks"])  # fresh clone: activate the committed hooks
             tag = update_available()
             if tag:
-                say("Sonelo kit %s is released; this machine has v%s. Ask the user: update now? If yes, run `python \"%s\" update`, then offer `apply --update-pipeline` in this repo." % (tag, VERSION, INSTALLED.as_posix()))
+                say("Sonelo kit %s is released; this machine has v%s. Ask the user: update now? If yes, run `python \"%s\" update`, then offer `refresh` in this repo." % (tag, VERSION, INSTALLED.as_posix()))
                 return
             if cfg.get("kit") and tuple(map(int, str(cfg["kit"]).split("."))) < tuple(map(int, VERSION.split("."))):
                 say("Teknobu standards kit v%s is installed but this repo was set up with v%s. Offer to run /repo-setup to refresh the generated files." % (VERSION, cfg["kit"]))
@@ -2599,7 +2680,7 @@ def cmd_update(args):
                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, **NOWIN)
     for line in (out.stdout or out.stderr).strip().splitlines():
         say("  " + line)
-    say("Repos pick the new worklog up on open; run `apply --update-pipeline` in a repo to refresh its agents, commands and hooks.")
+    say("Repos pick the new worklog up on open; run `refresh` in a repo to take the new agents, commands and hooks.")
 
 
 def cmd_doctor(args):
@@ -3062,6 +3143,14 @@ def main():
     p.add_argument("--force", action="store_true", help="replace files that exist without the kit marker")
     p.add_argument("--update-pipeline", action="store_true", help="refresh the built-in pipeline files (agents, commands, hooks, gates) from this kit version; backups kept")
     p.set_defaults(fn=cmd_apply)
+
+    p = sub.add_parser("refresh", help="take this kit's agents, commands, hooks and CI gates - and "
+                                       "nothing else (not your ci.yml, env files, branches or worklog); "
+                                       "backups kept")
+    p.add_argument("--repo", help="repo path (default: current directory)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change")
+    p.set_defaults(fn=cmd_refresh)
+
     p = sub.add_parser("check", help="what's in place in the current repo")
     p.add_argument("--repo")
     p.set_defaults(fn=cmd_check)

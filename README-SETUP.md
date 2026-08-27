@@ -8,9 +8,13 @@ tests → UAT plan → docs after, enforced by a Stop-hook gate locally and mirr
 - **Risk tiers**: docs/copy/styling-only changes take a fast lane (no plan mode or
   impact report; gate + CI still apply). Full pipeline stays mandatory for data,
   auth, contracts, and shared code. See CLAUDE.md.
-- **Model routing**: changelog-scribe, uat-plan-maintainer, and docs-maintainer run on
-  `model: haiku` — formatting jobs on a fast model. Analyst, reviewer, and tester keep
-  the strong session model.
+- **Model routing**: every agent declares the model it runs on, so none of them silently
+  inherits the session's Opus. The four scribes (changelog-scribe, docs-maintainer,
+  uat-writer, uat-plan-maintainer) run on `model: haiku` — formatting work. design-reviewer,
+  test-writer, test-runner and qa-runner run on `model: sonnet` — judgement against a written
+  contract. code-reviewer, security-reviewer and impact-analyst declare nothing and inherit the
+  session model: they decide whether a change ships and how it is built, so they are the ones
+  worth paying for.
 - **Parallel tail**: /post-change runs UAT plan + docs updates concurrently after
   tests pass.
 - **Batching guidance**: run /post-change once per work block, not per micro-edit.

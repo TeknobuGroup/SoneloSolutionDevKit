@@ -19,7 +19,7 @@ The hooks compute what is due from the changed files (`sh .claude/hooks/pipeline
 |---|---|
 | any code | `code-reviewer` |
 | *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |
-| supabase/, functions/, auth paths | `security-reviewer` |
+| supabase/, functions/, auth paths, .github/workflows/ | `security-reviewer` |
 
 Run the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.
 

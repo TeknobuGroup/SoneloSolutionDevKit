@@ -45,7 +45,7 @@ In Claude Code, in any repo or empty folder: `/repo-setup`. It asks whether this
 
 ## What you get
 
-**A complete pipeline, built in.** Ten agents: impact-analyst (before), code-reviewer, security-reviewer and design-reviewer (read-only, in parallel), test-writer (the only writer, tests only; failing test first for every bug), test-runner, qa-runner (Playwright against the work-branch URL), uat-writer, changelog-scribe and docs-maintainer (Haiku). Three commands: `/post-change` (review → fix loop, two rounds max → tests → verdict → docs), `/design-pass` (design-led polish within the contract, nothing that touches logic), `/pr` (UAT document required, becomes the PR body). Three Claude Code hooks: typecheck and lint after every edit, migrations append-only, and a Stop gate that holds the session until the changelog entry, regenerated types and a clear review verdict exist. CI gates mirror it on every PR: changelog, UAT document, types. The lead is the session you type into; the agents are its specialists. A starter folder of your own overrides any file; `apply --update-pipeline` refreshes the built-ins with backups.
+**A complete pipeline, built in.** Ten agents: impact-analyst (before), code-reviewer, security-reviewer and design-reviewer (read-only, in parallel), test-writer (the only writer, tests only; failing test first for every bug), test-runner, qa-runner (Playwright against the work-branch URL), uat-writer, changelog-scribe and docs-maintainer (Haiku). Three commands: `/post-change` (review → fix loop, two rounds max → tests → verdict → docs), `/design-pass` (design-led polish within the contract, nothing that touches logic), `/pr` (UAT document required, becomes the PR body). Three Claude Code hooks: typecheck and lint after every edit, migrations append-only, and a Stop gate that holds the session until the changelog entry, regenerated types and a clear review verdict exist. CI gates mirror it on every PR: changelog, UAT document, types. The lead is the session you type into; the agents are its specialists. A starter folder of your own seeds any file the kit does not own; the files the kit does own it restores to the current release on `refresh` (or `apply --update-pipeline`), keeping a backup in `.claude/.backup/`. `refresh` is the narrow verb: agents, commands, hooks and the kit's CI gates - never the repo's own ci.yml, env files, design contract or branches.
 
 **Branches and hooks.** Conventional commit messages. Secrets, `.env` files and files over 5 MB can't be committed. Pushes to `main` and force-pushes refused. Typecheck, lint and tests before every push, and again in CI with a secrets scan. `main` protected on GitHub with the CI and gates checks required.
 
@@ -61,7 +61,7 @@ In Claude Code, in any repo or empty folder: `/repo-setup`. It asks whether this
 
 ## Update
 
-`python ~/.claude/sonelo/repo_setup.py update` fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `apply --update-pipeline` in a repo refreshes its agents, commands and hooks with backups.
+`python ~/.claude/sonelo/repo_setup.py update` fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `refresh` in a repo takes the new agents, commands and hooks with backups, and touches nothing else.
 
 Windows is the first-class platform (installer, Credential Manager, scheduled presence stamps). The kit and the pipeline also run on Mac and Linux; the presence stamps don't.
 
@@ -71,4 +71,4 @@ This creates billable resources on your Supabase and Vercel accounts and reads y
 
 ## Upgrading from teknobu-kit v3
 
-Run `install` once; it migrates `~/.claude/teknobu` (config, pipeline, CLIs) to `~/.claude/sonelo` and leaves the old folder untouched. Repos keep every file they have - the kit recognises its earlier `teknobu-kit` markers as its own - and `apply --update-pipeline` refreshes them under the new name. `.teknobu.json` keeps its filename, and the old `TEKNOBU_*` escape hatches keep working.
+Run `install` once; it migrates `~/.claude/teknobu` (config, pipeline, CLIs) to `~/.claude/sonelo` and leaves the old folder untouched. Repos keep every file they have - the kit recognises its earlier `teknobu-kit` markers as its own - and `refresh` updates them under the new name. `.teknobu.json` keeps its filename, and the old `TEKNOBU_*` escape hatches keep working.
