@@ -60,7 +60,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.6"
+VERSION = "4.7"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -182,6 +182,24 @@ def use_repo_config(root):
                 "ignored - it would otherwise reach the generated pre-push hook and CI" % dropped)
         if ok:
             PROTECTED = ok
+
+
+def checks_lines(root):
+    """The commands in .githooks/checks, prefix stripped, so CI runs what the repo actually runs.
+
+    A `[glob]` prefix scopes a line to a local push; CI has no push to scope against and runs it
+    regardless. Without this, CI ran detect()'s list instead - a different list the moment anyone
+    edited the checks file, which the file's own header invites."""
+    out = []
+    for line in (read(root / ".githooks" / "checks") or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and not line.startswith("[ ") and not line.startswith("[[") and "]" in line:
+            line = line.split("]", 1)[1].strip()
+        if line:
+            out.append(line)
+    return out
 
 
 def env_doc():
@@ -457,10 +475,13 @@ work="{WORK}"
 zero=0000000000000000000000000000000000000000
 fail=0
 updates=0
+ranges=""
 while read local_ref local_sha remote_ref remote_sha; do
   [ -z "$remote_ref" ] && continue
   [ "$local_sha" = "$zero" ] && continue          # deleting a remote branch: not our business
   updates=$((updates + 1))
+  ranges="$ranges$remote_sha $local_sha
+"
   branch=${remote_ref#refs/heads/}
   for p in $protected; do
     if [ "$branch" = "$p" ] && [ "$SONELO_ALLOW_MAIN" != "1" ] && [ "$TEKNOBU_ALLOW_MAIN" != "1" ]; then
@@ -485,21 +506,84 @@ done
 hooks_dir=$(dirname "$0")
 checks="$hooks_dir/checks"
 [ -f "$checks" ] || exit 0
+
+# What this push actually changes. A check line may name the paths it cares about and is skipped
+# when none of them moved - so a stylesheet does not pay for the back-end suite. Every failure to
+# work the set out leaves it empty, and an empty set runs everything: this may only ever skip work
+# it is certain is irrelevant.
+changed=$(mktemp 2>/dev/null) || changed=""   # no temp file: fall through and run every line
+[ -n "$changed" ] && : > "$changed"
+ranges=$(printf '%s' "$ranges" | tr -d '\r')   # a CR in a ref line makes every sha unresolvable
+[ -n "$changed" ] && printf '%s\n' "$ranges" | while IFS=' ' read -r a b; do
+  [ -n "$b" ] || continue
+  if [ "$a" = "$zero" ]; then
+    base=$(git merge-base "$b" "origin/$work" 2>/dev/null)
+    [ -n "$base" ] || base=$(git merge-base "$b" "$work" 2>/dev/null)
+    [ -n "$base" ] && git -c core.quotePath=false diff --name-only "$base" "$b" 2>/dev/null
+  else
+    git -c core.quotePath=false diff --name-only "$a" "$b" 2>/dev/null
+  fi
+done | sort -u > "$changed"
+
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|'#'*) continue ;; esac
+  globs=""
+  case "$line" in
+    '[ '*|'[['*) ;;   # `[ -f x ] && cmd` and `[[ ... ]]` are test commands, not glob lists.
+                      # POSIX `[` is a command, so a space always follows it; a glob list never has
+                      # one. Without this an existing repo's conditional check was parsed as a
+                      # prefix and SILENTLY SKIPPED, with the hook still reporting success.
+    '['*']'*)
+      globs=${line%%]*}
+      globs=${globs#[}
+      line=${line#*]}
+      line=${line# }
+      ;;
+  esac
+  if [ -n "$globs" ] && [ -n "$changed" ] && [ -s "$changed" ]; then
+    hit=0
+    # `for g in $globs` word-splits AND pathname-expands. Without noglob, `[src/*]` was replaced by
+    # whatever existed one level down, so every deeper path - and every deletion - failed to match
+    # and the check was silently skipped. The deeper the path, the more certain the wrong skip.
+    set -f
+    while IFS= read -r f; do
+      for g in $globs; do
+        case "$f" in $g) hit=1 ;; esac
+      done
+      [ "$hit" = "1" ] && break
+    done < "$changed"
+    set +f
+    if [ "$hit" != "1" ]; then
+      echo "pre-push: skipped, nothing matching [$globs] changed: $line"
+      continue
+    fi
+  fi
   echo "pre-push: $line"
   if ! sh -c "$line"; then
     echo ""
     echo "  pre-push: FAILED: $line"
     echo "  Fix it and push again, or skip once with SONELO_SKIP=1 git push ..."
+    [ -n "$changed" ] && rm -f "$changed"
     exit 1
   fi
 done < "$checks"
+[ -n "$changed" ] && rm -f "$changed"
 exit 0
 '''
 
 CHECKS = '''# {MARK} v{VERSION} - commands run by .githooks/pre-push (one per line). CI runs the same list.
 # Edit freely; keep them fast enough to run before every push.
+#
+# A line may start with [glob ...] naming the paths it cares about, and is then skipped when the
+# push touches none of them - so a stylesheet change does not pay for the back-end suite. Globs are
+# shell `case` patterns, where * also matches /, so `src/*` covers `src/a/b.tsx`. A line with no
+# prefix always runs. If the changed set cannot be worked out, every line runs.
+#
+#   npm run typecheck                     always
+#   [src/* *.tsx] npm run test:ui         only when something under src/ or a .tsx file changed
+#
+# CI runs every line, prefix stripped, so a scoped line always runs somewhere even when every
+# local push skips it. That is what makes scoping safe rather than a hole.
 {CHECKS}
 '''
 
@@ -919,7 +1003,7 @@ case "$1" in
     [ -z "$files" ] && exit 0
     out="code"
     printf '%s\n' "$files" | grep -Eq '\.(tsx|jsx|css|scss)$|(^|/)tailwind\.config\.' && out="$out design"
-    printf '%s\n' "$files" | grep -Eq '^supabase/|(^|/)functions/|(^|/)auth(/|\.)|^\.github/workflows/|(^|/)\.mcp\.json$' && out="$out security"
+    printf '%s\n' "$files" | grep -Eq '^supabase/|(^|/)functions/|(^|/)auth(/|\.)|Auth([A-Z][A-Za-z]*)?\.(tsx?|jsx?)$|^\.github/workflows/|^\.githooks/|(^|/)\.mcp\.json$|(^|/)tailwind\.config\.' && out="$out security"
     printf '%s\n' "$out"
     ;;
   sig)
@@ -991,6 +1075,13 @@ cd "$root" || exit 0
 active=$(printf '%s' "$input" | $py -c "import json,sys; print(1 if json.load(sys.stdin).get('stop_hook_active') else 0)" 2>/dev/null)
 [ "$active" = "1" ] || active=0
 branch=$(git branch --show-current 2>/dev/null)
+# A spike branch reports its debt and lets the session end. It cannot reach main except through a
+# pull request, where the CI gates and a full pipeline pass still apply - so the gate is moved to
+# the boundary that matters rather than removed. Anything not named this way is unaffected.
+case "$branch" in
+  spike/*|draft/*|proto/*) prototype=1 ;;
+  *) prototype=0 ;;
+esac
 types=$($py -c "import json,sys,re; v=json.load(open(sys.argv[1])).get('generated_types') or ''; print(v if re.fullmatch(r'[A-Za-z0-9._/-]+', v) else '')" .teknobu.json 2>/dev/null)
 [ -n "$types" ] || types=src/types/database.ts
 ps=.claude/hooks/pipeline-state.sh
@@ -1032,6 +1123,14 @@ elif [ -n "$branch" ] && [ -f ".claude/state/$branch/review.json" ]; then
 - The pipeline verdict for $branch is blocked (see .claude/state/$branch/review.json). Fix the blocking findings and re-run /post-change."
 fi
 if [ -z "$reasons" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
+if [ "$prototype" = "1" ]; then
+  # stdout, not stderr: a Stop hook's stderr reaches the session only when it exits 2, and
+  # session-brief.sh already notes that "stdout becomes session context". Writing the disclosure to
+  # stderr on an exit-0 path meant the one thing that makes this defensible never happened.
+  printf '%s\n' "On $branch (a spike branch), so this is not blocking. This work is UNREVIEWED and \
+nothing downstream recomputes it once committed - run /post-change on the branch you merge into:$reasons"
+  exit 0
+fi
 if [ -z "$sig" ]; then printf '%s\n' "Not done yet:$reasons" >&2; exit 2; fi
 msig=""
 mcount=0
@@ -1132,14 +1231,14 @@ BUILTIN_PIPELINE = {
     '.claude/agents/test-writer.md': "---\nname: test-writer\ndescription: Writes or extends tests for changed code - unit and integration - and a failing test first for every bug fix. The only agent that writes files, and only test files. Use after a change is implemented, before test-runner.\nmodel: sonnet\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\n---\n\nYou write tests. You write nothing else: only files under the project's test locations (`tests/`, `__tests__/`, `*.test.*`, `*.spec.*`, `e2e/`). If a test needs a change to source code, report it; do not make it.\n\n1. Read the diff. For every changed behaviour, decide the smallest test that would fail if the change were reverted.\n2. For a bug fix: write the reproducing test first and confirm it fails on the old behaviour (reason from the code if you cannot run it), then that it passes.\n3. Cover the states: empty, one, many, null, failure of any external call. Prefer one assertion per test and names that read as sentences.\n4. Use the project's existing test framework and conventions; look at a neighbouring test before writing one. Never hit production data; use the local or work-branch database, fixtures, or mocks at the boundary.\n5. Do not write tests that cannot fail, tests of the framework, or tests of private details that would break on a harmless refactor.\n\nReport: files written, what each test proves, and any source change a test would need (as a request, not an edit).\n",
     '.claude/agents/test-runner.md': '---\nname: test-runner\ndescription: Runs the project\'s checks and tests and reports the truth of them - what ran, what failed, and why. Use after implementation and after fixes. Never edits.\nmodel: sonnet\ntools: Read, Bash(npm:*), Bash(npx:*), Bash(pnpm:*), Bash(yarn:*), Bash(bun:*), Bash(flutter:*), Bash(python:*), Bash(pytest:*), Bash(git diff:*)\n---\n\nYou run the checks and report what actually happened. You never edit and never "fix" a test by weakening it.\n\n1. Run, in order, stopping at the first red: the type check, the linter, the unit/integration tests, using the commands in `.githooks/checks` (the same list the pre-push hook and CI run). Never against production; the work-branch database or local only.\n2. For every failure: the test name, the assertion, the first relevant line of the stack, and your reading of the cause in one sentence. Do not paste whole logs.\n3. Say what did not run and why (no tests for this area, a missing service, a timeout).\n\nEnd with `TESTS: green (<n> passed)` or `TESTS: red (<n> failed of <m>)`, then the failures. Three lines if everything is green.\n',
     '.claude/agents/qa-runner.md': "---\nname: qa-runner\ndescription: Exercises the running app the way a user would, on the work-branch URL, through Playwright - the flows in docs/UAT_PLAN.md and the ones the change touches - and reports what a user would hit. Use after tests are green and the branch is deployed. Never edits.\nmodel: sonnet\ntools: Read, Grep, Glob, Bash(npx playwright:*), Bash(npx:*), Bash(curl:*)\n---\n\nYou are the tester of what was built, as opposed to the code. You never edit.\n\n1. Find the base URL: `QA_BASE_URL` in the environment, else the work-branch URL in `.teknobu.json` or the work-branch `.env` file. If none, say so and stop.\n2. If the repo has Playwright (`@playwright/test` in package.json, or `e2e/`), run the end-to-end suite against that URL and report as test-runner would. If it has none, say so once and recommend `npm init playwright@latest` with a smoke suite of the UAT plan's top flows; then do the walkthrough below with `curl` for what can be checked without a browser (routes respond, auth redirects, API errors are shaped).\n3. Walk the flows in `docs/UAT_PLAN.md` that the change touches, and the three most important flows regardless. For each: the steps, what happened, what a user would think. Look specifically at empty states, a failed request, a slow request, a refresh mid-flow, a deep link.\n4. Never create data in production. Never use real customer data.\n\nReport per flow: **pass** / **fail** / **could not test** with one line of why, ordered by user cost. End with `QA: pass` or `QA: fail (<n> flows)`.\n",
-    '.claude/agents/uat-writer.md': '---\nname: uat-writer\ndescription: Writes the UAT document for the current branch\'s pull request from the diff and the changelog - preconditions, test data, cases with steps and expected results, sign-off. Use before creating a PR. Haiku; formatting work.\nmodel: haiku\ntools: Read, Grep, Glob, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou write `docs/uat/<branch>-<YYYY-MM-DD>.md` for the current branch, for a tester who did not build the feature. Plain English; no code.\n\nFrom `git diff <base>...HEAD`, the CHANGELOG.md entry, and docs/UAT_PLAN.md:\n\n```\n# UAT - <feature or branch> - <date>\n\n**Branch:** <branch>   **Environment:** <work-branch URL>   **Prepared by:** Claude Code   **Status:** awaiting sign-off\n\n## What changed\nTwo to five sentences a client understands.\n\n## Preconditions\nAccounts, roles, data that must exist, feature flags.\n\n## Test data\nExactly what to type or upload, so two testers get the same result.\n\n| ID | Area | Steps | Expected | Result | Tester | Date |\n|----|------|-------|----------|--------|--------|------|\n| UAT-1 | ... | 1. ... 2. ... | ... | | | |\n\n## Not covered here\nWhat this change does not touch and why it is out of scope.\n\n## Sign-off\nName / role / date / decision (accept, accept with notes, reject).\n```\n\nOne row per behaviour a user can observe, including the failure paths. Number steps. Expected results are specific ("the row shows Verified in green", not "it works"). Also add the new cases to docs/UAT_PLAN.md so the master plan stays current. Report the path of the file written.\n',
+    '.claude/agents/uat-writer.md': "---\nname: uat-writer\ndescription: Pushes the branch's UAT test cases to UAT Hub and records what was pushed for the pull request. Use before creating a PR. Haiku; formatting work.\nmodel: haiku\ntools: Read, Grep, Glob, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou produce this branch's UAT. The cases go to UAT Hub, where a human tester picks them up; the\npull request gets a short record of what you pushed, not a second copy of the cases.\n\n## 1. Write and push the cases\n\nRead the `## Writing UAT` section of this repo's `CLAUDE.md` and follow it exactly. It carries the\nfield contract the endpoint enforces, the rules for writing for a tester rather than for yourself, the coverage the cases\nmust have, and what to do when a push is refused. Do not work from memory and do not paraphrase it -\nthat section is generated from the hub's own prompt and is the current contract. Naming the\nfields here would be a second copy of something the endpoint enforces, so this does not.\n\nDerive the cases from `git diff <base>...HEAD`, the CHANGELOG.md entry, and `docs/UAT_PLAN.md`.\nCover the failure paths, not just the happy ones. If you changed how an existing feature behaves,\nre-push its cases with their existing `source_ref` so the definitions stop being stale.\n\n## 2. Record the push for the pull request\n\nThen write `docs/uat/<branch>-<YYYY-MM-DD>.md`. It is a record, not a duplicate:\n\n```\n# UAT - <feature or branch> - <date>\n\n**Branch:** <branch>   **Environment:** <work-branch URL>   **Prepared by:** Claude Code\n**Cases:** pushed to UAT Hub, project `<slug>`, module(s) `<module>` - <n> cases\n\n## What changed\nTwo to five sentences a client understands.\n\n## Preconditions\nAccounts, roles, data that must exist, feature flags. The tester needs these before starting.\n\n## Test data\nExactly what to type or upload, so two testers get the same result.\n\n## Cases pushed\n| source_ref | Title | Module |\n|---|---|---|\n| auth-login-invalid | Wrong password shows an inline error | Auth |\n\n## Not covered here\nWhat this change does not touch and why it is out of scope. Anything that cannot be tested\nthrough the interface, and why.\n\n## Sign-off\nResults are recorded in UAT Hub against this round, not in this file.\n```\n\nThe `source_ref` table is what makes the record useful: a reviewer can see the scope of testing,\nand anyone can find the case in the hub. Do not restate steps or expected results here - the hub\nholds those, and a second copy goes stale the moment you re-push.\n\n## If the hub is not available\n\nA repo with no UAT Hub project, no `UAT_HUB_KEY`, or a refused push is not a failure to work\naround. Say so plainly in your report. In that case only, write the cases into the document in full\n(a table of ID, steps, expected, result, tester, date) so the branch still has usable UAT, and state\nat the top of the file that they were not pushed and why. Never invent a project slug.\n\nAlso add the new cases to `docs/UAT_PLAN.md` so the master list stays current.\n\nReport: what you pushed, to which project and module, how many cases, and the path of the record.",
     '.claude/agents/changelog-scribe.md': '---\nname: changelog-scribe\ndescription: Adds or updates the CHANGELOG.md entry for the current branch from the diff. Use after a change, before the Stop gate. Haiku; formatting work. Writes only CHANGELOG.md.\nmodel: haiku\ntools: Read, Edit, Write, Bash(git diff:*), Bash(git log:*), Bash(git branch:*)\n---\n\nYou maintain CHANGELOG.md (Keep a Changelog shape: `## [Unreleased]` with Added / Changed / Fixed / Removed / Security). From `git diff <base>...HEAD` write one line per user-visible or operator-visible change, in plain language, with the area in front: `- Case search: results now deduplicate across BAILII and the National Archives.` Migrations get a line under Changed naming the table. No internal refactor chatter unless it changes behaviour. Edit only CHANGELOG.md; report the lines added.\n',
     '.claude/agents/docs-maintainer.md': '---\nname: docs-maintainer\ndescription: Keeps docs/STATUS.md current and updates docs/ARCHITECTURE.md when the shape of the system changed. Use at the end of a work block. Haiku; formatting work. Writes only under docs/.\nmodel: haiku\ntools: Read, Edit, Write, Grep, Glob, Bash(git diff:*), Bash(git log:*)\n---\n\nYou keep two documents truthful, editing nothing else.\n\n- `docs/STATUS.md`: what is being worked on now, what was finished in this block (one line each, dated), what is blocked and on whom, the next three things. Delete what is stale; keep it to one screen.\n- `docs/ARCHITECTURE.md`: only when the diff adds or removes a service, table, edge function, integration, route group, or environment variable. Update the relevant section; never rewrite the document.\n\nReport what you changed in two lines.\n',
     '.claude/agents/uat-plan-maintainer.md': '---\nname: uat-plan-maintainer\ndescription: Updates docs/UAT_PLAN.md after a change - flags invalidated scenarios, adds new ones, marks what needs client-side re-testing. Use as part of /post-change.\ntools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)\nmodel: haiku\n---\n\nYou maintain `docs/UAT_PLAN.md` only - do not modify any other file.\n\nGiven the current branch\'s diff (`git diff` against the base branch), changelog entry, and impact report:\n\n1. Mark existing UAT scenarios touched by this change as **RE-TEST REQUIRED**, with the\n   reason and date.\n2. Add scenarios for any new behaviour: ID, preconditions, steps, expected result,\n   tenant/role to test as.\n3. Flag anything that needs **client-side verification** (real accounts, live\n   integrations, third-party services) separately from internal testing.\n4. Keep a short "Changed in this cycle" list at the top so a human can brief UAT in\n   two minutes.\n\nScenario IDs are stable - never renumber existing ones. Retired scenarios are moved to\nan Archive section, not deleted.\n',
     '.claude/commands/post-change.md': '---\ndescription: Run the change pipeline on the current work block - parallel review, fix loop (max 2), tests, verdict, docs. Once per block, not per edit.\n---\nRun the pipeline on everything changed since the last commit on this branch (plus any uncommitted work). Do not ask questions; report each stage in a line or two.\n\n1. **Tier.** Decide fast lane or full pipeline per CLAUDE.md. Say which and why in one line.\n2. **Review, in parallel.** Launch `code-reviewer` and `security-reviewer` together (and `design-reviewer` if anything under the UI changed). Wait for all three.\n3. **Fix loop.** Fix every finding marked *blocks the task* or *hurts the task*. Re-run only the reviewer(s) that reported them. At most two rounds; if a blocker survives two rounds, stop and ask the user with the finding quoted.\n4. **Tests.** Run `test-writer` for the changed behaviour (and the failing-test-first rule for any bug fix), then `test-runner`. Red means fix and re-run; same two-round cap.\n5. **Verdict.** After the last code or test edit of the block, run `sh .claude/hooks/pipeline-state.sh sig` from the repo root, then write `.claude/state/<branch>/review.json`: `{"branch": "...", "at": "<ISO time>", "sig": "<the sig output>", "verdict": "clear" | "blocked", "blocking": ["..."], "reviewers": {"code": "clear|blocked", "security": "clear|blocked", "design": "clear|blocked|skipped"}, "tests": "green|red"}`. The Stop gate blocks until this exists, covers the reviewers the diff makes due, and matches the current sig - any later code edit makes it stale.\n6. **Tail, in parallel.** `changelog-scribe`, `docs-maintainer` and `uat-plan-maintainer` together. Then, if this block is heading for a pull request, `uat-writer`.\n7. **Summary.** Five lines: tier, findings fixed, tests, what is in the changelog, what is still open.\n\nRules: reviewers never edit; only the lead (you) and test-writer write. Never weaken a test to pass it. Never print secrets or env values.\n',
     '.claude/commands/design-pass.md': "---\ndescription: Design-led polish of a screen within the design contract - applies the design-reviewer's polish and consistency findings in the fast lane; leaves anything that blocks or hurts the task for a human.\nargument-hint: <screen or component path>\n---\nRun `design-reviewer` on $ARGUMENTS (or on the screens touched since the last commit if no argument).\n\nThen, in the fast lane and without asking:\n- Apply every finding marked **polish** or **inconsistency**: spacing, hierarchy by size/weight/space, empty/loading/error states, reuse of the existing component for the same job, tokens instead of literals, accessible names, focus rings.\n- Do not touch data flow, contracts, handlers, or logic. If a finding needs any of those, leave it and list it.\n- Do not apply findings marked **blocks the task** or **hurts the task**; list them for the user with the reviewer's wording.\n\nRe-run `design-reviewer` once on the result. Report: what was applied (file:line), what was left and why, and the screens a human should open to see the result. Commit message if asked: `style: design pass on <screen>`.\n",
     '.claude/commands/worktree.md': '---\ndescription: Manage git worktrees for parallel sessions - new <branch> creates a sibling worktree wired for the worklog, list shows state, clean removes merged ones\nargument-hint: new <branch> | list | clean\n---\nRun `python "$HOME/.claude/sonelo/repo_setup.py" worktree $ARGUMENTS` from the repo root (default to `list` when no argument was given) and relay its output plainly.\n- `new <branch>`: report the created path and tell the user to open their next Claude Code session there; the worklog is pre-stamped to report under this repo\'s project.\n- `clean`: a "kept" line is information for the user - uncommitted work, or a branch git cannot prove merged (squash merges look unmerged). Never force-remove a worktree and never delete branches to make clean succeed.\n',
-    '.claude/commands/pr.md': '---\ndescription: Create the pull request for this branch into production - pipeline verdict must be clear, UAT document required, PR body is the UAT document.\n---\n1. Confirm `.claude/state/<branch>/review.json` exists with `"verdict": "clear"` and `"tests": "green"` from this branch\'s latest work. If not, run `/post-change` first.\n2. Run `uat-writer` if `docs/uat/` has no document for this branch dated today. Commit it: `docs: UAT for <branch>`.\n3. Push the branch. Create the PR with `gh pr create --base <production branch> --head <branch> --title "<conventional summary>" --body-file docs/uat/<the document>`. Add the changelog lines under a "## Changes" heading in the body if the PR template asks for them.\n4. Report the PR URL, the gates that must pass, and the UAT document path. Never print secrets.\n',
+    '.claude/commands/pr.md': '---\ndescription: Create the pull request for this branch into production - pipeline verdict must be clear, UAT document required, PR body is the UAT document.\n---\n1. Confirm `.claude/state/<branch>/review.json` exists with `"verdict": "clear"` and `"tests": "green"` from this branch\'s latest work. If not, run `/post-change` first.\n2. Run `uat-writer` if `docs/uat/` has no document for this branch dated today. It pushes the cases to UAT Hub and writes a record of what was pushed. Commit it: `docs: UAT for <branch>`.\n3. Push the branch. Create the PR with `gh pr create --base <production branch> --head <branch> --title "<conventional summary>" --body-file docs/uat/<the document>`. Add the changelog lines under a "## Changes" heading in the body if the PR template asks for them.\n4. Report the PR URL, the gates that must pass, and the UAT document path. Never print secrets.\n',
     '.claude/hooks/post-edit.sh': POST_EDIT_SH,
     '.claude/hooks/guard-migrations.sh': '#!/bin/sh\n# sonelo-devkit pipeline: PreToolUse hook on Edit/Write/MultiEdit. Migrations are append-only.\n{ [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0\ninput=$(cat)\nfile=$(printf \'%s\' "$input" | python -c "import json,sys; d=json.load(sys.stdin); print((d.get(\'tool_input\') or {}).get(\'file_path\') or \'\')" 2>/dev/null)\ncase "$file" in\n  *supabase/migrations/*|*supabase\\\\migrations\\\\*) ;;\n  *) exit 0 ;;\nesac\nif [ -f "$file" ]; then\n  echo "Blocked: $file is an existing migration. Migrations are append-only - create a new file under supabase/migrations/ instead. (SONELO_SKIP_HOOKS=1 overrides, say why in the commit.)" >&2\n  exit 2\nfi\nexit 0\n',
     '.claude/hooks/stop-gate.sh': STOP_GATE_SH,
@@ -1152,7 +1251,7 @@ BUILTIN_PIPELINE = {
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
 }
-PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
+PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. A diff that is *entirely* design-lane makes only `design-reviewer` due - one non-design file puts `code-reviewer` back. Hooks, the Stop gate and CI still apply.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
 
 UPDATE_COMMAND_MD = '''---
 description: Update the Sonelo kit and worklog on this machine to the latest release, then offer to refresh this repo
@@ -2090,7 +2189,10 @@ def cmd_apply(args):
         else:
             cache = ("          cache: %s\n" % d["pm"]) if d["lockfile"] and d["pm"] in ("npm", "pnpm", "yarn") else ""
             node_steps += fill(NODE_STEPS, NODE_VERSION=d["node_version"], CACHE=cache, INSTALL=install)
-    check_steps = "".join("      - run: %s\n" % c for c in d["checks"]) or "      - run: echo 'no checks configured - see .githooks/checks'\n"
+    # the repo's own checks file wins over detection: it is what pre-push runs, and CI claiming to
+    # run "every line" is only true if it reads the same list
+    ci_checks = checks_lines(root) or d["checks"]
+    check_steps = "".join("      - run: %s\n" % c for c in ci_checks) or "      - run: echo 'no checks configured - see .githooks/checks'\n"
     ci = fill(CI_YML, BRANCHES=", ".join(PROTECTED + [WORK_BRANCH]), PROTECTED_LIST=", ".join(PROTECTED),
               NODE_STEPS=node_steps, FLUTTER_STEPS=FLUTTER_STEPS if d["flutter"] else "",
               PYTHON_STEPS=PYTHON_STEPS if d["python"] else "", CHECK_STEPS=check_steps)
