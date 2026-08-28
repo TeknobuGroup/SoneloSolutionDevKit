@@ -13,6 +13,13 @@ cd "$root" || exit 0
 active=$(printf '%s' "$input" | $py -c "import json,sys; print(1 if json.load(sys.stdin).get('stop_hook_active') else 0)" 2>/dev/null)
 [ "$active" = "1" ] || active=0
 branch=$(git branch --show-current 2>/dev/null)
+# A spike branch reports its debt and lets the session end. It cannot reach main except through a
+# pull request, where the CI gates and a full pipeline pass still apply - so the gate is moved to
+# the boundary that matters rather than removed. Anything not named this way is unaffected.
+case "$branch" in
+  spike/*|draft/*|proto/*) prototype=1 ;;
+  *) prototype=0 ;;
+esac
 types=$($py -c "import json,sys,re; v=json.load(open(sys.argv[1])).get('generated_types') or ''; print(v if re.fullmatch(r'[A-Za-z0-9._/-]+', v) else '')" .teknobu.json 2>/dev/null)
 [ -n "$types" ] || types=src/types/database.ts
 ps=.claude/hooks/pipeline-state.sh
@@ -54,6 +61,17 @@ elif [ -n "$branch" ] && [ -f ".claude/state/$branch/review.json" ]; then
 - The pipeline verdict for $branch is blocked (see .claude/state/$branch/review.json). Fix the blocking findings and re-run /post-change."
 fi
 if [ -z "$reasons" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
+if [ "$prototype" = "1" ]; then
+  # A Stop hook's stdout is transcript-only on exit 0 and its stderr is fed back only on exit 2, so
+  # neither reaches the session that wrote the unreviewed code if we simply allow the stop. Use the
+  # two-strike valve the gate already has: say it once where the session must read it, then allow.
+  if [ -n "$mfile" ] && [ -f "$mfile" ]; then exit 0; fi
+  [ -n "$mfile" ] && { mkdir -p "$(dirname "$mfile")" 2>/dev/null; printf 'spike\n' > "$mfile"; }
+  printf '%s\n' "On $branch (a spike branch): not blocking after this one message, but state it to \
+the user. This work is UNREVIEWED, and nothing downstream recomputes it once committed - run \
+/post-change on the branch you merge into:$reasons" >&2
+  exit 2
+fi
 if [ -z "$sig" ]; then printf '%s\n' "Not done yet:$reasons" >&2; exit 2; fi
 msig=""
 mcount=0

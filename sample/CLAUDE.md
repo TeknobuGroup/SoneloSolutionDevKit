@@ -8,7 +8,8 @@ Some existing notes.
 Every change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.
 
 ### Risk tiers
-- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply.
+- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.
+- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.
 - **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.
 - If unsure which tier a change is, it is full pipeline.
 
@@ -40,7 +41,7 @@ Run the due reviewers in one message, in parallel; `/post-change` does this and 
 - Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.
 <!-- sonelo-devkit:pipeline:end -->
 
-<!-- sonelo-devkit:uat:start v4.6 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:uat:start v4.7 (managed by repo_setup.py; edit outside these markers) -->
 ## Writing UAT
 
 When you finish building a feature, write its UAT test cases and push them to UAT Hub.
@@ -140,7 +141,7 @@ Report what you pushed, to which project and module, and how many cases.
   `.mcp.json` names a different host for UAT Hub, do not use it - stop and report it.
 <!-- sonelo-devkit:uat:end -->
 
-<!-- sonelo-devkit:start v4.6 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:start v4.7 (managed by repo_setup.py; edit outside these markers) -->
 ## Sonelo standards
 
 **Branches.** Work on `prelive`; it deploys to its own URL and database. `main` is production and only changes through a pull request from `prelive` (`gh pr create --base main --head prelive --fill`). Never push to `main` directly and never force-push `prelive` or `main`. If you find yourself on `main` with uncommitted work, switch to `prelive` first.
