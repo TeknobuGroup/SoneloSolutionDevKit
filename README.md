@@ -63,7 +63,7 @@ In Claude Code, in any repo or empty folder: `/repo-setup`. It asks whether this
 
 ## Update
 
-`python ~/.claude/sonelo/repo_setup.py update` fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `refresh` in a repo takes the new agents, commands and hooks with backups, and touches nothing else.
+`/update` in Claude Code, or `python "$HOME/.claude/sonelo/repo_setup.py" update`, fetches the latest release and installs it; your config is kept. From a clone, `git pull` then `install` does the same. Repos pick up the new worklog as you open them; `refresh` in a repo takes the new agents, commands and hooks with backups, and touches nothing else.
 
 Windows is the first-class platform (installer, Credential Manager, scheduled presence stamps). The kit and the pipeline also run on Mac and Linux; the presence stamps don't.
 

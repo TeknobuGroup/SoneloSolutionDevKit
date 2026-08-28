@@ -3,7 +3,7 @@
     "uat-hub": {
       "command": "node",
       "args": [
-        "C:/Users/AccountA/uat-hub/mcp/server.mjs"
+        "${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs"
       ],
       "env": {
         "UAT_HUB_URL": "https://testing.teknobugroup.com",
