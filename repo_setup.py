@@ -60,7 +60,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.3"
+VERSION = "4.5"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -76,6 +76,16 @@ USER_SETTINGS = Path("~/.claude/settings.json").expanduser()
 HOOK_MARK = "repo_setup.py"
 CONFIG_FILE = HOME_DIR / "config.json"
 UPDATE_STAMP = HOME_DIR / "latest-release"          # newest release tag seen; mtime = last check (daily throttle for the nudge)
+
+# UAT Hub: one internal deployment, one checkout location, so these are constants rather than
+# configuration - a knob nobody turns is one more thing to fall out of step. The only value that
+# genuinely differs per repo is the project slug, and that is asked for (see uat_slug).
+UAT_HUB_URL = "https://testing.teknobugroup.com"
+UAT_HUB_KEY_VAR = "UAT_HUB_KEY"                         # read from the environment; never written into a file
+UAT_MCP_NAME = "uat-hub"                                # the server's key in .mcp.json
+UAT_HUB_SERVER = Path("~/uat-hub/mcp/server.mjs").expanduser()   # the checkout every Teknobu machine has
+KIT_ENV_KEYS = ("UAT_HUB_KEY",)                         # keys .env.example documents because the kit needs them,
+                                                        # not because a .env in the repo mentioned them
 
 DEFAULTS = {
     "mode": "full",                       # full: standards + agents + infrastructure | worklog: the worklog only
@@ -516,6 +526,11 @@ What the kit wired automatically: git hooks (commit format, secrets, protected b
 - [ ] If it reports DNS as misconfigured: add the CNAME it prints at your DNS provider (GoDaddy), then re-run.
 - [ ] By hand instead: Settings -> Domains (add domain, Git branch `{WORK}`); Settings -> Environment Variables (Preview, scoped to `{WORK}`); production branch stays `{MAIN}`.
 
+### UAT Hub
+- [ ] The project must exist at {UAT_HUB} before anything can be pushed: a push never creates one, so an unknown slug is refused (which is what stops a typo inventing a phantom client). Until then the wiring is inert, not broken.
+- [ ] Set `UAT_HUB_KEY` in your environment - not in `.env`, not in `.mcp.json`, which is committed. `repo_setup.py doctor` reports whether it is set, never its value.
+- [ ] `.mcp.json` records the slug and the path to the uat-hub checkout as `~/uat-hub/mcp/server.mjs` resolved on the machine that ran the kit. On a machine that keeps the checkout elsewhere, edit the `args` path there; sessions without the server fall back to the HTTP endpoint.
+
 ### GitHub
 - [ ] `python ~/.claude/sonelo/repo_setup.py protect` (needs the `gh` CLI logged in) - or Settings -> Branches -> add rule for `{MAIN}`: require a pull request, require the `checks` status, block force pushes and deletions.
 - [ ] Actions -> Secrets: see the list at the top of `.github/workflows/deploy-supabase.yml` (Supabase repos only).
@@ -547,6 +562,85 @@ CLAUDE_SECTION = '''<!-- {MARK}:start v{VERSION} (managed by repo_setup.py; edit
 
 **If a hook blocks you**, fix the cause. `SONELO_SKIP=1` exists for false positives only; say so in the commit message if you use it.
 <!-- {MARK}:end -->
+'''
+
+UAT_SECTION = '''<!-- {MARK}:uat:start v{VERSION} (managed by repo_setup.py; edit outside these markers) -->
+## Writing UAT
+
+When you finish building a feature, write its UAT test cases and push them to UAT Hub.
+Do NOT write them to a Markdown file — the hub is where a human tester picks them up.
+
+Push with the `push_uat_test_cases` MCP tool. If that tool is unavailable, POST the same
+shape to `https://testing.teknobugroup.com/api/uat/test-cases` with
+`Authorization: Bearer $UAT_HUB_KEY`.
+
+    project:    {UAT_PROJECT}          (omit if UAT_HUB_PROJECT is set for this repo)
+    module:     the feature area, e.g. "Auth", "Checkout", "Patrols"
+    test_cases: a list, each with
+                  title            required, one line, the thing being checked
+                  steps            how to carry it out
+                  expected_result  what should happen if it works
+                  test_url         the page to open — must be http(s)
+                  source_ref       a stable id you choose, e.g. "auth-login-invalid"
+
+### Write for the tester, not for yourself
+
+The person running these has not read the code and may not know the feature. Assume
+nothing.
+
+- **One check per case.** If the title needs "and", it is two cases.
+- **Steps are what to do, in order** — "Enter a valid email and a wrong password, submit",
+  not "test invalid credentials".
+- **Expected result must be decidable.** Someone has to be able to say pass or fail without
+  asking you. "Shows an error" is not decidable; "Inline error under the password field,
+  and the page does not navigate" is.
+- **Name real things** — the actual button text, the actual field label, the actual URL.
+- **No jargon from the codebase.** No component names, no function names, no ticket numbers.
+
+### Cover what actually breaks
+
+A list of happy paths is close to worthless. For each feature include:
+
+- the normal case
+- the empty case — no data, first use, nothing configured yet
+- the invalid case — wrong input, wrong format, wrong order
+- the permission case — someone who should not be able to do this, if roles apply
+- anything you know is fragile, or that you had to think hard about while building it
+
+If something cannot be tested through the interface, say so in the steps rather than
+writing a case nobody can run.
+
+### Always set source_ref
+
+Give every case a stable id derived from what it tests, e.g. `checkout-discount-invalid`.
+Pushing the same case twice with the same `source_ref` updates nothing and creates nothing,
+so a retry after a timeout is safe and re-running you is safe. Without it, every push
+duplicates.
+
+### Batching
+
+Up to 200 cases per push, one module per push. Several modules means several pushes.
+
+### If the push is refused
+
+Read the message; it is specific.
+
+- _"no project with slug X; create it in UAT Hub first"_ — the slug is wrong, or the project
+  has not been created. Do not invent one. Stop and report it.
+- _"invalid or revoked api key"_ — `UAT_HUB_KEY` is missing, wrong, or has been revoked.
+  Stop and report it. Do not put a key in any committed file.
+
+Report what you pushed, to which project and module, and how many cases.
+
+### How this repo is wired
+
+- The MCP server is registered in `.mcp.json`. `UAT_HUB_KEY` is expanded from the environment of
+  the machine running the session and is never written into a file in this repo - `.mcp.json` is
+  committed, and one key covers every project. `repo_setup.py doctor` reports whether it is set.
+- This repo pushes to the UAT Hub project `{UAT_PROJECT}`. A push cannot create a project: if the
+  hub has no project with that slug, every push is refused until someone creates it in UAT Hub.
+  That is correct behaviour, not a fault to work around - do not invent a slug.
+<!-- {MARK}:uat:end -->
 '''
 
 # the sh hooks break under a CRLF checkout; merge_gitattributes writes its own header
@@ -1042,11 +1136,12 @@ Gather everything before doing anything, in one message, defaults in brackets; t
 2. Deploys on Vercel? If yes, {WORK} domain [{WORK}.<production domain>] and production domain [{DOMAIN_EXAMPLE}].
 3. Supabase: already has a production project [yes for an existing app] - then create only the {WORK} database; or create both.
 4. GitHub branch protection on main [yes].
+5. UAT Hub project slug, so sessions can push UAT test cases to {UAT_HUB} instead of writing a Markdown file [the repo folder name]. The project must already exist in the hub - a push to an unknown slug is refused rather than creating one, so ask the user rather than guessing. "skip" leaves the default in place; the wiring stays inert until the project exists.
 Confirm the plan in four lines, including that Supabase projects may be billable. Then run without further questions.
 
 Do, reporting each step's output:
 1. `python "$HOME/.claude/sonelo/repo_setup.py" doctor` - stop and tell the user if a login the plan needs is missing; don't work around it.
-2. `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down hooks, CI, {ENVDOC}, CLAUDE.md, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, prefer `repo_setup.py refresh`: it takes the kit's current agents, commands, hooks and CI *gates* (ci-gates.yml, pull_request_template.md), keeps a backup of everything it replaces, and touches nothing else - not the repo's own ci.yml, env files, design contract or branches. Never pass `--force` unless asked.
+2. `python "$HOME/.claude/sonelo/repo_setup.py" apply --uat-project <slug>` (drop the flag to keep whatever the repo already recorded). It lays down hooks, CI, {ENVDOC}, CLAUDE.md and its "Writing UAT" section, `.mcp.json` registering the UAT Hub MCP server (merged into any that exists; the key stays the `${UAT_HUB_KEY}` placeholder and is never written out), `UAT_HUB_KEY` in `.env.example`, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, prefer `repo_setup.py refresh`: it takes the kit's current agents, commands, hooks and CI *gates* (ci-gates.yml, pull_request_template.md), keeps a backup of everything it replaces, and touches nothing else - not the repo's own ci.yml, env files, design contract or branches. Never pass `--force` unless asked.
 3. Brand: write the guidelines verbatim to `docs/BRAND.md` if given, and rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the one call-to-action colour, the off-brand list, the design lint command if any). Put the product's one-line description and voice rules into CLAUDE.md and the pipeline's ARCHITECTURE/STATUS/UAT placeholders. Take the stack from the repo, not from the guidelines; if they disagree (e.g. the document still says Lovable Cloud), say so in the summary.
 4. Fill every remaining `TODO` in the pipeline files from what is true of the repo. Ask nothing; leave a TODO only if it is genuinely unknowable.
 5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply sonelo repo standards` on `{WORK}`.
@@ -1166,6 +1261,15 @@ def merge_gitignore(root, rep):
     rep.note("updated (%d lines added%s)" % (len(missing), "; !.env.example moved last" if moved else ""), path)
 
 
+def kit_env_lines(keys):
+    """The kit's own .env.example entries: what the variable is for, then an empty value. A value is
+    never written here - .env.example is committed."""
+    doc = {UAT_HUB_KEY_VAR: ("# UAT Hub (%s): create-only key for pushing UAT test cases from a Claude\n"
+                             "# Code session. Set it in your environment - it is not a deploy variable, and a\n"
+                             "# literal key never belongs in a committed file.\n" % UAT_HUB_URL)}
+    return "".join(doc.get(k, "") + "%s=\n" % k for k in keys)
+
+
 def env_example(root, rep):
     env, example = root / ".env", root / ".env.example"
     keys = []
@@ -1174,22 +1278,22 @@ def env_example(root, rep):
             m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
             if m and m.group(1) not in keys:
                 keys.append(m.group(1))
+    kit = [k for k in KIT_ENV_KEYS if k not in keys]   # the kit needs these whether or not a .env mentions them
     existing = read(example)
     if existing is None:
-        if not keys:
-            rep.note("skipped (no .env to derive from)", example)
-            return
-        text = "# Copy to .env and fill in. Prelive and production use different values.\n" + "".join("%s=\n" % k for k in keys)
+        text = ("# Copy to .env and fill in. Prelive and production use different values.\n"
+                + "".join("%s=\n" % k for k in keys) + kit_env_lines(kit))
         if not rep.dry:
             write(example, text)
-        rep.note("created (%d keys, values stripped)" % len(keys), example)
+        rep.note("created (%d keys, values stripped)" % (len(keys) + len(kit)), example)
         return
     have = set(re.findall(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", existing, re.M))
     add = [k for k in keys if k not in have]
-    if add:
+    add_kit = [k for k in kit if k not in have]
+    if add or add_kit:
         if not rep.dry:
-            write(example, existing.rstrip("\n") + "\n" + "".join("%s=\n" % k for k in add))
-        rep.note("updated (%d keys added)" % len(add), example)
+            write(example, existing.rstrip("\n") + "\n" + "".join("%s=\n" % k for k in add) + kit_env_lines(add_kit))
+        rep.note("updated (%d keys added)" % (len(add) + len(add_kit)), example)
     else:
         rep.note("unchanged", example)
 
@@ -1199,7 +1303,10 @@ def env_prelive(root, rep):
     if path.exists():
         rep.note("unchanged (yours)", path)
         return
-    keys = re.findall(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", read(root / ".env.example") or "", re.M)
+    # KIT_ENV_KEYS are session/machine variables - UAT_HUB_KEY is read by the MCP server on the
+    # machine running Claude Code. Pushing them to a hosting provider spreads a secret for no gain.
+    keys = [k for k in re.findall(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
+                                  read(root / ".env.example") or "", re.M) if k not in KIT_ENV_KEYS]
     if not keys:
         rep.note("skipped (no .env.example keys to start from)", path)
         return
@@ -1211,7 +1318,84 @@ def env_prelive(root, rep):
     rep.note("created (%d keys, fill in)" % len(keys), path)
 
 
-def claude_md(root, rep, update=False):
+def uat_slug(root, explicit=None):
+    """This repo's UAT Hub project slug.
+
+    The hub fixes a slug when the project is created there and it cannot change afterwards, so it is
+    not derivable - hence: what was asked for, else what the repo already recorded, else the folder
+    name. A guessed default is safe to write because a push to a slug the hub does not know is
+    refused with a message saying so; the wiring is inert, not broken, until the project exists."""
+    for value in (explicit, read_json(root / ".teknobu.json", {}).get("uat_project"), root.name):
+        if value and str(value).strip():
+            return str(value).strip()
+    return root.name
+
+
+def backup_copy(root, name, text, into=None):
+    """Keep a copy of a file the kit is about to replace, under .claude/.backup/<stamp>/.
+
+    Not named `backup`: copy_pipeline has a local of that name for the same directory, and a
+    function shadowed inside the one place most likely to want it is a trap."""
+    into = into or (root / ".claude" / ".backup" / datetime.now().strftime("%Y%m%d-%H%M%S"))
+    into.mkdir(parents=True, exist_ok=True)
+    if not (into.parent / ".gitignore").exists():
+        write(into.parent / ".gitignore", "*\n")
+    write(into / name, text)
+    return into
+
+
+def mcp_json(root, rep, slug, into=None):
+    """Register the UAT Hub MCP server, merging into whatever .mcp.json the repo already has.
+
+    The key is written as the literal "${UAT_HUB_KEY}", expanded from the environment when Claude
+    Code starts the server. It is never resolved here: .mcp.json is committed into client repos that
+    may be handed over or shared, and one key covers every project - a literal in one repo's history
+    would expose push access for the whole estate.
+
+    Only the uat-hub entry is ours. Any other server in the file is left exactly as it is, and a
+    .mcp.json that will not parse is reported rather than replaced."""
+    path = root / ".mcp.json"
+    server = {"command": "node", "args": [UAT_HUB_SERVER.as_posix()],
+              "env": {"UAT_HUB_URL": UAT_HUB_URL, "UAT_HUB_KEY": "${%s}" % UAT_HUB_KEY_VAR,
+                      "UAT_HUB_PROJECT": slug}}
+    existing = read(path)
+    if existing is None:
+        data, action = {"mcpServers": {UAT_MCP_NAME: server}}, "created"
+    else:
+        data = read_json(path, None)
+        if data is None:
+            rep.note("skipped (not a JSON object; add the %s server by hand)" % UAT_MCP_NAME, path)
+            return
+        servers = data.get("mcpServers")
+        data["mcpServers"] = servers if isinstance(servers, dict) else {}
+        data["mcpServers"][UAT_MCP_NAME] = server
+        action = "updated"
+    text = json.dumps(data, indent=2) + "\n"
+    if existing == text:
+        rep.note("unchanged", path)
+        return
+    saved = None
+    if not rep.dry:
+        if existing is not None:
+            saved = backup_copy(root, ".mcp.json", existing, into)
+        write(path, text)
+    rep.note("%s (%s -> project %s)" % (action, UAT_MCP_NAME, slug), path)
+    return saved
+
+
+def splice(text, start, end, block, before=None):
+    """Replace a marked block in place, or add it - immediately before `before` when that marker is
+    present, otherwise at the end."""
+    if start in text and end in text:
+        a, b = text.index(start), text.index(end) + len(end)
+        return text[:a] + block.rstrip("\n") + text[b:]
+    if before and before in text:
+        a = text.index(before)
+        return text[:a] + block.rstrip("\n") + "\n\n" + text[a:]
+    return text.rstrip("\n") + "\n\n" + block.rstrip("\n") + "\n"
+
+
+def claude_md(root, rep, slug=None, update=False):
     path = root / "CLAUDE.md"
     section = fill(CLAUDE_SECTION, WORK=WORK_BRANCH, MAIN=PROTECTED[0])
     existing = read(path)
@@ -1221,11 +1405,14 @@ def claude_md(root, rep, update=False):
             if existing and fmt % m in existing:
                 return fmt % m
         return fmt % MARK
+    ustart, uend = marker("<!-- %s:uat:start"), marker("<!-- %s:uat:end -->")
+    uat = fill(UAT_SECTION, UAT_PROJECT=uat_slug(root, slug))
     pstart, pend = marker("<!-- %s:pipeline:start -->"), marker("<!-- %s:pipeline:end -->")
     pipeline = ("<!-- %s:pipeline:start -->" % MARK) + "\n" + fill(PIPELINE_CLAUDE_SECTION, WORK=WORK_BRANCH, MAIN=PROTECTED[0]).rstrip("\n") + "\n" + ("<!-- %s:pipeline:end -->" % MARK) + "\n"
     start, end = marker("<!-- %s:start"), marker("<!-- %s:end -->")
     if existing is None:
-        text, action = "# %s\n\n<one line: what this product is and who it is for>\n\n" % root.name + pipeline + "\n" + section, "created"
+        text, action = ("# %s\n\n<one line: what this product is and who it is for>\n\n" % root.name
+                        + pipeline + "\n" + uat + "\n" + section), "created"
     else:
         text = existing
         if pstart in text and pend in text:
@@ -1244,6 +1431,7 @@ def claude_md(root, rep, update=False):
                 text = text[:text.index(start)] + pipeline + "\n" + text[text.index(start):]
             else:
                 text = text.rstrip("\n") + "\n\n" + pipeline
+        text = splice(text, ustart, uend, uat, before=start)   # between the pipeline and the standards
         if start in text and end in text:
             a, b = text.index(start), text.index(end) + len(end)
             text = text[:a] + section.rstrip("\n") + text[b:]
@@ -1686,12 +1874,13 @@ def cmd_apply(args):
     # pull_request_template.md is a BUILTIN_PIPELINE file; copy_pipeline below is its only writer.
 
     # docs + config
-    rep.put(root / env_doc(), fill(PRELIVE_MD, REPO=root.name, WORK=WORK_BRANCH, WORKU=WORK_BRANCH.upper(), MAIN=main,
+    rep.put(root / env_doc(), fill(PRELIVE_MD, REPO=root.name, WORK=WORK_BRANCH, WORKU=WORK_BRANCH.upper(), MAIN=main, UAT_HUB=UAT_HUB_URL,
                                    DEPLOY_LINE="Supabase migrations and edge functions deployed per branch, " if d["supabase"] else "",
                                    SUPABASE_TODO=fill(SUPABASE_TODO, WORK=WORK_BRANCH, WORKU=WORK_BRANCH.upper()) if d["supabase"] else ""), force=args.force)
     cfg = read_json(root / ".teknobu.json", {})
+    slug = uat_slug(root, getattr(args, "uat_project", None))   # asked for once, then remembered here
     cfg.update({"kit": VERSION, "work_branch": WORK_BRANCH, "protected": PROTECTED, "commit_format": "conventional",
-                "applied": datetime.now().strftime("%Y-%m-%d"),
+                "applied": datetime.now().strftime("%Y-%m-%d"), "uat_project": slug,
                 "stack": {k: d[k] for k in ("node", "pm", "supabase", "flutter", "python", "vercel")}})
     cfg.setdefault("generated_types", "src/types/database.ts")
     text = json.dumps(cfg, indent=2) + "\n"
@@ -1703,7 +1892,8 @@ def cmd_apply(args):
             write(root / ".teknobu.json", text)
         rep.note("updated" if existed else "created", root / ".teknobu.json")
     copy_pipeline(root, rep, d, update=args.update_pipeline)   # starter first, built-ins fill the gaps
-    claude_md(root, rep, update=args.update_pipeline)
+    claude_md(root, rep, slug, update=args.update_pipeline)
+    mcp_json(root, rep, slug)                                  # the tool the CLAUDE.md UAT section names
     merge_gitignore(root, rep)
     merge_gitattributes(root, rep)
     env_example(root, rep)
@@ -1741,8 +1931,10 @@ def cmd_refresh(args):
     creating and checking out the work branch. On a repo that only wants this release's agents,
     commands and hooks, that is a lot of blast radius for a small want - so this is the narrow verb.
 
-    It does exactly three things: the built-in pipeline files (backups kept in .claude/.backup/),
-    the hook registrations in .claude/settings.json, and the managed section of CLAUDE.md. It also
+    It does exactly four things: the built-in pipeline files (backups kept in .claude/.backup/),
+    the hook registrations in .claude/settings.json, the managed sections of CLAUDE.md, and the
+    uat-hub entry in .mcp.json - the MCP server the managed UAT section tells sessions to use, which
+    would otherwise be named by a refreshed CLAUDE.md in a repo that does not have it. It also
     records the kit version in .teknobu.json - without that the session-start nudge would keep
     reporting the repo as out of date and pointing back at the heavy command.
 
@@ -1772,7 +1964,7 @@ def cmd_refresh(args):
     # repo whose CLAUDE.md carries hand-written policy outside the markers would lose it with no
     # copy anywhere - and refresh, unlike --update-pipeline, is now the recommended path.
     before = read(root / "CLAUDE.md")
-    claude_md(root, rep, update=True)
+    claude_md(root, rep, uat_slug(root), update=True)   # read-only on .teknobu.json: refresh owns no repo keys
     if before is not None and not dry and read(root / "CLAUDE.md") != before:
         backups = backups or (root / ".claude" / ".backup" / datetime.now().strftime("%Y%m%d-%H%M%S"))
         backups.mkdir(parents=True, exist_ok=True)
@@ -1780,6 +1972,7 @@ def cmd_refresh(args):
             write(backups.parent / ".gitignore", "*\n")
         write(backups / "CLAUDE.md", before)
         rep.note("replaced (yours backed up)", root / "CLAUDE.md")
+    backups = mcp_json(root, rep, uat_slug(root), into=backups or None) or backups
     cfg_path = root / ".teknobu.json"
     cfg = read_json(cfg_path, {})
     if isinstance(cfg, dict) and cfg and (cfg.get("kit") != VERSION):
@@ -1802,7 +1995,8 @@ def cmd_refresh(args):
             say("  %-*s  %s" % (width, action, w))
         say("")
     say("Refreshed: .claude/agents, .claude/commands, .claude/hooks, the CI *gates* "
-        "(.github/workflows/ci-gates.yml, pull_request_template.md) and the managed CLAUDE.md section.")
+        "(.github/workflows/ci-gates.yml, pull_request_template.md), the managed CLAUDE.md sections "
+        "and the %s entry in .mcp.json (any other MCP server in it is left alone)." % UAT_MCP_NAME)
     say("Untouched: your CI workflow (ci.yml), the deploy workflow, %s, .githooks/, .env*, "
         ".claude/rules/design.md, branches, the worklog." % env_doc())
     if backups:
@@ -1826,6 +2020,7 @@ def status(root):
         items.append(("Supabase deploy workflow", (root / ".github" / "workflows" / "deploy-supabase.yml").exists()))
     items.append(("branch %s" % WORK_BRANCH, bool(sh(["git", "-C", str(root), "branch", "--list", WORK_BRANCH]).stdout.strip())))
     items.append(("CLAUDE.md standards section", MARK in (read(root / "CLAUDE.md") or "")))
+    items.append((".mcp.json (%s server)" % UAT_MCP_NAME, UAT_MCP_NAME in (read(root / ".mcp.json") or "")))
     if (root / ".env").exists() or (root / ".env.example").exists():
         items.append((".env.example", (root / ".env.example").exists()))
     items.append((".claude/rules/design.md (design contract)", (root / ".claude" / "rules" / "design.md").exists()))
@@ -2713,11 +2908,17 @@ def cmd_doctor(args):
                 say("           the env var wins over `supabase login`; remove it (or set a fresh token) and re-run")
     else:
         say("Supabase   no token (supabase login, or SUPABASE_ACCESS_TOKEN)")
+    say("UAT Hub    %s; %s %s" % (UAT_HUB_URL, UAT_HUB_KEY_VAR,
+        "set" if os.environ.get(UAT_HUB_KEY_VAR) else "not set - export it in your environment"))
+    say("           MCP server %s" % (UAT_HUB_SERVER.as_posix() if UAT_HUB_SERVER.exists() else
+        "not found at %s (sessions fall back to the HTTP endpoint)" % UAT_HUB_SERVER.as_posix()))
     root = repo_root(args.repo) if hasattr(args, "repo") else repo_root()
     if root:
         items, _ = status(root)
         missing = [n for n, ok in items if not ok]
         say("repo       %s: %s" % (root.name, ("missing " + ", ".join(missing)) if missing else "standards complete"))
+        say("           UAT Hub project %s - a slug the hub does not know is refused, so create the "
+            "project there first" % uat_slug(root))
 
 
 def command_text(tpl):
@@ -2728,6 +2929,7 @@ def command_text(tpl):
                 REGION=c.get("supabase_region") or DEFAULTS["supabase_region"], DATABASE=c.get("database") or "separate",
                 DB_PLAN=("create production and a persistent `%s` database branch" % c["work_branch"]) if c.get("database") == "branching"
                 else ("create `<name>-%s` and `<name>` projects" % c["work_branch"]),
+                UAT_HUB=UAT_HUB_URL,
                 DOMAIN_PATTERN=pattern.replace("{name}", "<name>"), DOMAIN_EXAMPLE=pattern.replace("{name}", "<repo>"))
 
 
@@ -3142,6 +3344,7 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="show what would change")
     p.add_argument("--force", action="store_true", help="replace files that exist without the kit marker")
     p.add_argument("--update-pipeline", action="store_true", help="refresh the built-in pipeline files (agents, commands, hooks, gates) from this kit version; backups kept")
+    p.add_argument("--uat-project", metavar="SLUG", help="UAT Hub project slug for this repo (default: the recorded one, else the folder name); the project must already exist in the hub")
     p.set_defaults(fn=cmd_apply)
 
     p = sub.add_parser("refresh", help="take this kit's agents, commands, hooks and CI gates - and "

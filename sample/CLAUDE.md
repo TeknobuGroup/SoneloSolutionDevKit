@@ -40,7 +40,85 @@ Run the due reviewers in one message, in parallel; `/post-change` does this and 
 - Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.
 <!-- sonelo-devkit:pipeline:end -->
 
-<!-- sonelo-devkit:start v4.2 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:uat:start v4.5 (managed by repo_setup.py; edit outside these markers) -->
+## Writing UAT
+
+When you finish building a feature, write its UAT test cases and push them to UAT Hub.
+Do NOT write them to a Markdown file — the hub is where a human tester picks them up.
+
+Push with the `push_uat_test_cases` MCP tool. If that tool is unavailable, POST the same
+shape to `https://testing.teknobugroup.com/api/uat/test-cases` with
+`Authorization: Bearer $UAT_HUB_KEY`.
+
+    project:    app-hub          (omit if UAT_HUB_PROJECT is set for this repo)
+    module:     the feature area, e.g. "Auth", "Checkout", "Patrols"
+    test_cases: a list, each with
+                  title            required, one line, the thing being checked
+                  steps            how to carry it out
+                  expected_result  what should happen if it works
+                  test_url         the page to open — must be http(s)
+                  source_ref       a stable id you choose, e.g. "auth-login-invalid"
+
+### Write for the tester, not for yourself
+
+The person running these has not read the code and may not know the feature. Assume
+nothing.
+
+- **One check per case.** If the title needs "and", it is two cases.
+- **Steps are what to do, in order** — "Enter a valid email and a wrong password, submit",
+  not "test invalid credentials".
+- **Expected result must be decidable.** Someone has to be able to say pass or fail without
+  asking you. "Shows an error" is not decidable; "Inline error under the password field,
+  and the page does not navigate" is.
+- **Name real things** — the actual button text, the actual field label, the actual URL.
+- **No jargon from the codebase.** No component names, no function names, no ticket numbers.
+
+### Cover what actually breaks
+
+A list of happy paths is close to worthless. For each feature include:
+
+- the normal case
+- the empty case — no data, first use, nothing configured yet
+- the invalid case — wrong input, wrong format, wrong order
+- the permission case — someone who should not be able to do this, if roles apply
+- anything you know is fragile, or that you had to think hard about while building it
+
+If something cannot be tested through the interface, say so in the steps rather than
+writing a case nobody can run.
+
+### Always set source_ref
+
+Give every case a stable id derived from what it tests, e.g. `checkout-discount-invalid`.
+Pushing the same case twice with the same `source_ref` updates nothing and creates nothing,
+so a retry after a timeout is safe and re-running you is safe. Without it, every push
+duplicates.
+
+### Batching
+
+Up to 200 cases per push, one module per push. Several modules means several pushes.
+
+### If the push is refused
+
+Read the message; it is specific.
+
+- _"no project with slug X; create it in UAT Hub first"_ — the slug is wrong, or the project
+  has not been created. Do not invent one. Stop and report it.
+- _"invalid or revoked api key"_ — `UAT_HUB_KEY` is missing, wrong, or has been revoked.
+  Stop and report it. Do not put a key in any committed file.
+
+Report what you pushed, to which project and module, and how many cases.
+
+### How this repo is wired
+
+- The MCP server is registered in `.mcp.json`. `UAT_HUB_KEY` is expanded from the environment of
+  the machine running the session and is never written into a file in this repo - `.mcp.json` is
+  committed, and one key covers every project. `repo_setup.py doctor` reports whether it is set.
+- This repo pushes to the UAT Hub project `app-hub`. A push cannot create a project: if the
+  hub has no project with that slug, every push is refused until someone creates it in UAT Hub.
+  That is correct behaviour, not a fault to work around - do not invent a slug.
+<!-- sonelo-devkit:uat:end -->
+
+<!-- sonelo-devkit:start v4.5 (managed by repo_setup.py; edit outside these markers) -->
 ## Sonelo standards
 
 **Branches.** Work on `prelive`; it deploys to its own URL and database. `main` is production and only changes through a pull request from `prelive` (`gh pr create --base main --head prelive --fill`). Never push to `main` directly and never force-push `prelive` or `main`. If you find yourself on `main` with uncommitted work, switch to `prelive` first.
