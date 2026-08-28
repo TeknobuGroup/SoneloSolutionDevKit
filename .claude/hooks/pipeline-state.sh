@@ -16,7 +16,7 @@ case "$1" in
     [ -z "$files" ] && exit 0
     out="code"
     printf '%s\n' "$files" | grep -Eq '\.(tsx|jsx|css|scss)$|(^|/)tailwind\.config\.' && out="$out design"
-    printf '%s\n' "$files" | grep -Eq '^supabase/|(^|/)functions/|(^|/)auth(/|\.)|^\.github/workflows/|(^|/)\.mcp\.json$' && out="$out security"
+    printf '%s\n' "$files" | grep -Eq '^supabase/|(^|/)functions/|(^|/)auth(/|\.)|Auth([A-Z][A-Za-z]*)?\.(tsx?|jsx?)$|^\.github/workflows/|^\.githooks/|(^|/)\.mcp\.json$|(^|/)tailwind\.config\.' && out="$out security"
     printf '%s\n' "$out"
     ;;
   sig)
