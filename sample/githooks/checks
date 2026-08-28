@@ -1,5 +1,16 @@
-# teknobu-kit v1.0 - commands run by .githooks/pre-push (one per line). CI runs the same list.
+# sonelo-devkit v4.7 - commands run by .githooks/pre-push (one per line). CI runs the same list.
 # Edit freely; keep them fast enough to run before every push.
+#
+# A line may start with [glob ...] naming the paths it cares about, and is then skipped when the
+# push touches none of them - so a stylesheet change does not pay for the back-end suite. Globs are
+# shell `case` patterns, where * also matches /, so `src/*` covers `src/a/b.tsx`. A line with no
+# prefix always runs. If the changed set cannot be worked out, every line runs.
+#
+#   npm run typecheck                     always
+#   [src/* *.tsx] npm run test:ui         only when something under src/ or a .tsx file changed
+#
+# CI runs every line, prefix stripped, so a scoped line always runs somewhere even when every
+# local push skips it. That is what makes scoping safe rather than a hole.
 npm run typecheck
-npm run lint
-npm test
+[src/* *.tsx *.css] npm run test:ui
+[supabase/*] npm run test:rls

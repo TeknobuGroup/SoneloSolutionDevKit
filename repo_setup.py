@@ -514,16 +514,28 @@ checks="$hooks_dir/checks"
 changed=$(mktemp 2>/dev/null) || changed=""   # no temp file: fall through and run every line
 [ -n "$changed" ] && : > "$changed"
 ranges=$(printf '%s' "$ranges" | tr -d '\r')   # a CR in a ref line makes every sha unresolvable
-[ -n "$changed" ] && printf '%s\n' "$ranges" | while IFS=' ' read -r a b; do
-  [ -n "$b" ] || continue
-  if [ "$a" = "$zero" ]; then
-    base=$(git merge-base "$b" "origin/$work" 2>/dev/null)
-    [ -n "$base" ] || base=$(git merge-base "$b" "$work" 2>/dev/null)
-    [ -n "$base" ] && git -c core.quotePath=false diff --name-only "$base" "$b" 2>/dev/null
-  else
-    git -c core.quotePath=false diff --name-only "$a" "$b" 2>/dev/null
-  fi
-done | sort -u > "$changed"
+# All-or-nothing. Emitting nothing for a range that cannot be resolved and unioning it with the
+# ranges that can leaves a PARTIAL set - which still looks non-empty, so scoping engages against a
+# set that is missing whole branches. A first push of `prelive` alongside a spike branch did
+# exactly that and skipped the migrations suite. One unresolvable range disables scoping for the
+# whole push. --no-renames because a rename reports only its destination, so moving a file out of
+# a scoped tree hid that the tree had changed at all.
+if [ -n "$changed" ]; then
+  ok=1
+  for pair in $(printf '%s' "$ranges" | tr ' ' ':' | tr '\n' ' '); do
+    a=${pair%%:*}; b=${pair#*:}
+    [ -n "$a" ] && [ -n "$b" ] || continue
+    base=$a
+    if [ "$a" = "$zero" ]; then
+      base=$(git merge-base "$b" "origin/$work" 2>/dev/null) || base=""
+      [ -n "$base" ] || base=$(git merge-base "$b" "$work" 2>/dev/null) || base=""
+    fi
+    if [ -z "$base" ] || [ "$base" = "$b" ]; then ok=0; break; fi
+    git -c core.quotePath=false diff --no-renames --name-only "$base" "$b" >> "$changed" 2>/dev/null || { ok=0; break; }
+  done
+  [ "$ok" = "1" ] || : > "$changed"
+  [ -s "$changed" ] && sort -u "$changed" -o "$changed"
+fi
 
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|'#'*) continue ;; esac
@@ -605,6 +617,24 @@ jobs:
           curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
           ./gitleaks dir . --no-banner --redact
 {NODE_STEPS}{FLUTTER_STEPS}{PYTHON_STEPS}{CHECK_STEPS}'''
+
+CI_CHECKS_STEP = """      - name: checks (.githooks/checks, the same list pre-push runs)
+        shell: bash
+        run: |
+          if [ ! -f .githooks/checks ]; then echo "no .githooks/checks"; exit 0; fi
+          rc=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in ''|'#'*) continue ;; esac
+            case "$line" in
+              '[ '*|'[['*) ;;
+              '['*']'*) line=${line#*]}; line=${line# } ;;
+            esac
+            [ -n "$line" ] || continue
+            echo "ci: $line"
+            sh -c "$line" || rc=1
+          done < .githooks/checks
+          exit $rc
+"""
 
 NODE_STEPS = '''      - uses: actions/setup-node@v4
         with:
@@ -1124,12 +1154,15 @@ elif [ -n "$branch" ] && [ -f ".claude/state/$branch/review.json" ]; then
 fi
 if [ -z "$reasons" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
 if [ "$prototype" = "1" ]; then
-  # stdout, not stderr: a Stop hook's stderr reaches the session only when it exits 2, and
-  # session-brief.sh already notes that "stdout becomes session context". Writing the disclosure to
-  # stderr on an exit-0 path meant the one thing that makes this defensible never happened.
-  printf '%s\n' "On $branch (a spike branch), so this is not blocking. This work is UNREVIEWED and \
-nothing downstream recomputes it once committed - run /post-change on the branch you merge into:$reasons"
-  exit 0
+  # A Stop hook's stdout is transcript-only on exit 0 and its stderr is fed back only on exit 2, so
+  # neither reaches the session that wrote the unreviewed code if we simply allow the stop. Use the
+  # two-strike valve the gate already has: say it once where the session must read it, then allow.
+  if [ -n "$mfile" ] && [ -f "$mfile" ]; then exit 0; fi
+  [ -n "$mfile" ] && { mkdir -p "$(dirname "$mfile")" 2>/dev/null; printf 'spike\n' > "$mfile"; }
+  printf '%s\n' "On $branch (a spike branch): not blocking after this one message, but state it to \
+the user. This work is UNREVIEWED, and nothing downstream recomputes it once committed - run \
+/post-change on the branch you merge into:$reasons" >&2
+  exit 2
 fi
 if [ -z "$sig" ]; then printf '%s\n' "Not done yet:$reasons" >&2; exit 2; fi
 msig=""
@@ -1251,7 +1284,7 @@ BUILTIN_PIPELINE = {
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
 }
-PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. A diff that is *entirely* design-lane makes only `design-reviewer` due - one non-design file puts `code-reviewer` back. Hooks, the Stop gate and CI still apply.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
+PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
 
 UPDATE_COMMAND_MD = '''---
 description: Update the Sonelo kit and worklog on this machine to the latest release, then offer to refresh this repo
@@ -2189,10 +2222,12 @@ def cmd_apply(args):
         else:
             cache = ("          cache: %s\n" % d["pm"]) if d["lockfile"] and d["pm"] in ("npm", "pnpm", "yarn") else ""
             node_steps += fill(NODE_STEPS, NODE_VERSION=d["node_version"], CACHE=cache, INSTALL=install)
-    # the repo's own checks file wins over detection: it is what pre-push runs, and CI claiming to
-    # run "every line" is only true if it reads the same list
-    ci_checks = checks_lines(root) or d["checks"]
-    check_steps = "".join("      - run: %s\n" % c for c in ci_checks) or "      - run: echo 'no checks configured - see .githooks/checks'\n"
+    # CI reads .githooks/checks at run time rather than a list baked in at apply time. Baking it
+    # meant editing the file - which its own header invites - left a line running nowhere until
+    # someone re-ran apply, and interpolating lines as `run:` steps put them under `bash -e`, where
+    # a deliberate local no-op like `[ -d e2e ] && npx playwright test` exits 1 and turns CI red.
+    check_steps = CI_CHECKS_STEP if (root / ".githooks" / "checks").exists() or d["checks"] else ""
+    check_steps = check_steps or "      - run: echo 'no checks configured - see .githooks/checks'\n"
     ci = fill(CI_YML, BRANCHES=", ".join(PROTECTED + [WORK_BRANCH]), PROTECTED_LIST=", ".join(PROTECTED),
               NODE_STEPS=node_steps, FLUTTER_STEPS=FLUTTER_STEPS if d["flutter"] else "",
               PYTHON_STEPS=PYTHON_STEPS if d["python"] else "", CHECK_STEPS=check_steps)
@@ -2264,17 +2299,23 @@ def cmd_refresh(args):
     creating and checking out the work branch. On a repo that only wants this release's agents,
     commands and hooks, that is a lot of blast radius for a small want - so this is the narrow verb.
 
-    It does exactly four things: the built-in pipeline files (backups kept in .claude/.backup/),
-    the hook registrations in .claude/settings.json, the managed sections of CLAUDE.md, and the
-    uat-hub entry in .mcp.json - the MCP server the managed UAT section tells sessions to use, which
-    would otherwise be named by a refreshed CLAUDE.md in a repo that does not have it. It also
-    records the kit version in .teknobu.json - without that the session-start nudge would keep
-    reporting the repo as out of date and pointing back at the heavy command.
+    It takes: the built-in pipeline files (backups kept in .claude/.backup/), the hook
+    registrations in .claude/settings.json, the managed sections of CLAUDE.md, the uat-hub entry in
+    .mcp.json, the kit-owned git hooks (commit-msg, pre-commit, pre-push) and the CI workflow. It
+    records the kit version in .teknobu.json - without that the session-start nudge keeps reporting
+    the repo as out of date and pointing back at the heavy command.
 
-    "The pipeline" includes the two kit-owned files under .github/: ci-gates.yml and
-    pull_request_template.md. They are the gates half of the pipeline, so refreshing them is the
-    point - but a workflow is the highest-privilege thing this command rewrites, so every replaced
-    file is named in the output rather than counted, and the repo's own ci.yml is never touched."""
+    The git hooks and ci.yml were out of scope until 4.7 (see docs/decisions/0007). That held while
+    every release lived under .claude/; 4.7's feature is in pre-push and in the CI step that reads
+    .githooks/checks, so the old scoping made `refresh` record a repo as 4.7 while shipping none of
+    it, and `check` then called the repo current. A rollout verb that does not carry the release is
+    worse than a wide one.
+
+    Still the repo's own, and still never touched here: `.githooks/checks` (its header invites
+    editing, and pre-push reads it at run time), `.env*`, the environment doc, `.claude/rules/
+    design.md`, branches and the worklog. Any file whose kit marker has been removed is skipped by
+    rep.put unless --force, so a hand-owned ci.yml survives. Every replaced file is named in the
+    output rather than counted, because a workflow is the highest-privilege thing this rewrites."""
     root = repo_root(args.repo)
     if not root:
         sys.exit("not inside a git repository (run from the repo, or pass --repo)")
@@ -2294,6 +2335,30 @@ def cmd_refresh(args):
         return
     rep = Report(dry)
     backups = copy_pipeline(root, rep, update=True)   # also registers the hooks in .claude/settings.json
+    # the git hooks and CI: kit-owned, and where 4.7's feature lives. rep.put leaves a file whose
+    # marker has been removed alone, so a repo that has taken ownership of one keeps it.
+    d = detect(root)
+    rep.put(root / ".githooks" / "commit-msg", fill(COMMIT_MSG), executable=True)
+    rep.put(root / ".githooks" / "pre-commit", fill(PRE_COMMIT, UAT_HUB=UAT_HUB_URL, UAT_SERVER=UAT_HUB_SERVER_REF), executable=True)
+    rep.put(root / ".githooks" / "pre-push", fill(PRE_PUSH, PROTECTED=" ".join(PROTECTED), WORK=WORK_BRANCH), executable=True)
+    if (root / ".githooks" / "checks").exists():
+        rep.note("unchanged (yours to edit)", root / ".githooks" / "checks")
+    node_steps = ""
+    if d["node"]:
+        if d["pm"] == "pnpm":
+            node_steps += PNPM_SETUP
+        install = {"npm": "npm ci" if d["lockfile"] else "npm install", "pnpm": "pnpm install --frozen-lockfile",
+                   "yarn": "yarn install --frozen-lockfile", "bun": "bun install"}[d["pm"]]
+        if d["pm"] == "bun":
+            node_steps += "      - uses: oven-sh/setup-bun@v2\n      - run: bun install\n"
+        else:
+            cache = ("          cache: %s\n" % d["pm"]) if d["lockfile"] and d["pm"] in ("npm", "pnpm", "yarn") else ""
+            node_steps += fill(NODE_STEPS, NODE_VERSION=d["node_version"], CACHE=cache, INSTALL=install)
+    steps = CI_CHECKS_STEP if ((root / ".githooks" / "checks").exists() or d["checks"]) else "      - run: echo 'no checks configured - see .githooks/checks'\n"
+    rep.put(root / ".github" / "workflows" / "ci.yml",
+            fill(CI_YML, BRANCHES=", ".join(PROTECTED + [WORK_BRANCH]), PROTECTED_LIST=", ".join(PROTECTED),
+                 NODE_STEPS=node_steps, FLUTTER_STEPS=FLUTTER_STEPS if d["flutter"] else "",
+                 PYTHON_STEPS=PYTHON_STEPS if d["python"] else "", CHECK_STEPS=steps))
     # claude_md writes in place. Only BUILTIN_PIPELINE files get backed up by copy_pipeline, so a
     # repo whose CLAUDE.md carries hand-written policy outside the markers would lose it with no
     # copy anywhere - and refresh, unlike --update-pipeline, is now the recommended path.
@@ -2335,11 +2400,13 @@ def cmd_refresh(args):
                 pass
             say("  %-*s  %s" % (width, action, w))
         say("")
-    say("Refreshed: .claude/agents, .claude/commands, .claude/hooks, the CI *gates* "
-        "(.github/workflows/ci-gates.yml, pull_request_template.md), the managed CLAUDE.md sections "
-        "and the %s entry in .mcp.json (any other MCP server in it is left alone)." % UAT_MCP_NAME)
-    say("Untouched: your CI workflow (ci.yml), the deploy workflow, %s, .githooks/, .env*, "
-        ".claude/rules/design.md, branches, the worklog." % env_doc())
+    say("Refreshed: .claude/agents, .claude/commands, .claude/hooks, the git hooks "
+        "(commit-msg, pre-commit, pre-push), .github/workflows/ci.yml and the CI *gates* "
+        "(ci-gates.yml, pull_request_template.md), the managed CLAUDE.md sections and the %s entry "
+        "in .mcp.json (any other MCP server in it is left alone)." % UAT_MCP_NAME)
+    say("Untouched: .githooks/checks (yours to edit), the deploy workflow, %s, .env*, "
+        ".claude/rules/design.md, branches, the worklog. A file whose kit marker you removed is "
+        "left alone too." % env_doc())
     if backups:
         say("Replaced files are backed up in %s (self-ignoring)." % backups)
     if dry:

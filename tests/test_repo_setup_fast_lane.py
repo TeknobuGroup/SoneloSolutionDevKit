@@ -99,6 +99,26 @@ class PrePushRepo:
                              capture_output=True, env=self.env, input=line.encode(), **rs.NOWIN)
         return out.stdout.decode("utf-8", "replace") + out.stderr.decode("utf-8", "replace")
 
+    def push_many(self, lines):
+        """Several ref updates in one push. Nothing reached this path before, and it is the only
+        path on which the invariant this file defends actually broke."""
+        body = "".join("%s %s %s %s\n" % l for l in lines)
+        out = subprocess.run([self.sh, ".githooks/pre-push"], cwd=str(self.root),
+                             capture_output=True, env=self.env, input=body.encode(), **rs.NOWIN)
+        text = out.stdout.decode("utf-8", "replace") + out.stderr.decode("utf-8", "replace")
+        return [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("pre-push:")]
+
+    def sha(self, ref="HEAD"):
+        return self._git("rev-parse", ref).stdout.strip()
+
+    def branch(self, name):
+        self._git("checkout", "-q", "-b", name)
+
+    def mv(self, a, b):
+        self._git("mv", a, b)
+        self._git("commit", "-q", "-m", "chore: move %s" % a)
+        return self.sha()
+
     def ran(self, remote_sha):
         """The markers the checks actually printed. The hook's own narration quotes the command it
         is about to run or skip, so a substring test against the whole transcript matches the
@@ -139,6 +159,52 @@ class ScopedChecksRunTheRightLines(unittest.TestCase):
         r = PrePushRepo(self, CHECKS)
         r.commit("docs/x.md", "d\n")
         self.assertEqual(sorted(r.ran(ZERO)), ["RAN-always", "RAN-suite", "RAN-ui"])
+
+
+class TheChangedSetIsAllOrNothing(unittest.TestCase):
+    """A range that cannot be resolved emitted nothing and was unioned with the ranges that could,
+    leaving a PARTIAL set - which still looks non-empty, so scoping engaged against a set missing
+    whole branches. Measured: a first push of `prelive` alongside a spike branch skipped the
+    migrations suite and the hook exited 0. The invariant held per-range, not per-push."""
+
+    def test_a_multi_ref_push_with_one_unresolvable_range_runs_everything(self):
+        r = PrePushRepo(self, CHECKS)
+        r.commit("tests/t.py", "x\n")
+        prelive = r.sha()
+        r.branch("spike/x")
+        r.commit("src/b.css", "c\n")
+        got = sorted(r.push_many([
+            ("refs/heads/prelive", prelive, "refs/heads/prelive", ZERO),        # never seen: unresolvable
+            ("refs/heads/spike/x", r.sha(), "refs/heads/spike/x", prelive),     # resolvable
+        ]))
+        self.assertEqual(got, ["RAN-always", "RAN-suite", "RAN-ui"])
+
+    def test_a_resolvable_multi_ref_push_still_scopes(self):
+        """All-or-nothing must not mean never: two good ranges still scope."""
+        r = PrePushRepo(self, CHECKS)
+        base = r.commit("src/a.css", "x\n")
+        r.commit("src/a.css", "y\n")
+        got = sorted(r.push_many([("refs/heads/prelive", r.sha(), "refs/heads/prelive", base)]))
+        self.assertEqual(got, ["RAN-always", "RAN-ui"])
+
+
+class ARenameOutOfAScopedTreeStillCounts(unittest.TestCase):
+    """`git diff --name-only` reports only a rename's destination, so moving a file OUT of a scoped
+    tree hid that the tree had changed. Both scoped checks were skipped by a single `git mv`, which
+    is the commonest way a UI or migration suite actually breaks."""
+
+    def test_moving_a_file_out_of_the_tree_runs_the_check(self):
+        r = PrePushRepo(self, CHECKS)
+        base = r.commit("src/a.css", "x\n")
+        r.mv("src/a.css", "a.css")
+        self.assertIn("RAN-ui", r.ran(base))
+
+    def test_moving_a_file_into_the_tree_runs_the_check(self):
+        r = PrePushRepo(self, CHECKS)
+        r.commit("top.css", "x\n")
+        base = r.commit("tests/keep.py", "x\n")
+        r.mv("top.css", "src/top.css")
+        self.assertIn("RAN-ui", r.ran(base))
 
 
 class ExistingChecksFilesAreNotMangled(unittest.TestCase):
@@ -267,16 +333,20 @@ class SpikeBranchesReportInsteadOfBlocking(unittest.TestCase):
             code, _ = self.gate(branch)
             self.assertEqual(code, 2, branch)
 
-    def test_a_spike_branch_reports_and_allows(self):
+    def test_a_spike_branch_states_the_debt_once_then_allows(self):
+        """stdout on an exit-0 Stop hook is transcript-only and never reaches the model, so simply
+        allowing the stop meant the disclosure was never actually made. It now uses the valve the
+        gate already had: block once with the debt on stderr, then allow."""
         for branch in ("spike/ui", "draft/x", "proto/y"):
             code, out = self.gate(branch)
-            self.assertEqual(code, 0, branch)
-            self.assertIn("not blocking", out)
+            self.assertEqual(code, 2, branch)
+            self.assertIn("UNREVIEWED", out)
+            self.assertIn("state it to", out)
 
-    def test_the_disclosure_goes_to_stdout_not_stderr(self):
-        """A Stop hook's stderr reaches the session only when it exits 2. Writing the disclosure to
-        stderr on the exit-0 path meant the one thing making this defensible never happened - and
-        the first version of this test could not see that, because it merged both streams."""
+    def test_the_disclosure_reaches_the_model_and_then_stops_blocking(self):
+        """A Stop hook's stderr is fed back only on exit 2 and its stdout is transcript-only, so
+        the disclosure has to ride an exit 2. The second stop is allowed - it is a spike lane, not
+        a wall. An earlier version of this test could not see the difference: it merged the streams."""
         git, sh = tools(self)
         env = git_env()
         root = make_temp_dir(self)
@@ -290,11 +360,41 @@ class SpikeBranchesReportInsteadOfBlocking(unittest.TestCase):
         (root / "src" / "a.ts").write_text("x\n", encoding="utf-8", newline="\n")
         subprocess.run([git, "-C", str(root), "add", "-A"], capture_output=True, env=env, **rs.NOWIN)
         (root / "sg.sh").write_text(rs.fill(rs.STOP_GATE_SH), encoding="utf-8", newline="\n")
-        out = subprocess.run([sh, "sg.sh"], cwd=str(root), capture_output=True, text=True,
-                             input="{}", env=env, **rs.NOWIN)
-        self.assertEqual(out.returncode, 0)
-        self.assertIn("CHANGELOG", out.stdout, "the disclosure must be on stdout")
-        self.assertIn("UNREVIEWED", out.stdout)
+        first = subprocess.run([sh, "sg.sh"], cwd=str(root), capture_output=True, text=True,
+                               input="{}", env=env, **rs.NOWIN)
+        self.assertEqual(first.returncode, 2, "the disclosure must ride an exit 2 to be seen")
+        self.assertIn("CHANGELOG", first.stderr)
+        self.assertIn("UNREVIEWED", first.stderr)
+        second = subprocess.run([sh, "sg.sh"], cwd=str(root), capture_output=True, text=True,
+                                input="{}", env=env, **rs.NOWIN)
+        self.assertEqual(second.returncode, 0, "said once; a spike lane is not a wall")
+
+    def test_refresh_carries_the_release_into_an_existing_repo(self):
+        """4.3 kept the git hooks and ci.yml out of `refresh`. 4.7's feature lives in pre-push and
+        in the CI step, so under that scoping `refresh` recorded a repo as 4.7 while shipping none
+        of it - and `check` then called the repo current. See docs/decisions/0007."""
+        import argparse, json as _json
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not on PATH")
+        self.addCleanup(setattr, rs, "ensure_installed", rs.ensure_installed)
+        rs.ensure_installed = lambda: False
+        self.addCleanup(setattr, rs, "WORK_BRANCH", rs.WORK_BRANCH)
+        self.addCleanup(setattr, rs, "PROTECTED", list(rs.PROTECTED))
+        root = make_temp_dir(self)
+        subprocess.run([git, "init", "-b", "prelive", str(root)], capture_output=True,
+                       env=git_env(), check=True, **rs.NOWIN)
+        (root / ".teknobu.json").write_text(
+            _json.dumps({"kit": "4.6", "work_branch": "prelive", "protected": ["main"]}), encoding="utf-8")
+        (root / ".githooks").mkdir()
+        (root / ".githooks" / "pre-push").write_text(
+            "#!/bin/sh\n# sonelo-devkit v4.6 - old\nexit 0\n", encoding="utf-8", newline="\n")
+        mine = "# mine\nnpm test\n"
+        (root / ".githooks" / "checks").write_text(mine, encoding="utf-8", newline="\n")
+        rs.cmd_refresh(argparse.Namespace(repo=str(root), dry_run=False, uat_project=None))
+        self.assertIn("nothing matching", (root / ".githooks" / "pre-push").read_text(encoding="utf-8"))
+        self.assertEqual((root / ".githooks" / "checks").read_text(encoding="utf-8"), mine,
+                         "the checks file is the repo's own and is never rewritten")
 
     def test_it_says_the_debt_is_not_recorded_anywhere(self):
         """It claimed the full pipeline runs on promotion. Nothing enforces that: pipeline-state
@@ -302,6 +402,7 @@ class SpikeBranchesReportInsteadOfBlocking(unittest.TestCase):
         into main. The claim was removed rather than left standing."""
         _, out = self.gate("spike/ui")
         self.assertIn("nothing downstream recomputes it", out)
+        self.assertIn("/post-change on the branch you merge into", out)
 
 
 class CiRunsEveryLineTheChecksFileHas(unittest.TestCase):
@@ -332,8 +433,9 @@ class CiRunsEveryLineTheChecksFileHas(unittest.TestCase):
         root = make_temp_dir(self)
         self.assertEqual(rs.checks_lines(root), [])
 
-    def test_apply_puts_those_lines_into_ci(self):
-        """End to end: the generated workflow contains the scoped line, unscoped."""
+    def test_apply_makes_ci_read_the_checks_file(self):
+        """Baking the list at apply time meant editing the file - which its own header invites -
+        left a line running nowhere until someone re-ran apply. CI reads the file instead."""
         import argparse
         git = shutil.which("git")
         if not git:
@@ -351,9 +453,11 @@ class CiRunsEveryLineTheChecksFileHas(unittest.TestCase):
         rs.cmd_apply(argparse.Namespace(repo=str(root), dry_run=False, force=False,
                                         update_pipeline=False, uat_project=None))
         ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("- run: npm run typecheck", ci)
-        self.assertIn("- run: npm run test:ui", ci)
-        self.assertNotIn("[src/*]", ci, "the prefix is local-only; CI has no push to scope against")
+        self.assertIn(".githooks/checks", ci, "CI must read the same list pre-push runs")
+        self.assertNotIn("- run: npm run test:ui", ci,
+                         "a baked line goes stale the moment the checks file is edited")
+        # and the step strips the prefix, so CI runs the line it would otherwise skip
+        self.assertIn("line=${line#*]}", ci)
 
 
 if __name__ == "__main__":

@@ -45,16 +45,28 @@ checks="$hooks_dir/checks"
 changed=$(mktemp 2>/dev/null) || changed=""   # no temp file: fall through and run every line
 [ -n "$changed" ] && : > "$changed"
 ranges=$(printf '%s' "$ranges" | tr -d '\r')   # a CR in a ref line makes every sha unresolvable
-[ -n "$changed" ] && printf '%s\n' "$ranges" | while IFS=' ' read -r a b; do
-  [ -n "$b" ] || continue
-  if [ "$a" = "$zero" ]; then
-    base=$(git merge-base "$b" "origin/$work" 2>/dev/null)
-    [ -n "$base" ] || base=$(git merge-base "$b" "$work" 2>/dev/null)
-    [ -n "$base" ] && git -c core.quotePath=false diff --name-only "$base" "$b" 2>/dev/null
-  else
-    git -c core.quotePath=false diff --name-only "$a" "$b" 2>/dev/null
-  fi
-done | sort -u > "$changed"
+# All-or-nothing. Emitting nothing for a range that cannot be resolved and unioning it with the
+# ranges that can leaves a PARTIAL set - which still looks non-empty, so scoping engages against a
+# set that is missing whole branches. A first push of `prelive` alongside a spike branch did
+# exactly that and skipped the migrations suite. One unresolvable range disables scoping for the
+# whole push. --no-renames because a rename reports only its destination, so moving a file out of
+# a scoped tree hid that the tree had changed at all.
+if [ -n "$changed" ]; then
+  ok=1
+  for pair in $(printf '%s' "$ranges" | tr ' ' ':' | tr '\n' ' '); do
+    a=${pair%%:*}; b=${pair#*:}
+    [ -n "$a" ] && [ -n "$b" ] || continue
+    base=$a
+    if [ "$a" = "$zero" ]; then
+      base=$(git merge-base "$b" "origin/$work" 2>/dev/null) || base=""
+      [ -n "$base" ] || base=$(git merge-base "$b" "$work" 2>/dev/null) || base=""
+    fi
+    if [ -z "$base" ] || [ "$base" = "$b" ]; then ok=0; break; fi
+    git -c core.quotePath=false diff --no-renames --name-only "$base" "$b" >> "$changed" 2>/dev/null || { ok=0; break; }
+  done
+  [ "$ok" = "1" ] || : > "$changed"
+  [ -s "$changed" ] && sort -u "$changed" -o "$changed"
+fi
 
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|'#'*) continue ;; esac

@@ -62,12 +62,15 @@ elif [ -n "$branch" ] && [ -f ".claude/state/$branch/review.json" ]; then
 fi
 if [ -z "$reasons" ]; then [ -n "$mfile" ] && rm -f "$mfile" 2>/dev/null; exit 0; fi
 if [ "$prototype" = "1" ]; then
-  # stdout, not stderr: a Stop hook's stderr reaches the session only when it exits 2, and
-  # session-brief.sh already notes that "stdout becomes session context". Writing the disclosure to
-  # stderr on an exit-0 path meant the one thing that makes this defensible never happened.
-  printf '%s\n' "On $branch (a spike branch), so this is not blocking. This work is UNREVIEWED and \
-nothing downstream recomputes it once committed - run /post-change on the branch you merge into:$reasons"
-  exit 0
+  # A Stop hook's stdout is transcript-only on exit 0 and its stderr is fed back only on exit 2, so
+  # neither reaches the session that wrote the unreviewed code if we simply allow the stop. Use the
+  # two-strike valve the gate already has: say it once where the session must read it, then allow.
+  if [ -n "$mfile" ] && [ -f "$mfile" ]; then exit 0; fi
+  [ -n "$mfile" ] && { mkdir -p "$(dirname "$mfile")" 2>/dev/null; printf 'spike\n' > "$mfile"; }
+  printf '%s\n' "On $branch (a spike branch): not blocking after this one message, but state it to \
+the user. This work is UNREVIEWED, and nothing downstream recomputes it once committed - run \
+/post-change on the branch you merge into:$reasons" >&2
+  exit 2
 fi
 if [ -z "$sig" ]; then printf '%s\n' "Not done yet:$reasons" >&2; exit 2; fi
 msig=""
