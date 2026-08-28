@@ -2,7 +2,28 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
-## Changed in this cycle (kit v4.5)
+## Changed in this cycle (kit v4.6)
+
+### Fixed: the commands the kit prints run in PowerShell
+- UAT-4.6-1: In PowerShell, copy the Vercel line out of a generated `PRELIVE.md` and run it. It executes (or fails on its own arguments) rather than dying with `can't open file '...\~\.claude\...': No such file or directory`.
+- UAT-4.6-2: The same line run in Git Bash still works. One form has to serve both shells.
+- UAT-4.6-3: `grep -rn "python ~/" repo_setup.py README.md` returns nothing. Historical documents under `docs/uat/` are records of what was true then and are left alone.
+- UAT-4.6-4: A freshly generated `PRELIVE.md` is stamped with the current kit version and points at `~/.claude/sonelo`, not the pre-v4.0 `~/.claude/teknobu`.
+
+### New: `/update` takes the latest release without leaving Claude Code
+- UAT-4.6-5: On a machine behind the latest release, `/update` reports the version it moved from and to, and then offers `refresh` for the current repo rather than doing it unasked.
+- UAT-4.6-6: On a machine already current, `/update` says so and stops - it does not re-download or reinstall.
+- UAT-4.6-7: `uninstall` removes `/repo-setup`, `/new-repo`, `/landing` and `/update`. Before v4.6, `landing.md` was left behind.
+- UAT-4.6-8: `install --mode worklog` leaves none of the four kit commands in place.
+
+### New: `refresh --uat-project <slug>`
+- UAT-4.6-9: `refresh --uat-project fortex-hub` sets the slug in `.mcp.json`, in the CLAUDE.md UAT block and in `.teknobu.json`, in one command, without touching CI, the environment doc, the design contract or the branch you are on.
+- UAT-4.6-10: A later plain `refresh` keeps that slug. It does not revert to the folder name.
+- UAT-4.6-11: A plain `refresh` on a repo that never supplied a slug does **not** add `uat_project` to `.teknobu.json` - refresh still owns no key it was not handed.
+- UAT-4.6-12: `refresh --uat-project <new> --dry-run` writes nothing, `.teknobu.json` included.
+- UAT-4.6-13: Passing a corrected slug replaces the old one everywhere; the wrong slug appears nowhere in `CLAUDE.md`.
+
+## Changed in a previous cycle (kit v4.5)
 
 ### New: every repo the kit touches can push UAT to the hub
 - UAT-4.5-1: `apply --dry-run` reports `.mcp.json` among its planned changes and writes nothing.
@@ -22,7 +43,7 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 - UAT-4.5-15: `apply --uat-project <slug>` corrects the slug in `.mcp.json`, `CLAUDE.md` and `.teknobu.json` at once, leaving one UAT block.
 - UAT-4.5-16: `check` lists `.mcp.json (uat-hub server)` and reports it missing when it is absent.
 
-## Changed in this cycle (worklog v1.17)
+## Changed in a previous cycle (worklog v1.17)
 
 ### Changed: effort and elapsed are both shown, and both named
 - UAT-1.17-1: Open the dashboard. The KPI row shows an **agent-hours** card and an **elapsed** card. agent-hours is the larger whenever any sessions overlapped.

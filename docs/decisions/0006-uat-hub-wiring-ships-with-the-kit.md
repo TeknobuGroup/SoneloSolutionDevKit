@@ -57,15 +57,23 @@ and nothing else in its untouched list moves.
 ## Consequences
 
 - Every repo the kit touches can push UAT with no further work, once its project exists in the hub.
-- One key across every repo is a known trade-off, already recorded in the hub's `docs/SCOPE.md`: a
-  leak or a rotation touches every project at once. It was accepted at a handful of projects. **The
-  kit is what makes this scale, so it is now the thing to watch:** around ten wired repos it is worth
-  revisiting. The hub's schema already supports multiple keys, so per-project keys are a change of
-  practice rather than a rebuild.
+- One key across every repo is **settled**, not an open trade-off: the hub's
+  [ADR-0004](../../../uat-hub/docs/decisions/0004-shared-push-key.md) put the question again at ten
+  projects - precisely because this kit was about to make the choice permanent by repetition - and
+  confirmed it. So the kit wires every repo to the same `UAT_HUB_KEY` without asking. That ADR also
+  lists what keeps the blast radius bounded (create-only endpoint, unknown slugs refused, key stored
+  only as a sha256, and the `${UAT_HUB_KEY}` placeholder in every file the kit writes). Those are
+  load-bearing: the kit must not weaken any of them without reopening that decision.
 - `.env.example` is now created in every repo, even one with no `.env` to derive keys from - it is
   where the kit documents configuration, and `UAT_HUB_KEY` has to appear there.
 - `UAT_HUB_KEY` is deliberately excluded from `.env.<work>`, which is pushed to the hosting provider.
   It is a session variable with no use in a deployed environment; spreading it buys nothing.
-- `.mcp.json` records an absolute path resolved on the machine that ran the kit. On a machine that
-  keeps the uat-hub checkout somewhere else that path is wrong, and the session falls back to the
-  HTTP endpoint. The per-repo environment doc says so.
+- `.mcp.json` names the server as `${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs`, so the committed
+  file names no developer's home directory. **`HOME` alone is wrong**: it is not a Windows
+  environment variable - absent from both User and Machine scope, set only per process by Git Bash -
+  so a `${HOME}`-only form fails on the kit's stated first-class platform, and a `claude mcp list`
+  check run from a Git-Bash-derived shell cannot detect that. `USERPROFILE` is always set by Windows;
+  `HOME` is always set on mac and Linux. What is verified: `claude mcp list` reports an unset bare
+  `${VAR}` and accepts the `:-` default form, nested included. What is **not** verified: that the
+  path resolves. If it does not, the server does not start and the session uses the HTTP endpoint,
+  which is the same outcome as any wrong path.

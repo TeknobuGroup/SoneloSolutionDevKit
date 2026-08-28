@@ -349,11 +349,16 @@ class RefreshIsNarrow(unittest.TestCase):
         replaced = [w for a, w in rep.rows if str(a).startswith("replaced")]
         self.assertEqual(replaced, [], "a freshly written pipeline must have nothing to replace")
 
-    def test_survives_a_teknobu_json_that_is_not_an_object(self):
+    def test_stops_on_a_teknobu_json_that_is_not_an_object(self):
+        """Until v4.6 this ran to completion on a config it could not use. That is the same silent
+        substitution as an unparseable one: a JSON list carries no branch model, so the generated
+        pre-push hook and CI would be built from this machine's answers and written into the repo as
+        if they were the repo's. The kit now stops and says so."""
         root = self.make_repo()
         (root / ".teknobu.json").write_text('["not", "an", "object"]\n', encoding="utf-8")
-        rs.cmd_refresh(self.args(root))          # must not raise part-way through
-        self.assertTrue((root / ".claude" / "agents" / "code-reviewer.md").exists())
+        with self.assertRaises(SystemExit):
+            rs.cmd_refresh(self.args(root))
+        self.assertFalse((root / ".claude" / "agents" / "code-reviewer.md").exists())
 
     def test_dry_run_writes_nothing(self):
         root = self.make_repo()

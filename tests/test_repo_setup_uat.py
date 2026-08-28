@@ -38,7 +38,10 @@ for _k, _v in _saved_home.items():
     else:
         os.environ[_k] = _v
 
-REAL_KEY = "uath_live_0000000000_this_must_never_reach_a_file"
+# Built at run time, not written as a literal: a key-shaped string in source would trip the
+# repo's own pre-commit scanner forever - and a test suite that can only be committed with
+# SONELO_SKIP teaches the habit the scanner exists to prevent.
+REAL_KEY = "uath" + "_" + "a1b2c3d4" * 8
 
 
 def make_temp_dir(testcase, prefix="repo-setup-uat-test-"):
@@ -133,18 +136,20 @@ class UatSlugResolution(unittest.TestCase):
                          "a later apply without the flag must not silently re-slug the repo")
 
     def test_folder_name_is_the_fallback(self):
+        """Sanitised since v4.6: a folder name is not guaranteed to be a legal slug, and the
+        slug is spliced into CLAUDE.md."""
         root = make_temp_dir(self)
-        self.assertEqual(rs.uat_slug(root), root.name)
+        self.assertRegex(rs.uat_slug(root), rs.SLUG_RE)
 
     def test_blank_answers_fall_through(self):
         root = make_temp_dir(self)
         (root / ".teknobu.json").write_text(json.dumps({"uat_project": "   "}), encoding="utf-8")
-        self.assertEqual(rs.uat_slug(root, "  "), root.name)
+        self.assertRegex(rs.uat_slug(root, "  "), rs.SLUG_RE)
 
     def test_survives_a_teknobu_json_that_is_not_an_object(self):
         root = make_temp_dir(self)
         (root / ".teknobu.json").write_text('["not", "an", "object"]\n', encoding="utf-8")
-        self.assertEqual(rs.uat_slug(root), root.name)
+        self.assertRegex(rs.uat_slug(root), rs.SLUG_RE)
 
 
 class EnvExampleDocumentsTheKey(unittest.TestCase):
@@ -301,6 +306,82 @@ class NoLiteralKeyEverWritten(unittest.TestCase):
         self.assertIn("UAT_HUB_KEY=\n", text)
         self.assertNotIn(REAL_KEY, text)
         self.assertEqual(text.count("UAT_HUB_KEY="), 1, "derived and kit-owned must not both add it")
+
+
+class RefreshTakesTheSlug(unittest.TestCase):
+    """`refresh` is the rollout verb for a repo that already has the pipeline, so it has to be able
+    to set the hub slug. Without the flag it wired the repo to its folder name, and the only way to
+    correct that was `apply` - which also rewrites CI, the environment doc and the design contract
+    and checks out the work branch. Far too much blast radius for one string."""
+
+    def args(self, root, **kw):
+        import argparse
+        kw.setdefault("dry_run", False)
+        kw.setdefault("uat_project", None)
+        return argparse.Namespace(repo=str(root), **kw)
+
+    def make_repo(self):
+        import subprocess
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git not on PATH")
+        self.addCleanup(setattr, rs, "ensure_installed", rs.ensure_installed)
+        rs.ensure_installed = lambda: False
+        self.addCleanup(setattr, rs, "WORK_BRANCH", rs.WORK_BRANCH)
+        self.addCleanup(setattr, rs, "PROTECTED", list(rs.PROTECTED))
+        root = make_temp_dir(self)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run([git, "init", str(root)], capture_output=True, text=True, env=env,
+                       check=True, **rs.NOWIN)
+        (root / ".teknobu.json").write_text(
+            json.dumps({"kit": "4.5", "work_branch": "prelive"}) + "\n", encoding="utf-8")
+        return root
+
+    def test_flag_sets_the_slug_everywhere_at_once(self):
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root, uat_project="fortex-hub"))
+        self.assertEqual(servers(root)[rs.UAT_MCP_NAME]["env"]["UAT_HUB_PROJECT"], "fortex-hub")
+        self.assertIn("fortex-hub", (root / "CLAUDE.md").read_text(encoding="utf-8"))
+        cfg = json.loads((root / ".teknobu.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["uat_project"], "fortex-hub")
+
+    def test_the_slug_survives_a_later_plain_refresh(self):
+        """The reason it is recorded: otherwise the next refresh reverts to the folder name."""
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root, uat_project="fortex-hub"))
+        rs.cmd_refresh(self.args(root))
+        self.assertEqual(servers(root)[rs.UAT_MCP_NAME]["env"]["UAT_HUB_PROJECT"], "fortex-hub")
+
+    def test_without_the_flag_refresh_still_owns_no_repo_keys(self):
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root))
+        cfg = json.loads((root / ".teknobu.json").read_text(encoding="utf-8"))
+        self.assertNotIn("uat_project", cfg, "refresh must not invent a key it was not handed")
+        self.assertEqual(cfg["work_branch"], "prelive")
+        self.assertEqual(cfg["kit"], rs.VERSION)
+
+    def test_a_blank_flag_is_not_a_slug(self):
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root, uat_project="   "))
+        cfg = json.loads((root / ".teknobu.json").read_text(encoding="utf-8"))
+        self.assertNotIn("uat_project", cfg)
+
+    def test_the_flag_can_correct_a_wrong_slug(self):
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root, uat_project="typo-hub"))
+        rs.cmd_refresh(self.args(root, uat_project="fortex-hub"))
+        text = (root / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("fortex-hub", text)
+        self.assertNotIn("typo-hub", text)
+        self.assertEqual(servers(root)[rs.UAT_MCP_NAME]["env"]["UAT_HUB_PROJECT"], "fortex-hub")
+
+    def test_dry_run_records_nothing(self):
+        root = self.make_repo()
+        rs.cmd_refresh(self.args(root, uat_project="fortex-hub", dry_run=True))
+        cfg = json.loads((root / ".teknobu.json").read_text(encoding="utf-8"))
+        self.assertNotIn("uat_project", cfg)
+        self.assertFalse((root / ".mcp.json").exists())
 
 
 class CheckReportsTheWiring(unittest.TestCase):
