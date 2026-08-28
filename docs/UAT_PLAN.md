@@ -2,6 +2,26 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
+## Changed in this cycle (kit v4.5)
+
+### New: every repo the kit touches can push UAT to the hub
+- UAT-4.5-1: `apply --dry-run` reports `.mcp.json` among its planned changes and writes nothing.
+- UAT-4.5-2: `apply` writes `.mcp.json` with a `uat-hub` server whose `UAT_HUB_KEY` is the literal `${UAT_HUB_KEY}` placeholder, never a value.
+- UAT-4.5-3: with a real key exported, nothing under the repo contains it - the kit writes a reference, not a credential.
+- UAT-4.5-4: `CLAUDE.md` gains one managed `## Writing UAT` block naming `push_uat_test_cases` and the five case fields.
+- UAT-4.5-5: that block is identical to the fenced prompt in uat-hub's `docs/AGENT_PROMPT.md`, with only `<project-slug>` substituted. It is a field contract the endpoint enforces, so a paraphrase is a defect.
+- UAT-4.5-6: `.env.example` carries `UAT_HUB_KEY=` with an empty value, even in a repo that has no `.env` to derive keys from.
+- UAT-4.5-7: `.env.<work>` does **not** carry `UAT_HUB_KEY` - that file is pushed to the hosting provider.
+- UAT-4.5-8: a second `apply` merges rather than duplicating, and reuses the recorded slug instead of re-defaulting to the folder name.
+- UAT-4.5-9: an existing `.mcp.json` holding another server keeps it, and its other top-level keys, with the original backed up under `.claude/.backup/`.
+- UAT-4.5-10: an unparseable `.mcp.json` is reported and left byte-identical, never replaced.
+- UAT-4.5-11: `doctor` reports `UAT_HUB_KEY` as set or not set and never prints the value.
+- UAT-4.5-12: a repo with no hub project still applies cleanly - the wiring is inert until the project exists, not an error every session.
+- UAT-4.5-13: `refresh` also delivers the `uat-hub` entry, and names `.mcp.json` in its summary.
+- UAT-4.5-14: `refresh` still leaves `.githooks/checks`, the repo's own `ci.yml`, `.env*` and `.claude/rules/design.md` untouched.
+- UAT-4.5-15: `apply --uat-project <slug>` corrects the slug in `.mcp.json`, `CLAUDE.md` and `.teknobu.json` at once, leaving one UAT block.
+- UAT-4.5-16: `check` lists `.mcp.json (uat-hub server)` and reports it missing when it is absent.
+
 ## Changed in this cycle (worklog v1.17)
 
 ### Changed: effort and elapsed are both shown, and both named
