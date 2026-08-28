@@ -8,7 +8,7 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 - UAT-1.17-1: Open the dashboard. The KPI row shows an **agent-hours** card and an **elapsed** card. agent-hours is the larger whenever any sessions overlapped.
 - UAT-1.17-2: With no project filter applied, the agent-hours card equals the total of the projects table's Claude Code column directly below it. This is the invariant; if they differ, the tile is computing the wrong thing.
 - UAT-1.17-3: The agent-hours card equals the sum of the report's `Est. active (parallel sessions add up)` column for the same window. Dashboard and report must agree.
-- UAT-1.17-4: In a week with concurrent sessions, elapsed is lower than agent-hours. In a week with none, they are equal.
+- UAT-1.17-4: In a week with concurrent sessions, elapsed is clearly lower than agent-hours. With no concurrency the two are close but need not be identical - `active_min` is floored per session while elapsed counts raw seconds, so elapsed can sit a minute or so per session above effort.
 - UAT-1.17-5: The report's day table column reads `Claude Code (elapsed)`, not `Claude Code`.
 - UAT-1.17-6: On a machine with no ActivityWatch and no presence data, the paragraph explaining elapsed vs effort still prints above the Days table. It used to be suppressed entirely.
 - UAT-1.17-7: A single-day report (`latest.md`) says `... elapsed with Claude Code active (concurrent sessions count once)`.

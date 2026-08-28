@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-worklog_agent.py  (v1.16)  -  per-repo work reporter for Claude Code
+worklog_agent.py  (v1.17)  -  per-repo work reporter for Claude Code
 
 Lives at <repo>/.worklog/worklog_agent.py. Claude Code hooks run it at the start and end of every
 session in this repo, and after each response (throttled). Each run:
@@ -853,7 +853,10 @@ def build_report(slices, machines, since, until, cfg):
             if s.get("branch"):
                 b["branches"].add(s["branch"])
             b["session_objs"].append(s)
-            for pair in (s.get("bursts") or [[s.get("start"), s.get("end")]]):
+            # Same clamp as the dashboard: without it a burstless session contributes its whole
+            # span to the elapsed column, which is how 18-19 Aug came to read 24h of Claude.
+            fallback = [[s.get("start"), (st + timedelta(minutes=int(s.get("active_min") or 0))).isoformat()]]
+            for pair in (s.get("bursts") or fallback):
                 bs, be = parse_iso(pair[0]), parse_iso(pair[1])
                 if bs and be and be >= bs:
                     cur = bs
@@ -1445,7 +1448,11 @@ svg.trend text{font-size:11px;fill:var(--muted)}
       r.commits.forEach(function (c) { var t = new Date(c.time); if (!isNaN(t)) commits.push({ t: t, hash: c.hash, subject: c.subject, repo: r.repo }); });
       r.sessions.forEach(function (s) {
         var a = new Date(s.start), b = new Date(s.end); if (isNaN(a)) return; if (isNaN(b)) b = a;
-        var bursts = (s.bursts || [[s.start, s.end]]).map(function (pr) { return [new Date(pr[0]), new Date(pr[1])]; }).filter(function (pr) { return !isNaN(pr[0]) && !isNaN(pr[1]) && pr[1] >= pr[0]; });
+        // A session with no bursts (an older slice) used to fall back to its whole span, so a
+        // session left open for three days counted as three days of activity. Clamp the stand-in
+        // to the active minutes it did record - never more than the session itself claims.
+        var raw = s.bursts && s.bursts.length ? s.bursts : [[s.start, new Date(+new Date(s.start) + (s.active_min || 0) * 60000).toISOString()]];
+        var bursts = raw.map(function (pr) { return [new Date(pr[0]), new Date(pr[1])]; }).filter(function (pr) { return !isNaN(pr[0]) && !isNaN(pr[1]) && pr[1] >= pr[0]; });
         sessions.push({ a: a, b: b, bursts: bursts, active: s.active_min || 0, prompts: s.prompts || 0, title: s.title || '', branch: s.branch || '', tokens: s.tokens || {}, byModel: s.tokens_by_model || {}, repo: r.repo, agents: s.agents || {}, tools: s.tools || {}, commands: s.commands || {} });
       });
       if (r.uncommitted) uncommitted.push(r.repo + ' (' + r.uncommitted + ')');
@@ -1563,7 +1570,8 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var cards = [
       { v: commits, l: 'commits' },
       { v: sessions, l: 'Claude Code sessions' },
-      { v: fmtDur(agent), l: 'agent-hours', s: 'effort: parallel sessions add up; equals the per-project totals below' },
+      { v: fmtDur(agent), l: state.filter ? 'agent-hours \u00b7 ' + state.filter : 'agent-hours',
+        s: 'effort: parallel sessions add up' + (state.filter ? '' : '; equals the per-project totals below') },
       { v: fmtDur(active), l: 'elapsed', s: 'wall clock, any session; concurrent sessions count once; idle cap ' + DATA.idle_minutes + ' min' }
     ];
     if (haveAw) cards.push({ v: fmtDur(state.filter ? editor : ed), l: state.filter ? 'editor time · ' + state.filter : 'editor time', s: 'VS Code in front, at the keyboard' });
@@ -1578,7 +1586,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     if (!haveAw) notes.push('Install ActivityWatch for desk and editor time.');
     el('daysNote').textContent = notes.join(' ');
     var html = '<div class="dayrow axis"><div></div><div class="track">' + [0, 3, 6, 9, 12, 15, 18, 21, 24].map(function (h) { return '<span class="tick" style="left:' + (h / 24 * 100) + '%">' + pad(h) + '</span>'; }).join('') + '</div><div class="figs">' +
-      (haveAw ? '<span>desk</span><span>editor</span>' : '<span></span><span></span>') + '<span>Claude</span><span>commits</span></div></div>';
+      (haveAw ? '<span>desk</span><span>editor</span>' : '<span></span><span></span>') + '<span>Claude (elapsed)</span><span>commits</span></div></div>';
     var days = R.days.slice().reverse();
     days.forEach(function (d) {
       var k = dateKey(d), d0 = +d, d1 = +addDays(d, 1);
@@ -1628,7 +1636,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
         '<td style="text-align:left"><div class="bar"><i style="width:' + (a + e) + '%;background:' + x.p.color + ';opacity:.35"></i><i style="width:' + a + '%;background:' + x.p.color + '"></i></div></td>' +
         (havePrices ? '<td>' + (x.cost ? DATA.currency + x.cost.toFixed(2) + (x.priced ? '' : '*') : '–') + '</td>' : '') + '</tr>';
     });
-    html += '</tbody></table><div class="legend">' + (haveAw ? '<span><i style="background:#999"></i>Claude Code active</span><span><i style="background:#ccc"></i>plus editor time</span>' : '') + '<span>Claude Code here is effort per project: parallel sessions add up, so the column can exceed the day. The Days rows and the top card show wall-clock time.</span></div>';
+    html += '</tbody></table><div class="legend">' + (haveAw ? '<span><i style="background:#999"></i>Claude Code active</span><span><i style="background:#ccc"></i>plus editor time</span>' : '') + '<span>Claude Code here is effort per project: parallel sessions add up, so the column can exceed the day. The Days rows and the elapsed card show wall-clock time.</span></div>';
     el('projects').innerHTML = html;
     Array.prototype.forEach.call(el('projects').querySelectorAll('tr.p'), function (tr) {
       tr.onclick = function () { state.filter = state.filter === tr.dataset.p ? null : tr.dataset.p; render(); };

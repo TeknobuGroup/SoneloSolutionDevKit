@@ -1,4 +1,4 @@
-"""Unit tests for the v1.14 and v1.15 changes to worklog_agent.py.
+"""Unit tests for the v1.14, v1.15 and v1.17 changes to worklog_agent.py.
 
 v1.14 coverage:
   - agent_name_map(cfg): built-in names merged with cfg["agent_names"] overrides,
@@ -17,6 +17,14 @@ v1.15 coverage:
   - dashboard_data(): the new "version" / "whats_new" payload fields and the
     default when the new parameter is omitted.
   - version_of() and the tuple comparison the cmd_run self-upgrade guard relies on.
+
+v1.17 coverage:
+  - the identity active_min == sum(bursts) + idle_minutes * (bursts - 1), exercised
+    through collect_sessions against a real transcript. Effort computed any other
+    way (a burst union, say) runs tens of percent low.
+  - the report's two time figures keep saying which is which: the Summary column is
+    effort and labels itself, the Days column is elapsed and labels itself, and the
+    explanation prints whether or not ActivityWatch data exists.
 
 Stdlib only; hermetic: nothing is read or written outside the repo or per-test
 temp dirs (never ~/Worklog or ~/.claude); the render tests point wa.LOG into
@@ -464,7 +472,7 @@ class UpgradeGuardComparisonTests(unittest.TestCase):
     def test_machine_copy_newer_than_the_running_version_triggers(self):
         self.assertGreater(self.parsed("9.9"), self.running())
 
-class ActiveTimeIdentity(unittest.TestCase):
+class ActiveTimeIdentityTests(unittest.TestCase):
     """The reporting design rests on one identity, so it is pinned:
 
         active_min == sum(burst durations) + idle_minutes * (bursts - 1)
@@ -502,8 +510,8 @@ class ActiveTimeIdentity(unittest.TestCase):
         base = datetime(2026, 8, 11, 9, 0, 0, tzinfo=TZ)
         offs = [0, 10, 20, 30,   70, 80, 90,   150, 160]
         got = self.collect([base + timedelta(minutes=m) for m in offs], idle=15)
-        if not got:
-            self.skipTest("collect_sessions found nothing for this fixture")
+        self.assertTrue(got, "fixture produced no session - the HOME override or the encoded "
+                             "directory name is wrong; a skip here would hide the identity going stale")
         s = got[0]
         burst_total = sum((wa.parse_iso(b) - wa.parse_iso(a)).total_seconds() / 60
                           for a, b in s["bursts"])
@@ -515,7 +523,7 @@ class ActiveTimeIdentity(unittest.TestCase):
                            "unioning bursts under-reports this session by a third")
 
 
-class TimeColumnsSayWhatTheyAre(unittest.TestCase):
+class TimeColumnsSayWhatTheyAreTests(unittest.TestCase):
     """Two different numbers on purpose: the Summary column is effort (parallel sessions add up),
     the Days column is elapsed (concurrent sessions merge). Each must keep saying which it is."""
 
@@ -526,9 +534,10 @@ class TimeColumnsSayWhatTheyAre(unittest.TestCase):
     def test_summary_adds_parallel_sessions_and_labels_itself(self):
         md = report(self.concurrent())
         self.assertIn("parallel sessions add up", md)
-        self.assertEqual(md.count("30m"), md.count("30m"), "both projects report their own 30m")
-        self.assertIn("| Alpha |", md)
-        self.assertIn("| Beta |", md)
+        # The whole release in one line: two sessions working the same 30 minutes is an hour of
+        # effort, and the same day is 30 minutes elapsed.
+        self.assertIn("| **Total** | **0** | **2** | **1h** |", md)
+        self.assertRegex(md, r"Tue 11 Aug \|[^|]*\|\s*30m\s*\|", "the day itself is 30m elapsed")
 
     def test_days_column_names_itself_elapsed(self):
         md = report(self.concurrent())
