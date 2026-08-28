@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Worklog 1.17: the dashboard shows **agent-hours** beside elapsed time. agent-hours is effort - each session's own active time, summed, so five sessions working an hour each reads as five agent-hours; elapsed is wall clock with any session active, where those same five count once. The two were already computed differently in different places with only one of them labelled, so the same day could be read as two numbers with no way to tell which was which. Measured on this machine: 337h effort against 248h elapsed over 28 days, peaking at 5 concurrent sessions.
 - Kit 4.3: `repo_setup.py refresh` — takes this release's agents, commands and hooks (backups in `.claude/.backup/`), registers the hooks, updates the managed CLAUDE.md section, records the kit version, and touches nothing else. It does refresh the kit's own gates (`.github/workflows/ci-gates.yml`, `.github/pull_request_template.md`) — they are part of the pipeline — and names every file it replaces rather than counting them; the repo's own `ci.yml`, environment doc, `.env*`, design contract, branches and worklog are untouched. `apply --update-pipeline` still works; `refresh` is what the nudge, `update` and `/repo-setup` now recommend.
 - Kit 4.3: every shipped agent declares the model it runs on. design-reviewer, test-writer, test-runner and qa-runner move to `model: sonnet`; the four scribes stay on `haiku`; code-reviewer, security-reviewer and impact-analyst deliberately declare nothing and inherit the session model. A test pins all three groups, the deliberate absence included. Decision recorded in docs/decisions/0004.
 - Kit 4.3: code-reviewer and security-reviewer are given a reading budget — the diff is the source, not the repo. The budget is on breadth (no repo sweeps, no unrelated modules); following the callers of a changed signature stays in scope, because that is the check that catches regressions in files the diff does not touch.
@@ -28,6 +29,7 @@
 - VERSION 4.1 -> 4.2.
 
 ### Fixed
+- Worklog 1.17: the report's day-table column is now `Claude Code (elapsed)` and the single-day header says `elapsed ... (concurrent sessions count once)`. Both were bare "Claude Code active" and read as effort. The paragraph explaining the difference was only printed when ActivityWatch or presence data existed, so a machine with neither shipped the column with no explanation at all; it is now always printed.
 - Kit 4.2: missing review verdict used to pass silently at Stop gate.
 
 ## 4.0

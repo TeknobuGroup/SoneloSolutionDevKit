@@ -464,6 +464,85 @@ class UpgradeGuardComparisonTests(unittest.TestCase):
     def test_machine_copy_newer_than_the_running_version_triggers(self):
         self.assertGreater(self.parsed("9.9"), self.running())
 
+class ActiveTimeIdentity(unittest.TestCase):
+    """The reporting design rests on one identity, so it is pinned:
+
+        active_min == sum(burst durations) + idle_minutes * (bursts - 1)
+
+    A gap inside a burst is under the idle cap, so those pairs telescope to the burst duration;
+    a gap between bursts is over it, so each contributes exactly the cap. Anything that computes
+    "effort" by unioning bursts silently drops the second term - for a multi-burst session that
+    is tens of percent, and it would put the dashboard below the report it must agree with."""
+
+    def collect(self, stamps, idle=15):
+        home = make_temp_dir(self)
+        root = make_temp_dir(self)
+        proj = home / ".claude" / "projects" / wa.encode_cwd(root)
+        proj.mkdir(parents=True)
+        lines = [json.dumps({"type": "user", "timestamp": ts.isoformat(), "cwd": str(root),
+                             "sessionId": "s1", "uuid": "u%d" % i,
+                             "message": {"role": "user", "content": "hi"}})
+                 for i, ts in enumerate(stamps)]
+        (proj / "s1.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        import os
+        saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
+        try:
+            return wa.collect_sessions(root, stamps[0] - timedelta(days=1), idle)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_active_minutes_equal_bursts_plus_the_cap_per_gap(self):
+        # 30 min working, 40 away, 20 working, 60 away, 10 working.
+        # Events inside a burst are 10 min apart so no internal gap trips the 15 min cap.
+        base = datetime(2026, 8, 11, 9, 0, 0, tzinfo=TZ)
+        offs = [0, 10, 20, 30,   70, 80, 90,   150, 160]
+        got = self.collect([base + timedelta(minutes=m) for m in offs], idle=15)
+        if not got:
+            self.skipTest("collect_sessions found nothing for this fixture")
+        s = got[0]
+        burst_total = sum((wa.parse_iso(b) - wa.parse_iso(a)).total_seconds() / 60
+                          for a, b in s["bursts"])
+        self.assertEqual(len(s["bursts"]), 3, "gaps of 40 and 60 min both exceed the 15 min cap")
+        self.assertEqual(burst_total, 60, "30 + 20 + 10 minutes of contiguous work")
+        self.assertEqual(s["active_min"], burst_total + 15 * (len(s["bursts"]) - 1))
+        self.assertEqual(s["active_min"], 90)
+        self.assertGreater(s["active_min"], burst_total,
+                           "unioning bursts under-reports this session by a third")
+
+
+class TimeColumnsSayWhatTheyAre(unittest.TestCase):
+    """Two different numbers on purpose: the Summary column is effort (parallel sessions add up),
+    the Days column is elapsed (concurrent sessions merge). Each must keep saying which it is."""
+
+    def concurrent(self):
+        """Two projects worked simultaneously for the same 30 minutes."""
+        return [make_slice("Alpha", [make_session()]), make_slice("Beta", [make_session()])]
+
+    def test_summary_adds_parallel_sessions_and_labels_itself(self):
+        md = report(self.concurrent())
+        self.assertIn("parallel sessions add up", md)
+        self.assertEqual(md.count("30m"), md.count("30m"), "both projects report their own 30m")
+        self.assertIn("| Alpha |", md)
+        self.assertIn("| Beta |", md)
+
+    def test_days_column_names_itself_elapsed(self):
+        md = report(self.concurrent())
+        self.assertNotIn("| Claude Code |", md,
+                         "a bare 'Claude Code' header reads as effort; the column is elapsed")
+        self.assertIn("Claude Code (elapsed)", md)
+
+    def test_the_elapsed_explanation_is_not_conditional_on_activitywatch(self):
+        """It used to print only when ActivityWatch or presence data existed, so a machine with
+        neither shipped the column with no explanation at all."""
+        md = report(self.concurrent())
+        self.assertIn("add parallel sessions together", md)
+
+
 
 if __name__ == "__main__":
     unittest.main()

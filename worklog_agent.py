@@ -60,9 +60,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.16"
-WHATS_NEW = "works inside git worktrees; agent usage grouped by project with friendly team names; self-upgrades mid-session"
-WHATS_NEW_SHORT = "worktree support; per-project agents; self-upgrading"   # header strip only; keep under ~60 chars
+VERSION = "1.17"
+WHATS_NEW = "agent-hours on the dashboard (parallel sessions add up); elapsed columns now say they are elapsed"
+WHATS_NEW_SHORT = "agent-hours tile; elapsed vs effort labelled"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -953,7 +953,7 @@ def build_report(slices, machines, since, until, cfg):
             bits.append("first trace %s, last %s" % (tr[0].strftime("%H:%M"), tr[1].strftime("%H:%M")))
         wc = wall_clock(d)
         if wc >= 1:
-            bits.append("%s with Claude Code active" % fmt_dur(wc))
+            bits.append("%s elapsed with Claude Code active (concurrent sessions count once)" % fmt_dur(wc))
         if d in pres:
             bits.append("unlocked %s\u2013%s (%s)" % (pres[d]["first"].strftime("%H:%M"), pres[d]["last"].strftime("%H:%M"),
                                                     fmt_dur(pres[d]["on_s"] / 60)))
@@ -1010,14 +1010,17 @@ def build_report(slices, machines, since, until, cfg):
 
     if span >= 2:
         cols = ["Day"] + (["At desk"] if have_aw else []) + (["Unlocked"] if have_pres else []) + \
-               ["First \u2013 last trace", "Claude Code"] + (["Editor"] if have_aw else []) + ["Commits"]
+               ["First \u2013 last trace", "Claude Code (elapsed)"] + (["Editor"] if have_aw else []) + ["Commits"]
         L.append("## Days")
         L.append("")
         if have_aw or have_pres:
-            L.append("At desk = keyboard/mouse active (ActivityWatch). Unlocked = between unlock/logon and lock/sleep. "
-                     "Trace = first and last commit or Claude Code event. Claude Code = wall-clock time with any session active "
-                     "(the per-project figures above add parallel sessions together, so they can exceed this).")
-            L.append("")
+            L.append("At desk = keyboard/mouse active (ActivityWatch). Unlocked = between unlock/logon and lock/sleep.")
+        # Always printed: on a machine with neither ActivityWatch nor presence data this used to
+        # ship with no explanation, leaving an elapsed column looking like an effort one.
+        L.append("Trace = first and last commit or Claude Code event. Claude Code (elapsed) = wall-clock time with any "
+                 "session active, so concurrent sessions count once. The per-project figures above add parallel sessions "
+                 "together - that is the effort number - and they can exceed this.")
+        L.append("")
         L.append("| " + " | ".join(cols) + " |")
         L.append("|---|" + "---:|" * (len(cols) - 1))
         for d in days:
@@ -1547,6 +1550,11 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   function renderKpis(R, focus) {
     var commits = sum(focus, function (x) { return x.commits.length; }), sessions = sum(focus, function (x) { return x.sessions.length; });
     var active = sum(R.days, function (d) { return wallClock(focus, d); }), editor = sum(focus, function (x) { return x.editorMin; });
+    // Effort, not elapsed: x.active is the project's summed session active_min, the same number
+    // the projects table below renders and the report's Summary column totals. Do NOT compute it
+    // by unioning bursts - active_min also carries idle_minutes per burst gap, so a union runs
+    // tens of percent low and the dashboard would disagree with the report.
+    var agent = sum(focus, function (x) { return x.active; });
     var desk = 0, unl = 0, ed = 0;
     R.days.forEach(function (d) {
       var k = dateKey(d); if (aw[k]) { desk += aw[k].desk_s / 60; ed += (aw[k].editor_s || 0) / 60; }
@@ -1555,7 +1563,8 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var cards = [
       { v: commits, l: 'commits' },
       { v: sessions, l: 'Claude Code sessions' },
-      { v: fmtDur(active), l: 'Claude Code active', s: 'wall clock, any session; idle cap ' + DATA.idle_minutes + ' min' }
+      { v: fmtDur(agent), l: 'agent-hours', s: 'effort: parallel sessions add up; equals the per-project totals below' },
+      { v: fmtDur(active), l: 'elapsed', s: 'wall clock, any session; concurrent sessions count once; idle cap ' + DATA.idle_minutes + ' min' }
     ];
     if (haveAw) cards.push({ v: fmtDur(state.filter ? editor : ed), l: state.filter ? 'editor time · ' + state.filter : 'editor time', s: 'VS Code in front, at the keyboard' });
     if (haveAw) cards.push({ v: fmtDur(desk), l: 'at the desk', s: 'any app, keyboard or mouse active' });
