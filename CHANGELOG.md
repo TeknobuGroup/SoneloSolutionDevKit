@@ -29,6 +29,7 @@
 - VERSION 4.1 -> 4.2.
 
 ### Fixed
+- Worklog 1.17: **elapsed time no longer counts an idle session as working.** A session with no recorded bursts fell back to its whole span, so one left open for three days counted as three days of activity. On this machine that put 24h of Claude Code against 18 and 19 August and overstated the 14- and 28-day elapsed figures by about 49 hours. The stand-in interval is now clamped to the active minutes the session actually recorded. Pre-existing and it always fed the report's day column; found by design review when the number was promoted to a dashboard card.
 - Worklog 1.17: the report's day-table column is now `Claude Code (elapsed)` and the single-day header says `elapsed ... (concurrent sessions count once)`. Both were bare "Claude Code active" and read as effort. The paragraph explaining the difference was only printed when ActivityWatch or presence data existed, so a machine with neither shipped the column with no explanation at all; it is now always printed.
 - Kit 4.2: missing review verdict used to pass silently at Stop gate.
 
