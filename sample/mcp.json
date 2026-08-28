@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "uat-hub": {
+      "command": "node",
+      "args": [
+        "C:/Users/AccountA/uat-hub/mcp/server.mjs"
+      ],
+      "env": {
+        "UAT_HUB_URL": "https://testing.teknobugroup.com",
+        "UAT_HUB_KEY": "${UAT_HUB_KEY}",
+        "UAT_HUB_PROJECT": "app-hub"
+      }
+    }
+  }
+}
