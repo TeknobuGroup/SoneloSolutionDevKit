@@ -1,4 +1,4 @@
-# Worklog agent · v1.17 (part of the Sonelo Solution DevKit v4.1)
+# Worklog agent · v1.18 (part of the Sonelo Solution DevKit v4.7)
 
 Installed and updated through the kit: `python repo_setup.py install` does the machine setup, `/repo-setup` or `apply` puts it in a repo. The rest of this file is the reference.
 
@@ -67,7 +67,7 @@ The first time the agent runs on a given day after 05:00, whether that's your fi
 
 ### The dashboard
 
-`dashboard.html` is a single self-contained file, rebuilt on every run with the data embedded, so it opens by double-click with no server and nothing leaves the machine. Refresh the page after a run to see new data. It has presets for this week, last week, 14 and 28 days, with arrows to step back through the window, and clicking a project focuses every section on it.
+`dashboard.html` is a single self-contained file, rebuilt on every run with the data embedded, so it opens by double-click with no server and nothing leaves the machine. It reloads itself so an open page stays current (see below). It has presets for this week, last week, 14 and 28 days, with arrows to step back through the window, and clicking a project focuses every section on it.
 
 - **Days** — one row per day on a 24-hour track: Claude Code sessions as bars, commits as ticks (coloured by project), the machine's unlocked periods in light blue, with desk, editor, Claude and commit figures at the end of each row.
 - **Projects** — commits, sessions, Claude Code and editor time, a proportional bar, estimated cost once prices are set, and an **uncommitted** badge.
@@ -91,9 +91,13 @@ The Markdown reports carry the same data for reading in a plain editor or feedin
   ```
 
   Keys are matched as substrings of the model name; values are per million tokens. Fill them from the current price list; the agent ships with none.
+
+  From v1.18 tokens are recorded against the day they were spent, so a range shows what that range cost. Sessions collected before v1.18 carry one total for the whole session; theirs is apportioned across days by the effort on each, and the report and dashboard both say when a figure is apportioned rather than measured. Re-collecting a repo replaces the estimate with the real split, as long as the transcripts are still on disk.
 - **Per project** — repos, branches, an **uncommitted** flag with the file count, then per day, commits and sessions in time order.
 
-Stop hooks are throttled to one collection every three minutes; the Windows event log is read at most hourly.
+**Which day work lands on.** A Claude Code session keeps one id until you exit it, so the session answering this afternoon may have been opened last week. From v1.18 a session is reported on every day it worked rather than on the day it opened: each day is weighted by its burst time plus one idle cap for any gap opening on it, and the session's `active_min` is apportioned by those weights, so the days sum to exactly the session total. A day after the opening one shows `continued` in place of a prompt count, because prompts are counted per session.
+
+Stop hooks are throttled to one collection every three minutes; the Windows event log is read at most hourly. The dashboard reloads itself every three minutes - the same cadence the collector runs at - so an open page stays current - it is a `file://` page and cannot fetch its own data, so reloading is the only way; the range, the project filter and the scroll position survive it, and a hidden tab is left alone. `"dashboard_reload_s"` in `~/.claude/worklog.json` changes the interval or turns it off with `0`.
 
 ## Commands
 
