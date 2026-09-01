@@ -224,8 +224,25 @@ class McpJsonDrawsTheSecurityReviewer(unittest.TestCase):
 
 
 class UatBlockWarnsAboutTheKey(unittest.TestCase):
-    def test_it_says_never_to_echo_the_value(self):
-        self.assertIn("Never echo, print or interpolate the value", rs.UAT_SECTION)
+    def test_it_says_never_to_print_the_value(self):
+        """v4.8 gave this its own section, because the block now also carries a Windows recipe
+        that reads the key out of the registry - so "never echo or interpolate" as an absolute
+        would have forbidden the very thing the recipe requires. The rule is unchanged in force:
+        the value never reaches a transcript, a report, a commit or a file, and the one route
+        that captures it into a variable is the one that never echoes it. Asserted on the rule
+        rather than on one sentence's wording, which is what broke when the bullet was reworded."""
+        flat = " ".join(rs.UAT_SECTION.split())
+        self.assertIn("### Never print the key", rs.UAT_SECTION)
+        self.assertIn("Not the value, not a prefix", flat)
+        self.assertIn("Never print the value of `UAT_HUB_KEY`", flat)
+        self.assertIn("it does not belong in a transcript, a report, a commit or a file", flat)
+
+    def test_the_registry_recipe_never_echoes_what_it_reads(self):
+        """reg query's raw output contains the key; the recipe has to capture it into a
+        variable and pass it as an environment variable, never print it."""
+        line = [l for l in rs.UAT_SECTION.splitlines() if "K=$(reg query" in l]
+        self.assertEqual(len(line), 1)
+        self.assertNotIn("echo", line[0])
 
     def test_it_pins_the_host(self):
         self.assertIn("testing.teknobugroup.com", rs.UAT_SECTION)

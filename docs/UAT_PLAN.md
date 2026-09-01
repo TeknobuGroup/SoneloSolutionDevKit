@@ -2,6 +2,33 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
+## Changed in this cycle (kit v4.8)
+
+### Changed: the UAT block is re-synced with the hub, and one instruction was wrong
+- UAT-4.8-1: A freshly generated `CLAUDE.md` says a same-`source_ref` re-push **refreshes** that case. The words "updates nothing and creates nothing" appear nowhere - that was the old text, and a session that believed it would never re-push a rebuilt feature.
+- UAT-4.8-2: The block carries the sections the kit's copy had lost: `Fixing what a tester found`, `Order cases the way a tester must run them`, `Push the whole module, not a subset`, and the pointer to the read/update tools.
+- UAT-4.8-3: Console output a tester pasted is described as withheld by default, with `include_console` named as the opt-in. It comes from the client's live system and routinely carries access tokens.
+- UAT-4.8-4: The repo-specific tail (`How this repo is wired`, the slug, the one permitted host) survived the re-sync and still names this repo's project.
+- UAT-4.8-5: `refresh` on a repo at 4.7 replaces the managed UAT block in place and leaves the repo's own text outside the markers untouched.
+
+### New: name the login, so a tester can work in batches
+- UAT-4.8-6: The block tells a session to put the login profile first in the module name, with `"Supplier — Quotes"` style examples, and says the hub groups by module so the batching is free.
+- UAT-4.8-7: It reconciles that with the existing numbering rule rather than leaving them to fight: a numbered module reads `"01. Supplier — Quotes"`.
+- UAT-4.8-8: It tells a session to name the login again as the first instruction in the steps, and to say what the account must contain - "a supplier user with at least one open quote", not "a user".
+- UAT-4.8-9: One login per case: a case needing a supplier to submit and an admin to approve is two cases.
+- UAT-4.8-10: Credentials never appear in a case - the profile is named, an email and password never are.
+
+### New: verify the push landed
+- UAT-4.8-11: The block tells a session to read the module back after pushing and report the number the hub returned, not the number it sent.
+- UAT-4.8-12: The `created` trap is explained: it counts inserts and `source_ref` refreshes together, so a clean re-push of twelve unchanged cases reports twelve and is not twelve duplicates.
+- UAT-4.8-13: There is exactly one "If the push is refused" section and exactly one "Always set source_ref" section. The incoming block was written to be dropped in unchanged and would have produced two of each.
+
+### New: never print the key
+- UAT-4.8-14: The block forbids printing the key, a prefix of it, or "the key starts with".
+- UAT-4.8-15: The Windows registry route captures the value into a variable and passes it as an environment variable; the recipe contains no `echo`, and `grep -a` is called out because without it the match silently fails and reads as "no key set".
+- UAT-4.8-16: With a real key in the environment, nothing the kit generates contains it (the existing `NoLiteralKeyEverWritten` sweep still passes over the enlarged block).
+- UAT-4.8-17: `check` and `doctor` report kit v4.8.
+
 ## Changed in this cycle (worklog v1.18)
 
 ### Changed: work is reported on the day it happened
