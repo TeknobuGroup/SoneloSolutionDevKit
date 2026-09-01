@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-worklog_agent.py  (v1.17)  -  per-repo work reporter for Claude Code
+worklog_agent.py  (v1.18)  -  per-repo work reporter for Claude Code
 
 Lives at <repo>/.worklog/worklog_agent.py. Claude Code hooks run it at the start and end of every
 session in this repo, and after each response (throttled). Each run:
@@ -30,7 +30,8 @@ Commands (run from the repo root):
 
 Config:
   ~/.claude/worklog.json   shared by every repo on this machine:
-        {"pot": ..., "idle_minutes": 15, "window_days": 28, "aw_url": "http://localhost:5600",
+        {"pot": ..., "idle_minutes": 15, "window_days": 28, "dashboard_reload_s": 180,
+         "aw_url": "http://localhost:5600",
          "currency": "$", "prices": {"claude-sonnet-4-6": {"in": 3, "cache_create": 3.75, "cache_read": 0.3, "out": 15}}}
         prices are per million tokens, matched by model-name substring; leave empty for no cost column
         "agent_names": {"code-reviewer": "..."} overrides the built-in friendly display names for agents
@@ -60,15 +61,19 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.17"
-WHATS_NEW = "agent-hours on the dashboard (parallel sessions add up); elapsed columns now say they are elapsed"
-WHATS_NEW_SHORT = "agent-hours tile; elapsed vs effort labelled"   # header strip only; keep under ~60 chars
+VERSION = "1.18"
+WHATS_NEW = "work lands on the day it happened, not the day its session opened; cost per day; the dashboard reloads itself"
+WHATS_NEW_SHORT = "effort lands on the day worked"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
 LOG = HERE / "agent.log"
 MARK = "worklog_agent.py"                        # how we recognise our own hook entries
 STOP_THROTTLE_S = 180                            # Stop hooks fire after every response; re-collect at most every 3 min
+ATOMIC_RETRY_S = 5.0                             # two repos' agents can reach the same pot file at once; wait one out
+DASHBOARD_RELOAD_S = 180                         # the open dashboard re-reads itself this often; 0 turns it off.
+                                                 # Tied to STOP_THROTTLE_S on purpose: reloading faster than the
+                                                 # collector can produce new data just costs the reader their place.
 MACHINE_REFRESH_S = 600                          # ActivityWatch / presence refresh at most every 10 min
 SYSLOG_REFRESH_S = 3600                          # Windows event log at most hourly
 EDITOR_APPS = {"code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "code", "cursor", "windsurf"}
@@ -186,12 +191,33 @@ def iso_week_label(d):
 
 
 def atomic_write(path, text):
+    """Write through a temp file in the same directory, then replace. Two things the obvious
+    version gets wrong on Windows, both seen in this pot:
+
+      - os.replace raises PermissionError (WinError 32) while another process holds the
+        target - two repos' agents rendering the same pot at once. That is contention, not
+        failure, so it is retried; one of these left a project's slice stale for seven hours.
+      - the temp file must not look like the thing being written. Path.glob("*.json") DOES
+        match a leading dot, so `.tmp-x.json` was visible to load_slices, to cmd_status, and
+        to collect_and_write's superseded-slice sweep - which unlinks by that same glob and
+        could delete a half-written slice out from under its writer.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
-        os.replace(tmp, str(path))
+        deadline, delay = time.monotonic() + ATOMIC_RETRY_S, 0.05
+        while True:
+            try:
+                os.replace(tmp, str(path))
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    log("atomic_write: %s held by another process for %gs, giving up" % (path, ATOMIC_RETRY_S))
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
     except Exception:
         try:
             os.unlink(tmp)
@@ -217,6 +243,105 @@ def clip_to_days(start, end):
         out.append((cur.date(), (piece_end - cur).total_seconds()))
         cur = piece_end
     return out
+
+
+def session_bursts(s):
+    """A session's activity as (start, end) pairs. A slice written before bursts existed -
+    and every session in the older tests - falls back to the span the report has always used
+    for it: its start, running for active_min. Without that fallback a burstless session
+    would contribute its whole idle span, which once showed 24h of Claude in a day."""
+    out = []
+    for pair in s.get("bursts") or []:
+        try:
+            a, b = parse_iso(pair[0]), parse_iso(pair[1])
+        except (TypeError, IndexError):
+            continue
+        if a and b and b >= a:
+            out.append((a, b))
+    if out:
+        return out
+    st = parse_iso(s.get("start"))
+    return [(st, st + timedelta(minutes=int(s.get("active_min") or 0)))] if st else []
+
+
+def session_day_minutes(s, idle_minutes):
+    """Split one session's effort across the local days it actually happened on.
+
+    Effort is not burst time. The identity the whole report rests on is
+
+        active_min == sum(bursts) + idle_minutes * (bursts - 1)
+
+    because active_min charges every gap the idle cap. Splitting by burst seconds alone
+    drops that second term and runs 20-40% below the Summary column, so each day is given
+    a weight of its burst seconds plus one idle cap per gap - charged to the day the gap
+    OPENS - and active_min is then apportioned by those weights. Largest remainder, so the
+    per-day figures sum to exactly the session total printed everywhere else."""
+    bursts = session_bursts(s)
+    if not bursts:
+        return {}
+    weights = defaultdict(float)
+    for a, b in bursts:
+        weights[a.date()] += 0.0            # a single-event burst has no duration but still happened
+        for day, secs in clip_to_days(a, b):
+            weights[day] += secs
+    for (_, end), (nxt, _) in zip(bursts, bursts[1:]):
+        weights[end.date()] += max(min((nxt - end).total_seconds(), idle_minutes * 60), 0)
+    days = sorted(weights)
+    total = int(s.get("active_min") or 0)
+    pool = sum(weights.values())
+    if total <= 0 or pool <= 0:
+        # conservation holds for any total, including a nonsensical negative one out of a
+        # hand-edited slice: the days still sum to what the session claims
+        return {d: (total if d == days[0] else 0) for d in days}
+    exact = {d: total * weights[d] / pool for d in days}
+    out = {d: int(exact[d]) for d in days}
+    for d in sorted(days, key=lambda x: (-(exact[x] - int(exact[x])), x))[:total - sum(out.values())]:
+        out[d] += 1
+    return out
+
+
+TOK_KEYS = ("in", "cache_create", "cache_read", "out")
+
+
+def session_tokens_in_range(s, per_day, in_range, since, until):
+    """What this session spent inside the range, per model, and whether that is a measurement.
+
+    From 1.18 the collector records tokens against the day they were spent, so a range takes
+    exactly its own days. A slice written before that has one total for the whole session, and
+    the only honest answer is to apportion it by the effort recorded on each day - returned
+    with apportioned=True so the report can say so rather than print an estimate as fact."""
+    by_day = s.get("tokens_by_day_by_model")
+    if isinstance(by_day, dict) and by_day:
+        share = {}
+        for day_iso, models in by_day.items():
+            try:
+                d = datetime.strptime(str(day_iso), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if not (since.date() <= d <= until.date()) or not isinstance(models, dict):
+                continue
+            for model, tk in models.items():
+                acc = share.setdefault(model, {k: 0 for k in TOK_KEYS})
+                for k in TOK_KEYS:
+                    acc[k] += int((tk or {}).get(k, 0) or 0)
+        return share, False
+    whole = sum(per_day.values())
+    frac = (sum(in_range.values()) / whole) if whole else 1.0
+    by_model = s.get("tokens_by_model")
+    if not isinstance(by_model, dict) or not by_model:
+        tot = s.get("tokens") or {}
+        # A session that spent nothing must not stamp the range "partial pricing" for a model
+        # it never used, nor "estimated" for a split that never happened. Both markers exist to
+        # be believed; one crying wolf sends someone hunting for a missing price that is not there.
+        if not any(int(tot.get(k, 0) or 0) for k in TOK_KEYS):
+            return {}, False
+        by_model = {"?": tot}                       # older still: a total with no model breakdown
+    share = {}
+    for model, tk in by_model.items():
+        vals = {k: int(round(int((tk or {}).get(k, 0) or 0) * frac)) for k in TOK_KEYS}
+        if any(vals.values()):   # a share that rounds to nothing must not list its model or mark the row
+            share[model] = vals
+    return share, bool(share) and frac < 1.0
 
 
 def safe_name(s):
@@ -443,10 +568,15 @@ def collect_sessions(root, since, idle_minutes):
                             u = msg["usage"]
                             key = obj.get("requestId") or msg.get("id") or obj.get("uuid")
                             model = msg.get("model") or "?"
+                            # the local day rides INSIDE the entry: rec["usage"] is keyed by
+                            # requestId and merged with dict.update across transcripts, so a
+                            # resumed or sidechained record appears more than once. Bucketing
+                            # by day at parse time would count those twice; after the merge
+                            # each request is present once and carries the day it was spent.
                             entry = (model, int(u.get("input_tokens") or 0),
                                      int(u.get("cache_creation_input_tokens") or 0),
                                      int(u.get("cache_read_input_tokens") or 0),
-                                     int(u.get("output_tokens") or 0))
+                                     int(u.get("output_tokens") or 0), t.date().isoformat())
                             rec["usage"][key] = entry
                             if forced_key:
                                 if not rec["sub_files"] or rec["sub_files"][-1]["file"] != f.name:
@@ -485,10 +615,12 @@ def collect_sessions(root, since, idle_minutes):
                 b_start = t
             prev = t
         bursts.append([b_start.isoformat(), prev.isoformat()])
-        by_model = {}
-        for model, i, cc, cr, o in rec["usage"].values():
+        by_model, by_day = {}, {}
+        for model, i, cc, cr, o, day in rec["usage"].values():
             m = by_model.setdefault(model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
             m["in"] += i; m["cache_create"] += cc; m["cache_read"] += cr; m["out"] += o
+            dm = by_day.setdefault(day, {}).setdefault(model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
+            dm["in"] += i; dm["cache_create"] += cc; dm["cache_read"] += cr; dm["out"] += o
         tot = {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0}
         for m in by_model.values():
             for k in tot:
@@ -529,12 +661,13 @@ def collect_sessions(root, since, idle_minutes):
                 owner["taken"] = True
             a = agents.setdefault(owner["type"] if owner else "general-purpose",
                                   {"runs": 0, "wall_s": 0, "tokens": {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0}})
-            for model, i, cc, cr, o in sf["usage"].values():
+            for model, i, cc, cr, o, _day in sf["usage"].values():
                 a["tokens"]["in"] += i; a["tokens"]["cache_create"] += cc; a["tokens"]["cache_read"] += cr; a["tokens"]["out"] += o
         out.append({"id": rec["id"], "start": ts[0].isoformat(), "end": ts[-1].isoformat(),
                     "active_min": int(active.total_seconds() // 60), "prompts": rec["prompts"],
                     "title": rec["title"] or "", "branch": rec["branch"] or "",
                     "bursts": bursts, "tokens": tot, "tokens_by_model": by_model,
+                    "tokens_by_day_by_model": by_day,
                     "agents": agents, "tools": rec["tools"], "commands": rec["commands"]})
     out.sort(key=lambda r: r["start"])
     return out
@@ -828,7 +961,7 @@ def build_report(slices, machines, since, until, cfg):
             buckets[label] = {"repos": set(), "days": defaultdict(list), "day_active": defaultdict(int), "bursts": defaultdict(list), "session_objs": [],
                               "commits": 0, "sessions": 0, "active": 0, "branches": set(), "uncommitted": {},
                               "tok": {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0}, "models": set(),
-                              "cost": 0.0, "priced": True}
+                              "cost": 0.0, "priced": True, "apportioned": False}
         return buckets[label]
 
     for sl in slices:
@@ -844,40 +977,59 @@ def build_report(slices, machines, since, until, cfg):
             b["days"][t.date()].append((t, "commit", "`%s` %s" % (c["hash"][:7], shorten(c["subject"], 110)), c["subject"], t))
         for s in sl.get("sessions", []):
             st, en = parse_iso(s.get("start")), parse_iso(s.get("end"))
-            if not st or st < since or st > until:
+            if not st:
                 continue
             en = en or st
+            # A session is reported where it WORKED, not where it opened. Claude Code keeps one
+            # session id until you exit, so the session answering today may have opened last
+            # week; selecting on start time hid whole days of work behind that, and piled the
+            # week's effort onto the opening day of any range that did include it.
+            per_day = session_day_minutes(s, int(cfg["idle_minutes"]))
+            in_range = {d: m for d, m in per_day.items() if since.date() <= d <= until.date()}
+            if not in_range:
+                continue
             b["sessions"] += 1
-            b["active"] += s["active_min"]
-            b["day_active"][st.date()] += s["active_min"]
+            b["active"] += sum(in_range.values())
+            for d, m in in_range.items():
+                b["day_active"][d] += m
             if s.get("branch"):
                 b["branches"].add(s["branch"])
             b["session_objs"].append(s)
             # Same clamp as the dashboard: without it a burstless session contributes its whole
             # span to the elapsed column, which is how 18-19 Aug came to read 24h of Claude.
-            fallback = [[s.get("start"), (st + timedelta(minutes=int(s.get("active_min") or 0))).isoformat()]]
-            for pair in (s.get("bursts") or fallback):
-                bs, be = parse_iso(pair[0]), parse_iso(pair[1])
-                if bs and be and be >= bs:
-                    cur = bs
-                    for d, secs in clip_to_days(bs, be + timedelta(seconds=1)):
-                        b["bursts"][d].append((cur, cur + timedelta(seconds=secs)))
-                        cur = cur + timedelta(seconds=secs)
-            for k, v in (s.get("tokens") or {}).items():
-                if k in b["tok"]:
-                    b["tok"][k] += int(v)
-            for model, tk in (s.get("tokens_by_model") or {}).items():
+            day_spans = {}
+            for bs, be in session_bursts(s):
+                cur = bs
+                for d, secs in clip_to_days(bs, be + timedelta(seconds=1)):
+                    piece = (cur, cur + timedelta(seconds=secs))
+                    b["bursts"][d].append(piece)
+                    lo, hi = day_spans.get(d, piece)
+                    day_spans[d] = (min(lo, piece[0]), max(hi, piece[1]))
+                    cur = piece[1]
+            share, apportioned = session_tokens_in_range(s, per_day, in_range, since, until)
+            if apportioned:
+                b["apportioned"] = True
+            for model, tk in share.items():
                 b["models"].add(model)
+                for k in b["tok"]:
+                    b["tok"][k] += int(tk.get(k, 0) or 0)
                 p = price_for(model, cfg.get("prices"))
                 if p:
                     b["cost"] += sum(tk.get(k, 0) * float(p.get(k, 0)) for k in ("in", "cache_create", "cache_read", "out")) / 1e6
                 else:
                     b["priced"] = False
             title = shorten(s.get("title") or "(no prompt text)", 100)
-            b["days"][st.date()].append(
-                (st, "claude", "**Claude Code** %s\u2013%s \u00b7 ~%s active \u00b7 %d prompt%s \u00b7 \u201c%s\u201d" % (
-                    st.strftime("%H:%M"), en.strftime("%H:%M"), fmt_dur(s["active_min"]),
-                    s["prompts"], "" if s["prompts"] == 1 else "s", title), s.get("title") or "", en))
+            opened = min(per_day) if per_day else st.date()
+            for d in sorted(in_range):
+                lo, hi = day_spans.get(d, (st, en))
+                # prompts are counted per session, not per day, so only the day it opened can
+                # honestly claim them; the rest say what they are - the same session, still going
+                whose = ("%d prompt%s" % (s.get("prompts") or 0, "" if s.get("prompts") == 1 else "s")
+                         if d == opened else "continued")
+                b["days"][d].append(
+                    (lo, "claude", "**Claude Code** %s\u2013%s \u00b7 ~%s active \u00b7 %s \u00b7 \u201c%s\u201d" % (
+                        lo.strftime("%H:%M"), hi.strftime("%H:%M"), fmt_dur(in_range[d]), whose, title),
+                     s.get("title") or "", hi))
 
     active = {k: v for k, v in buckets.items() if v["commits"] or v["sessions"]}
     quiet = sorted(k for k, v in buckets.items() if not (v["commits"] or v["sessions"]))
@@ -1061,7 +1213,8 @@ def build_report(slices, machines, since, until, cfg):
             tot["in"] += t["in"] + t["cache_create"]; tot["cache_read"] += t["cache_read"]; tot["out"] += t["out"]
             tot_cost += b["cost"]
             models = ", ".join(sorted(m.replace("claude-", "") for m in b["models"] if m != "?"))
-            cost = ("%s%.2f%s" % (cfg.get("currency", "$"), b["cost"], "" if b["priced"] else "*")) if show_cost else None
+            marks = ("" if b["priced"] else "*") + ("†" if b["apportioned"] else "")
+            cost = ("%s%.2f%s" % (cfg.get("currency", "$"), b["cost"], marks)) if show_cost else None
             L.append("| %s | %d | %s | %s | %s%s | %s |" % (label, b["sessions"], fmt_tok(t["in"] + t["cache_create"]),
                                                           fmt_tok(t["cache_read"]), fmt_tok(t["out"]),
                                                           (" | " + cost) if cost else "", models))
@@ -1071,6 +1224,12 @@ def build_report(slices, machines, since, until, cfg):
         if show_cost and any(not b["priced"] for _, b in ordered):
             L.append("")
             L.append("\\* some models had no entry in `prices`, so the figure is partial.")
+        if show_cost and any(b["apportioned"] for _, b in ordered):
+            L.append("")
+            L.append("† an estimated cost, not a measured one. These sessions were collected before the agent "
+                     "recorded tokens per day, when one total covered a whole session however many days it ran; "
+                     "their spend is split across days in proportion to the effort recorded on each. Sessions "
+                     "collected since are exact, and re-collecting a repo replaces the estimate.")
         L.append("")
 
     an = agent_name_map(cfg)
@@ -1138,12 +1297,17 @@ def build_report(slices, machines, since, until, cfg):
 
     rows = []
     for label, b in ordered:
-        for day in sorted(b["days"]):
-            items = b["days"][day]
+        # The union is belt-and-braces: every in-range effort day also appends a "claude" item
+        # above, so today the two key sets match. It guards the coupling - the moment a day gets
+        # minutes without a detail line, that day's effort would vanish from the archived weekly
+        # CSV, which the dashboard's trend chart reads back and would then sit below the report.
+        # Note claude_sessions now counts session-DAYS, so a session spanning three days is 3.
+        for day in sorted(set(b["days"]) | set(b["day_active"])):
+            items = b["days"].get(day, [])
             rows.append([label, day.isoformat(),
                          sum(1 for it in items if it[1] == "commit"),
                          sum(1 for it in items if it[1] == "claude"),
-                         b["day_active"][day],
+                         b["day_active"].get(day, 0),
                          int(editor_for(day, label, b) / 60) if have_aw else "",
                          " | ".join(it[3] for it in items if it[1] == "commit"),
                          " | ".join(it[3] for it in items if it[1] == "claude" and it[3])])
@@ -1274,6 +1438,7 @@ def dashboard_data(slices, machines, cfg, pot, whats_new=""):
         "idle_minutes": int(cfg["idle_minutes"]), "currency": cfg.get("currency", "$"), "prices": cfg.get("prices") or {},
         "agent_names": agent_name_map(cfg),
         "version": VERSION, "whats_new": whats_new,
+        "reload_s": min(max(int(cfg.get("dashboard_reload_s", DASHBOARD_RELOAD_S) or 0), 0), 86400),
         "repo_count": len(slices),
         "projects": [{"project": k, "repos": v} for k, v in projects.items()],
         "machine": {"aw_days": aw_days, "presence": presence},
@@ -1327,7 +1492,7 @@ main{padding:16px 20px 40px;display:grid;gap:16px;max-width:1400px;margin:0 auto
 .dayrow.axis .tick{position:absolute;top:0;transform:translateX(-50%)}
 .dayrow.today .dl{color:var(--accent)}
 .dl{font-weight:600}
-.dl small{display:block;color:var(--muted);font-weight:400;font-size:11px}
+.dl small{display:block;color:var(--muted);font-weight:400;font-size:12px}
 .track{position:relative;height:28px;background:var(--soft);border-radius:6px;overflow:hidden}
 .track .gl{position:absolute;top:0;bottom:0;width:1px;background:#e3e5e8}
 .track .unl{position:absolute;top:0;bottom:0;background:var(--unl)}
@@ -1342,7 +1507,10 @@ th:first-child,td:first-child{text-align:left}
 td{padding:7px 8px;border-bottom:1px solid var(--soft);text-align:right;white-space:nowrap}
 tr.p{cursor:pointer}
 tr.p:hover td{background:#fafafa}
-tr.p.sel td{background:#f0fdfa}
+tr.p.sel td{background:#f0fdfa;box-shadow:inset 3px 0 0 var(--accent)}
+#scope{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--accent);border-radius:4px;padding:3px 8px;font-size:12px}
+#scope[hidden]{display:none}
+#scope button{border:0;background:none;cursor:pointer;font:inherit;color:var(--muted);padding:0;line-height:1}
 .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:8px;vertical-align:-1px}
 .bar{height:8px;border-radius:4px;background:var(--soft);position:relative;min-width:120px;overflow:hidden}
 .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
@@ -1371,7 +1539,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
 .log li .t{color:var(--muted);font-variant-numeric:tabular-nums}
 .log code{background:var(--soft);padding:1px 5px;border-radius:4px;font-size:12px}
 .log .cc{color:#0f766e;font-weight:600}
-@media (max-width:900px){.dayrow{grid-template-columns:80px 1fr}.figs{display:none}.meta{display:none}}
+@media (max-width:820px){.dayrow{grid-template-columns:80px 1fr}.figs{display:none}.meta{display:none}}
 </style>
 </head>
 <body>
@@ -1379,6 +1547,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   <h1>Worklog<span id="potName"></span></h1>
   <div class="seg" id="presets"></div>
   <div class="nav"><button id="prev" title="earlier">&#8249;</button><span id="rangeLabel"></span><button id="next" title="later">&#8250;</button></div>
+  <span id="scope" hidden></span>
   <div class="meta" id="meta"></div>
 </header>
 <main>
@@ -1387,7 +1556,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   <section class="card"><h2>Projects</h2><div class="note">Click a project to focus the other sections on it.</div><div id="projects"></div></section>
   <section class="card"><h2>At a glance</h2><div class="note">Commits and Claude Code active time per project per day; shading is Claude plus editor time.</div><div class="gridwrap" id="grid"></div></section>
   <section class="card" id="usageCard"><h2>Claude Code usage</h2><div id="usage"></div></section>
-  <section class="card" id="agentsCard"><h2>Agents</h2><div class="note">Subagent runs started from the sessions in range: how often, how long they ran, what they consumed. Below: slash commands and the tools Claude used.</div><div id="agents"></div></section>
+  <section class="card" id="agentsCard"><h2>Agents</h2><div class="note">Subagent runs from every session that worked in this range, counted whole - including any part of that session outside the range. Run counts are integers and are not apportioned. Below: slash commands and the tools Claude used.</div><div id="agents"></div></section>
   <section class="card" id="trendCard"><h2>Weeks</h2><div class="note">Hours per week by project: Claude Code active time plus editor time. Completed weeks from the archive, the current week to date.</div><div id="trend"></div></section>
   <section class="card"><h2>Log</h2><div class="log" id="log"></div></section>
 </main>
@@ -1453,7 +1622,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
         // to the active minutes it did record - never more than the session itself claims.
         var raw = s.bursts && s.bursts.length ? s.bursts : [[s.start, new Date(+new Date(s.start) + (s.active_min || 0) * 60000).toISOString()]];
         var bursts = raw.map(function (pr) { return [new Date(pr[0]), new Date(pr[1])]; }).filter(function (pr) { return !isNaN(pr[0]) && !isNaN(pr[1]) && pr[1] >= pr[0]; });
-        sessions.push({ a: a, b: b, bursts: bursts, active: s.active_min || 0, prompts: s.prompts || 0, title: s.title || '', branch: s.branch || '', tokens: s.tokens || {}, byModel: s.tokens_by_model || {}, repo: r.repo, agents: s.agents || {}, tools: s.tools || {}, commands: s.commands || {} });
+        sessions.push({ a: a, b: b, bursts: bursts, active: s.active_min || 0, prompts: s.prompts || 0, title: s.title || '', branch: s.branch || '', byModel: s.tokens_by_model || {}, byDay: s.tokens_by_day_by_model || null, repo: r.repo, agents: s.agents || {}, tools: s.tools || {}, commands: s.commands || {} });
       });
       if (r.uncommitted) uncommitted.push(r.repo + ' (' + r.uncommitted + ')');
     });
@@ -1497,6 +1666,38 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   var state = { preset: PRESETS[0], start: PRESETS[0].start(), n: 7, filter: null };
   var windowStart = DATA.window_start ? startOfDay(new Date(DATA.window_start)) : addDays(today, -(DATA.window_days || 28));
 
+  // Mirrors session_day_minutes() in the Python: a session's effort split across the days it
+  // happened on. Effort is bursts PLUS one idle cap per gap (that is what active_min counts),
+  // so each day is weighted by its burst time plus any gap opening on it, and active_min is
+  // apportioned by those weights - largest remainder, so the days sum to the session total.
+  // Both sides must agree: the projects table is the Python's Summary column.
+  function dayMinutes(s) {
+    var idleMs = (DATA.idle_minutes || 15) * 60000, w = {}, order = [];
+    function add(k, v) { if (!(k in w)) { w[k] = 0; order.push(k); } w[k] += v; }
+    s.bursts.forEach(function (pr, i) {
+      add(dateKey(pr[0]), 0);
+      var cur = +pr[0], end = +pr[1];
+      while (cur < end) {
+        var stop = Math.min(end, +addDays(startOfDay(new Date(cur)), 1));
+        add(dateKey(new Date(cur)), stop - cur);
+        cur = stop;
+      }
+      if (i + 1 < s.bursts.length) add(dateKey(pr[1]), Math.max(Math.min(+s.bursts[i + 1][0] - +pr[1], idleMs), 0));
+    });
+    var total = s.active || 0, pool = 0, out = {};
+    order.forEach(function (k) { pool += w[k]; });
+    if (total <= 0 || pool <= 0) { order.forEach(function (k, i) { out[k] = !i ? total : 0; }); return out; }
+    var used = 0, rem = [];
+    order.forEach(function (k) { var e = total * w[k] / pool; out[k] = Math.floor(e); used += out[k]; rem.push({ k: k, f: e - Math.floor(e) }); });
+    rem.sort(function (a, b) { return b.f - a.f || (a.k < b.k ? -1 : 1); });
+    // bounded: a non-integer active_min out of a hand-edited slice must not walk off the end
+    // and throw inside compute(), which would blank the whole page rather than one card
+    for (var i = 0, n = Math.min(total - used, rem.length); i < n; i++) out[rem[i].k] += 1;
+    return out;
+  }
+
+  var TOKK = ['in', 'cache_create', 'cache_read', 'out'];
+
   // ---------- compute for the current range
   function compute() {
     var start = state.start, end = addDays(start, state.n);
@@ -1504,22 +1705,79 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     for (var i = 0; i < state.n; i++) { var d = addDays(start, i); if (d > today) break; days.push(d); }
     var per = projects.map(function (p) {
       var commits = p.commits.filter(function (c) { return c.t >= start && c.t < end; });
-      var sessions = p.sessions.filter(function (s) { return s.a >= start && s.a < end; });
+      // Selected by where the session WORKED, not where it opened: one session id can stay
+      // open for days, and filtering on its start hid every later day's work behind it.
       var byDay = {}, editorByDay = {}, active = 0, editor = 0;
       days.forEach(function (d) { var k = dateKey(d); byDay[k] = { commits: [], sessions: [], active: 0 }; editorByDay[k] = editorFor(p, k); editor += editorByDay[k]; });
       commits.forEach(function (c) { var k = dateKey(c.t); if (byDay[k]) byDay[k].commits.push(c); });
-      sessions.forEach(function (s) { var k = dateKey(s.a); if (byDay[k]) { byDay[k].sessions.push(s); byDay[k].active += s.active; } active += s.active; });
-      var tok = { inp: 0, cr: 0, out: 0 }, cost = 0, priced = true, models = {};
-      sessions.forEach(function (s) {
-        tok.inp += (s.tokens['in'] || 0) + (s.tokens.cache_create || 0); tok.cr += s.tokens.cache_read || 0; tok.out += s.tokens.out || 0;
-        Object.keys(s.byModel).forEach(function (m) {
-          models[m] = 1; var pr = priceFor(m), t = s.byModel[m];
+      var sel = [];
+      p.sessions.forEach(function (s) {
+        var dm = dayMinutes(s), mine = {}, inr = 0, whole = 0, any = false;
+        Object.keys(dm).forEach(function (k) { whole += dm[k]; });
+        days.forEach(function (d) { var k = dateKey(d); if (k in dm) { mine[k] = dm[k]; inr += dm[k]; any = true; } });
+        if (any) sel.push({ s: s, mine: mine, inr: inr, whole: whole, first: Object.keys(dm).sort()[0] });
+      });
+      var sessions = sel.map(function (x) { return x.s; });
+      sel.forEach(function (x) {
+        // A day gets a per-day VIEW of the session, not the session itself: the same object in
+        // five days' buckets made the Log print one session's whole span, active time and prompt
+        // count five times, under days where minutes of it happened. Inherited through the
+        // prototype so every existing reader (bursts, title, colour) still sees the session.
+        Object.keys(x.mine).forEach(function (k) {
+          if (!byDay[k]) return;
+          var d0 = +startOfDay(new Date(k + 'T00:00:00')), d1 = +addDays(new Date(d0), 1), lo = null, hi = null;
+          x.s.bursts.forEach(function (pr) {
+            var a = Math.max(+pr[0], d0), b = Math.min(+pr[1], d1);
+            if (b < a) return;
+            if (lo === null || a < lo) lo = a;
+            if (hi === null || b > hi) hi = b;
+          });
+          var view = Object.create(x.s);
+          view.dayMin = x.mine[k];
+          view.dayLo = new Date(lo === null ? Math.max(+x.s.a, d0) : lo);
+          view.dayHi = new Date(hi === null ? +view.dayLo : hi);
+          view.continued = k !== x.first;
+          byDay[k].sessions.push(view);
+          byDay[k].active += x.mine[k];
+        });
+        active += x.inr;
+      });
+      var tok = { inp: 0, cr: 0, out: 0 }, cost = 0, priced = true, models = {}, apportioned = false;
+      sel.forEach(function (x) {
+        var s = x.s, share = {};
+        function acc(m) { return share[m] || (share[m] = { 'in': 0, cache_create: 0, cache_read: 0, out: 0 }); }
+        if (s.byDay && Object.keys(s.byDay).length) {   // v1.18: this range takes its own days.
+          // the length check matters: {} is truthy here but falsy on the Python side, and the
+          // two must branch identically or they annotate the same cost differently
+          Object.keys(s.byDay).forEach(function (k) {
+            if (!(k in x.mine)) return;
+            Object.keys(s.byDay[k]).forEach(function (m) {
+              var a = acc(m), t = s.byDay[k][m] || {};
+              TOKK.forEach(function (kk) { a[kk] += t[kk] || 0; });
+            });
+          });
+        } else {                             // older slice: one total for the whole session
+          var frac = x.whole ? x.inr / x.whole : 1;
+          Object.keys(s.byModel).forEach(function (m) {
+            // a model whose apportioned share rounds to nothing must not list itself in the
+            // Models column, nor stamp the row "partial" for a contribution of zero tokens
+            var t = s.byModel[m] || {}, v = {}, any = false;
+            TOKK.forEach(function (kk) { v[kk] = Math.round((t[kk] || 0) * frac); if (v[kk]) any = true; });
+            if (!any) return;
+            var a = acc(m);
+            TOKK.forEach(function (kk) { a[kk] += v[kk]; });
+          });
+          if (frac < 1 && Object.keys(share).length) apportioned = true;
+        }
+        Object.keys(share).forEach(function (m) {
+          models[m] = 1; var t = share[m], pr = priceFor(m);
+          tok.inp += (t['in'] || 0) + (t.cache_create || 0); tok.cr += t.cache_read || 0; tok.out += t.out || 0;
           if (pr) cost += ((t['in'] || 0) * (pr['in'] || 0) + (t.cache_create || 0) * (pr.cache_create || 0) + (t.cache_read || 0) * (pr.cache_read || 0) + (t.out || 0) * (pr.out || 0)) / 1e6;
           else priced = false;
         });
       });
       var branches = {}; sessions.forEach(function (s) { if (s.branch) branches[s.branch] = 1; });
-      return { p: p, commits: commits, sessions: sessions, byDay: byDay, editorByDay: editorByDay, active: active, editorMin: editor / 60, tok: tok, cost: cost, priced: priced, models: Object.keys(models).filter(function (m) { return m !== '?'; }), branches: Object.keys(branches) };
+      return { p: p, commits: commits, sessions: sessions, byDay: byDay, editorByDay: editorByDay, active: active, editorMin: editor / 60, tok: tok, cost: cost, priced: priced, apportioned: apportioned, models: Object.keys(models).filter(function (m) { return m !== '?'; }), branches: Object.keys(branches) };
     }).filter(function (x) { return x.commits.length || x.sessions.length || x.editorMin >= 1; });
     per.sort(function (a, b) { return (b.active + b.editorMin + b.commits.length * 5) - (a.active + a.editorMin + a.commits.length * 5); });
     return { start: start, end: end, days: days, per: per };
@@ -1543,12 +1801,20 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var last = R.days.length ? R.days[R.days.length - 1] : R.start;
     var a = R.start.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }), b = last.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
     el('rangeLabel').textContent = state.n === 7 ? isoWeek(R.start) + ' · ' + a + ' – ' + b : a + ' – ' + b;
+    // the filter now survives reloads and overnight, so it has to be legible as scope rather
+    // than as a faint tint on one table row that most of the page never mentions
+    var sc = el('scope');
+    if (state.filter) {
+      sc.innerHTML = 'Showing ' + esc(state.filter) + ' <button id="clearScope" title="show all projects">&#10005;</button>';
+      sc.hidden = false;
+      el('clearScope').onclick = function () { this.blur(); state.filter = null; render(); };
+    } else { sc.hidden = true; sc.innerHTML = ''; }
     el('prev').disabled = addDays(R.start, -state.preset.step) < addDays(windowStart, -6);
     el('next').disabled = addDays(R.start, state.preset.step) > today;
     var seg = el('presets');
     if (!seg.childNodes.length) PRESETS.forEach(function (ps) {
       var b = document.createElement('button'); b.textContent = ps.label; b.dataset.id = ps.id;
-      b.onclick = function () { state.preset = ps; state.start = ps.start(); state.n = ps.n; render(); };
+      b.onclick = function () { this.blur(); state.preset = ps; state.start = ps.start(); state.n = ps.n; render(); };
       seg.appendChild(b);
     });
     Array.prototype.forEach.call(seg.childNodes, function (b) { b.className = b.dataset.id === state.preset.id ? 'on' : ''; });
@@ -1603,7 +1869,9 @@ svg.trend text{font-size:11px;fill:var(--muted)}
           s.bursts.forEach(function (pr) {
             var a = Math.max(+pr[0], d0), b = Math.min(+pr[1], d1); if (b < a) return;
             var w = Math.max((b - a) / D * 100, 0.4);
-            parts.push('<i class="sess" style="left:' + ((a - d0) / D * 100) + '%;width:' + w + '%;background:' + x.p.color + '" title="' + esc(x.p.name + ' · ' + hm(pr[0]) + '–' + hm(pr[1]) + ' · session ' + hm(s.a) + '–' + hm(s.b) + ' · ~' + fmtDur(s.active) + ' active · ' + s.title) + '"></i>');
+            // ~active is THIS day's share; the session's own span stays labelled as the session,
+            // or a bar on day three of a long session claims the whole session's hours
+            parts.push('<i class="sess" style="left:' + ((a - d0) / D * 100) + '%;width:' + w + '%;background:' + x.p.color + '" title="' + esc(x.p.name + ' · ' + hm(pr[0]) + '–' + hm(pr[1]) + ' · ~' + fmtDur(s.dayMin) + ' active this day · session ' + hm(s.a) + '–' + hm(s.b) + (s.continued ? ' (continued)' : '') + ' · ' + s.title) + '"></i>');
           });
         });
         dd.commits.forEach(function (c) {
@@ -1615,7 +1883,19 @@ svg.trend text{font-size:11px;fill:var(--muted)}
       var rec = aw[k], ed = 0;
       if (state.filter) focus.forEach(function (x) { ed += (x.editorByDay[k] || 0) / 60; }); else ed = rec ? (rec.editor_s || 0) / 60 : 0;
       var first = null, last = null;
-      focus.forEach(function (x) { var dd = x.byDay[k]; if (!dd) return; dd.sessions.forEach(function (s) { if (!first || s.a < first) first = s.a; if (!last || s.b > last) last = s.b; }); dd.commits.forEach(function (c) { if (!first || c.t < first) first = c.t; if (!last || c.t > last) last = c.t; }); });
+      // clamped to the day: a session that opened last week must not drag this day's first
+      // trace back to the day it opened
+      focus.forEach(function (x) {
+        var dd = x.byDay[k]; if (!dd) return;
+        dd.sessions.forEach(function (s) {
+          s.bursts.forEach(function (pr) {
+            var a = Math.max(+pr[0], d0), b = Math.min(+pr[1], d1); if (b < a) return;
+            if (!first || a < +first) first = new Date(a);
+            if (!last || b > +last) last = new Date(b);
+          });
+        });
+        dd.commits.forEach(function (c) { if (!first || c.t < first) first = c.t; if (!last || c.t > last) last = c.t; });
+      });
       html += '<div class="dayrow' + (+d === +today ? ' today' : '') + '"><div class="dl">' + esc(dayLabel(d)) + '<small>' + (first ? hm(first) + ' – ' + hm(last) : '&nbsp;') + '</small></div><div class="track">' + parts.join('') + '</div><div class="figs">' +
         (haveAw ? '<span><b>' + (rec ? fmtDur(rec.desk_s / 60) : '–') + '</b>desk</span><span><b>' + (ed >= 1 ? fmtDur(ed) : '–') + '</b>editor</span>' : '<span></span><span></span>') +
         '<span><b>' + (act ? fmtDur(act) : '–') + '</b>Claude</span><span><b>' + (nC || '–') + '</b>commits</span></div></div>';
@@ -1674,11 +1954,15 @@ svg.trend text{font-size:11px;fill:var(--muted)}
       var t = x.tok.inp + x.tok.cr + x.tok.out; tot.inp += x.tok.inp; tot.cr += x.tok.cr; tot.out += x.tok.out; tot.cost += x.cost; if (!x.priced) tot.priced = false;
       html += '<tr><td><span class="sw" style="background:' + x.p.color + '"></span>' + esc(x.p.name) + '</td><td>' + x.sessions.length + '</td><td>' + fmtTok(x.tok.inp) + '</td><td>' + fmtTok(x.tok.cr) + '</td><td>' + fmtTok(x.tok.out) + '</td>' +
         '<td style="text-align:left"><div class="tokbar" style="width:' + (t / max * 100) + '%"><i style="width:' + (x.tok.inp / t * 100) + '%;background:' + x.p.color + '"></i><i style="width:' + (x.tok.cr / t * 100) + '%;background:' + x.p.color + ';opacity:.35"></i><i style="width:' + (x.tok.out / t * 100) + '%;background:#1b1f24"></i></div></td>' +
-        (havePrices ? '<td>' + DATA.currency + x.cost.toFixed(2) + (x.priced ? '' : '*') + '</td>' : '') + '<td style="text-align:left" class="muted">' + esc(x.models.map(function (m) { return m.replace('claude-', ''); }).join(', ')) + '</td></tr>';
+        (havePrices ? '<td>' + DATA.currency + x.cost.toFixed(2) + (x.priced ? '' : '*') + (x.apportioned ? '†' : '') + '</td>' : '') + '<td style="text-align:left" class="muted">' + esc(x.models.map(function (m) { return m.replace('claude-', ''); }).join(', ')) + '</td></tr>';
     });
     html += '<tr><td><b>Total</b></td><td></td><td><b>' + fmtTok(tot.inp) + '</b></td><td><b>' + fmtTok(tot.cr) + '</b></td><td><b>' + fmtTok(tot.out) + '</b></td><td></td>' + (havePrices ? '<td><b>' + DATA.currency + tot.cost.toFixed(2) + (tot.priced ? '' : '*') + '</b></td>' : '') + '<td></td></tr></tbody></table>' +
       '<div class="legend"><span><i style="background:#888"></i>input (incl. cache writes)</span><span><i style="background:#ccc"></i>cache read</span><span><i style="background:#1b1f24"></i>output</span>' +
       (havePrices ? (tot.priced ? '' : '<span>* some models have no price in the config</span>') : '<span>add prices to ~/.claude/worklog.json for a cost column</span>') + '</div>';
+    // a caveat about which cost figures can be trusted is not a colour key: it marks the rows
+    // it applies to, exactly as * marks unpriced ones, and explains itself under the table
+    if (havePrices && rows.some(function (x) { return x.apportioned; }))
+      html += '<div class="note" style="max-width:70ch">† an estimated cost, not a measured one. These sessions were collected before you upgraded, when one token total covered the whole session however many days it ran; their spend is split across days in proportion to the effort recorded on each. Sessions collected since are exact, and re-collecting a repo replaces the estimate.</div>';
     el('usage').innerHTML = html;
   }
 
@@ -1727,7 +2011,14 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var cur = { week: isoWeek(today), start: dateKey(monday(today)), projects: {}, partial: true };
     var ms = monday(today), me = addDays(ms, 7);
     projects.forEach(function (p) {
-      var act = sum(p.sessions.filter(function (s) { return s.a >= ms && s.a < me; }), function (s) { return s.active; });
+      // by the day the work happened, like every other figure on the page. Filtering the
+      // current week by session START while the archived weeks below it use day attribution
+      // made the last bar read 19.4h against the KPI's 29.4h for the same week.
+      var act = 0;
+      p.sessions.forEach(function (s) {
+        var dm = dayMinutes(s);
+        for (var d = ms; d < me && d <= today; d = addDays(d, 1)) { var k = dateKey(d); if (k in dm) act += dm[k]; }
+      });
       var ed = 0; for (var d = ms; d < me && d <= today; d = addDays(d, 1)) ed += editorFor(p, dateKey(d)) / 60;
       var c = p.commits.filter(function (x) { return x.t >= ms && x.t < me; }).length;
       if (act || ed >= 1 || c) cur.projects[p.name] = { active_min: act, editor_min: ed, commits: c };
@@ -1769,7 +2060,11 @@ svg.trend text{font-size:11px;fill:var(--muted)}
       R.days.slice().reverse().forEach(function (d) {
         var dd = x.byDay[dateKey(d)]; if (!dd || (!dd.commits.length && !dd.sessions.length)) return;
         var items = dd.commits.map(function (c) { return { t: c.t, html: '<code>' + esc(c.hash.slice(0, 7)) + '</code> ' + esc(c.subject) }; })
-          .concat(dd.sessions.map(function (s) { return { t: s.a, html: '<span class="cc">Claude Code</span> ' + hm(s.a) + '–' + hm(s.b) + ' · ~' + fmtDur(s.active) + ' active · ' + s.prompts + ' prompt' + (s.prompts === 1 ? '' : 's') + (s.title ? ' · “' + esc(s.title) + '”' : '') }; }));
+          .concat(dd.sessions.map(function (s) {
+            // this day's share of the session, clamped to this day - the same wording the
+            // Markdown report uses, so the two never tell different stories about one session
+            return { t: s.dayLo, html: '<span class="cc">Claude Code</span> ' + hm(s.dayLo) + '–' + hm(s.dayHi) + ' · ~' + fmtDur(s.dayMin) + ' active · ' + (s.continued ? 'continued' : s.prompts + ' prompt' + (s.prompts === 1 ? '' : 's')) + (s.title ? ' · “' + esc(s.title) + '”' : '') };
+          }));
         items.sort(function (a, b) { return a.t - b.t; });
         html += '<h4>' + esc(dayLabel(d)) + '</h4><ul>' + items.map(function (it) { return '<li><span class="t">' + hm(it.t) + '</span><span>' + it.html + '</span></li>'; }).join('') + '</ul>';
       });
@@ -1777,13 +2072,86 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     el('log').innerHTML = html || '<div class="empty">Nothing to list.</div>';
   }
 
+  // ---------- keep the view across a reload
+  // The page is opened as a file:// URL, so it cannot fetch its own data - reloading is the
+  // only way to pick up a re-render. That is fine as long as it comes back to the same view:
+  // sessionStorage where it is allowed, window.name where it is not (an opaque file origin).
+  function saveView() {
+    var g = el('grid'), f = document.activeElement;
+    var v = JSON.stringify({ p: state.preset.id, s: dateKey(state.start), n: state.n, f: state.filter,
+                             // a preset whose start is still "now" must be recomputed on load, or a
+                             // page left open across midnight comes back lit "This week" showing last week
+                             rel: dateKey(state.start) === dateKey(state.preset.start()),
+                             y: Math.round(window.pageYOffset || 0), x: Math.round(window.pageXOffset || 0),
+                             gx: g ? Math.round(g.scrollLeft) : 0,
+                             fid: (f && f !== document.body && f.id) ? f.id : null });
+    try { sessionStorage.setItem('worklog-view', v); return; } catch (e) { }
+    try { window.name = 'worklog:' + v; } catch (e) { }
+  }
+  function loadView() {
+    var raw = null;
+    try { raw = sessionStorage.getItem('worklog-view'); } catch (e) { }
+    if (!raw && typeof window.name === 'string' && window.name.indexOf('worklog:') === 0) raw = window.name.slice(8);
+    if (!raw) return null;
+    try {
+      var v = JSON.parse(raw), ps = null;
+      PRESETS.forEach(function (x) { if (x.id === v.p) ps = x; });
+      if (ps) { state.preset = ps; state.n = v.n || ps.n; }
+      var d = v.rel && ps ? ps.start() : (v.s ? startOfDay(new Date(v.s + 'T00:00:00')) : null);
+      if (d && !isNaN(+d)) state.start = d;
+      state.filter = v.f || null;
+      return v;
+    } catch (e) { return null; }
+  }
+  // Reloading is how this page stays current, so it must never land mid-read. It defers while
+  // the tab is hidden, while anything is selected (the Log is the copy-out surface), while a
+  // control has focus, and for a few seconds after any pointer or key activity - a day bar's
+  // detail lives in a native title attribute, which takes a deliberate hover to read.
+  var lastAct = 0, dueAt = 0;
+  ['mousemove', 'keydown', 'wheel', 'touchstart'].forEach(function (ev) {
+    window.addEventListener(ev, function () { lastAct = Date.now(); }, { passive: true });
+  });
+  function busy() {
+    if (document.hidden) return true;
+    if (Date.now() - lastAct < 5000) return true;
+    var ae = document.activeElement;
+    if (ae && (/^(INPUT|TEXTAREA)$/.test(ae.tagName) || ae.isContentEditable)) return true;
+    try { var s = getSelection(); if (s && !s.isCollapsed) return true; } catch (e) { }
+    return false;
+  }
+  function reloadNow() { saveView(); location.reload(); }
+  function scheduleReload() {
+    if (!DATA.reload_s) return;
+    dueAt = Date.now() + DATA.reload_s * 1000;
+    setTimeout(function tick() {
+      if (Date.now() < dueAt) { setTimeout(tick, Math.min(dueAt - Date.now(), 5000)); return; }
+      if (busy()) { setTimeout(tick, 2000); return; }
+      reloadNow();
+    }, DATA.reload_s * 1000);
+  }
+  // coming back to a tab that was hidden for an hour should not mean another full interval of
+  // stale data - and a hidden tab's timers are throttled hard, so the tick above may not be due
+  document.addEventListener('visibilitychange', function () {
+    if (!DATA.reload_s || document.hidden) return;
+    if (Date.now() >= dueAt && !busy()) reloadNow();
+  });
+
   // ---------- wire up
-  el('prev').onclick = function () { state.start = addDays(state.start, -state.preset.step); render(); };
-  el('next').onclick = function () { state.start = addDays(state.start, state.preset.step); render(); };
+  el('prev').onclick = function () { this.blur(); state.start = addDays(state.start, -state.preset.step); render(); };
+  el('next').onclick = function () { this.blur(); state.start = addDays(state.start, state.preset.step); render(); };
   el('potName').textContent = DATA.pot || '';
-  el('meta').textContent = 'rendered ' + new Date(DATA.generated).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' · ' + DATA.repo_count + ' repo' + (DATA.repo_count === 1 ? '' : 's') + ' reporting' + (haveAw ? '' : ' · no ActivityWatch data') + ' · refresh the page after a run' + (DATA.version ? ' · worklog v' + DATA.version : '') + (DATA.whats_new ? ' · new: ' + DATA.whats_new : '');
+  el('meta').textContent = 'rendered ' + new Date(DATA.generated).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' · ' + DATA.repo_count + ' repo' + (DATA.repo_count === 1 ? '' : 's') + ' reporting' + (haveAw ? '' : ' · no ActivityWatch data') + (DATA.reload_s ? ' · reloads itself every ' + (DATA.reload_s >= 60 ? Math.round(DATA.reload_s / 60) + ' min' : DATA.reload_s + 's') : ' · refresh the page after a run') + (DATA.version ? ' · worklog v' + DATA.version : '') + (DATA.whats_new ? ' · new: ' + DATA.whats_new : '');
+  var view = loadView();
+  try { history.scrollRestoration = 'manual'; } catch (e) { }   // or the browser races our restore
   renderTrend();
   render();
+  if (view) {
+    if (view.y || view.x) window.scrollTo(view.x || 0, view.y || 0);
+    var g = el('grid'); if (g && view.gx) g.scrollLeft = view.gx;
+    if (view.fid) { var f = el(view.fid); if (f && f.focus) f.focus(); }
+  }
+  window.addEventListener('beforeunload', saveView);
+  scheduleReload();
 })();
 </script>
 </body>
@@ -1797,6 +2165,9 @@ def build_morning(slices, machines, cfg, pot):
     """A one-screen page: yesterday (or the last day with activity), where each project was left, this week so far."""
     now = datetime.now(local_tz())
     today = now.date()
+    idle = int(cfg["idle_minutes"])
+    # This page opens itself every morning, so it reads a day the same way the report does:
+    # by the work done that day, not by which sessions happened to open on it.
     # last day before today with any trace, within a week
     candidate = None
     for back in range(1, 8):
@@ -1805,7 +2176,7 @@ def build_morning(slices, machines, cfg, pot):
         hit = False
         for sl in slices:
             if any(d0 <= (parse_iso(c.get("time")) or d0 - timedelta(1)) <= d1 for c in sl.get("commits", [])) or \
-               any(d0 <= (parse_iso(x.get("start")) or d0 - timedelta(1)) <= d1 for x in sl.get("sessions", [])):
+               any(d in session_day_minutes(x, idle) for x in sl.get("sessions", [])):
                 hit = True
                 break
         if hit:
@@ -1817,13 +2188,23 @@ def build_morning(slices, machines, cfg, pot):
     rows = []
     for sl in slices:
         commits = [c for c in sl.get("commits", []) if parse_iso(c.get("time")) and y0 <= parse_iso(c["time"]) <= y1]
-        sessions = [x for x in sl.get("sessions", []) if parse_iso(x.get("start")) and y0 <= parse_iso(x["start"]) <= y1]
+        sessions, active = [], 0
+        for x in sl.get("sessions", []):
+            mins = session_day_minutes(x, idle).get(y)
+            if not mins:            # a stray single-event burst is not a day's work
+                continue
+            sessions.append(x)
+            active += mins
         if not commits and not sessions and not sl.get("uncommitted"):
             continue
         last = max(sessions, key=lambda x: x.get("end") or "", default=None)
+        last_end = None
+        if last is not None:
+            ends = [min(b, y1) for a, b in session_bursts(last) if b >= y0 and a <= y1]
+            last_end = max(ends) if ends else None
         rows.append({"project": sl["project"], "repo": sl.get("repo") or "", "commits": len(commits),
-                     "active": sum(int(x.get("active_min") or 0) for x in sessions), "sessions": len(sessions),
-                     "last_title": (last or {}).get("title") or "", "last_end": parse_iso((last or {}).get("end")),
+                     "active": active, "sessions": len(sessions),
+                     "last_title": (last or {}).get("title") or "", "last_end": last_end,
                      "last_commit": commits[-1]["subject"] if commits else "", "uncommitted": sl.get("uncommitted") or 0,
                      "branch": (last or {}).get("branch") or ""})
     rows.sort(key=lambda r: (-(r["active"] + r["commits"] * 5), r["project"].lower()))
@@ -1834,7 +2215,10 @@ def build_morning(slices, machines, cfg, pot):
     for sl in slices:
         w = week.setdefault(sl["project"], {"commits": 0, "active": 0})
         w["commits"] += sum(1 for c in sl.get("commits", []) if parse_iso(c.get("time")) and parse_iso(c["time"]) >= w0)
-        w["active"] += sum(int(x.get("active_min") or 0) for x in sl.get("sessions", []) if parse_iso(x.get("start")) and parse_iso(x["start"]) >= w0)
+        for x in sl.get("sessions", []):
+            for d, mins in session_day_minutes(x, idle).items():
+                if d >= monday:
+                    w["active"] += mins
     week_rows = sorted(((k, v) for k, v in week.items() if v["commits"] or v["active"]), key=lambda kv: -(kv[1]["active"] + kv[1]["commits"] * 5))
     # machine facts for that day
     aw_days, presence = {}, []

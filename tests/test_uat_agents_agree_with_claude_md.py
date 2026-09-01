@@ -47,7 +47,8 @@ class UatWriterPushesToTheHub(unittest.TestCase):
         self.assertIn("push", WRITER.lower())
 
     def test_it_defers_to_the_claude_md_block_for_the_contract(self):
-        """The block is generated verbatim from the hub's docs/AGENT_PROMPT.md and states a contract
+        """The block is generated from the hub's docs/AGENT_PROMPT.md, merged with the two sections
+        from its docs/toolkit-uat-block.md (v4.8), and states a contract
         the endpoint enforces. A second shipped copy would drift, and silently."""
         self.assertIn("Writing UAT", WRITER)
         self.assertIn("CLAUDE.md", WRITER)

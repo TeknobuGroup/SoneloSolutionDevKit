@@ -2,7 +2,62 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
-## Changed in this cycle (kit v4.6)
+## Changed in this cycle (kit v4.8)
+
+### Changed: the UAT block is re-synced with the hub, and one instruction was wrong
+- UAT-4.8-1: A freshly generated `CLAUDE.md` says a same-`source_ref` re-push **refreshes** that case. The words "updates nothing and creates nothing" appear nowhere - that was the old text, and a session that believed it would never re-push a rebuilt feature.
+- UAT-4.8-2: The block carries the sections the kit's copy had lost: `Fixing what a tester found`, `Order cases the way a tester must run them`, `Push the whole module, not a subset`, and the pointer to the read/update tools.
+- UAT-4.8-3: Console output a tester pasted is described as withheld by default, with `include_console` named as the opt-in. It comes from the client's live system and routinely carries access tokens.
+- UAT-4.8-4: The repo-specific tail (`How this repo is wired`, the slug, the one permitted host) survived the re-sync and still names this repo's project.
+- UAT-4.8-5: `refresh` on a repo at 4.7 replaces the managed UAT block in place and leaves the repo's own text outside the markers untouched.
+
+### New: name the login, so a tester can work in batches
+- UAT-4.8-6: The block tells a session to put the login profile first in the module name, with `"Supplier — Quotes"` style examples, and says the hub groups by module so the batching is free.
+- UAT-4.8-7: It reconciles that with the existing numbering rule rather than leaving them to fight: a numbered module reads `"01. Supplier — Quotes"`.
+- UAT-4.8-8: It tells a session to name the login again as the first instruction in the steps, and to say what the account must contain - "a supplier user with at least one open quote", not "a user".
+- UAT-4.8-9: One login per case: a case needing a supplier to submit and an admin to approve is two cases.
+- UAT-4.8-10: Credentials never appear in a case - the profile is named, an email and password never are.
+
+### New: verify the push landed
+- UAT-4.8-11: The block tells a session to read the module back after pushing and report the number the hub returned, not the number it sent.
+- UAT-4.8-12: The `created` trap is explained: it counts inserts and `source_ref` refreshes together, so a clean re-push of twelve unchanged cases reports twelve and is not twelve duplicates.
+- UAT-4.8-13: There is exactly one "If the push is refused" section and exactly one "Always set source_ref" section. The incoming block was written to be dropped in unchanged and would have produced two of each.
+
+### New: never print the key
+- UAT-4.8-14: The block forbids printing the key, a prefix of it, or "the key starts with".
+- UAT-4.8-15: The Windows registry route captures the value into a variable and passes it as an environment variable; the recipe contains no `echo`, and `grep -a` is called out because without it the match silently fails and reads as "no key set".
+- UAT-4.8-16: With a real key in the environment, nothing the kit generates contains it (the existing `NoLiteralKeyEverWritten` sweep still passes over the enlarged block).
+- UAT-4.8-17: `check` and `doctor` report kit v4.8.
+
+## Changed in this cycle (worklog v1.18)
+
+### Changed: work is reported on the day it happened
+- UAT-1.18-1: Leave a Claude Code session open overnight and work in it the next day. The next day's row for that project shows a session count, Claude Code time and a cost. Before 1.18 it showed commits and editor time with `0 sessions` and `–` in both other columns.
+- UAT-1.18-2: The same session's effort no longer piles onto the day it opened. In a 28-day range, its minutes appear against each day it actually worked.
+- UAT-1.18-3: The invariant of UAT-1.17-2 and UAT-1.17-3 still holds: agent-hours tile == projects-table column == the report's `Est. active` column, for the same window.
+- UAT-1.18-4: For any single session, the per-day figures sum to that session's `active_min` exactly - no minute is lost or invented by the split. This is checked by test for both implementations; on screen it means a project's At-a-glance row adds up to its Summary figure.
+- UAT-1.18-5: A day's `first – last trace` is clamped to that day. A session opened last week no longer drags today's first trace back to the day it opened.
+- UAT-1.18-6: The Days section draws bars on days a spanning session worked. Those bars were previously drawn nowhere while the elapsed figure beside them counted the same time.
+- UAT-1.18-7: A session's detail line reads `continued` instead of a prompt count on days after the one it opened.
+
+### New: cost per day, and honesty about which figures are estimates
+- UAT-1.18-8: A range covering one day of a multi-day session shows only that day's tokens and cost, not the whole session's.
+- UAT-1.18-9: A cost that was apportioned rather than measured is marked `†` on its own row, the way `*` already marks a model with no price, and the mark is explained under the table - in the report and on the dashboard alike. You can tell WHICH rows to discount, not just that some exist. After re-collecting those repos the marks disappear, because the per-day map then exists.
+- UAT-1.18-9a: With no prices configured there is no cost column, and no `†` note appears at all - a footnote explaining a mark that is nowhere on screen is worse than none.
+- UAT-1.18-10: The per-day token buckets sum to the session's own `tokens` total - splitting them loses nothing.
+
+### New: the dashboard keeps itself current
+- UAT-1.18-11: Leave the dashboard open. Within about three minutes of a session's collection run, the page reflects it without being touched. Three minutes, not one: the collector itself re-collects at most every three minutes, so a faster page reload only costs the reader their place.
+- UAT-1.18-12: The reload keeps the range preset, the selected project filter and the scroll position. Selecting a project, scrolling to the Agents card and waiting through a reload leaves you where you were.
+- UAT-1.18-13: A hidden tab does not reload; it reloads on the next tick after it becomes visible.
+- UAT-1.18-14: `"dashboard_reload_s": 0` in `~/.claude/worklog.json` turns it off, and the header goes back to saying `refresh the page after a run`.
+
+### Fixed: two agents writing the pot at once
+- UAT-1.18-15: With sessions live in several repos, every project's slice keeps updating. Before 1.18 a `PermissionError` on `os.replace` could leave one project's slice stale for hours while the others carried on.
+- UAT-1.18-16: `ls ~/Worklog/slices` shows no `.tmp-*.json`. Temp files are suffixed `.tmp` so the pot's own `*.json` globs - including the sweep that deletes superseded slices - cannot see them.
+- UAT-1.18-17: `status` reports worklog 1.18, and the session-start message names what changed.
+
+## Changed in a previous cycle (kit v4.6)
 
 ### Fixed: the commands the kit prints run in PowerShell
 - UAT-4.6-1: In PowerShell, copy the Vercel line out of a generated `PRELIVE.md` and run it. It executes (or fails on its own arguments) rather than dying with `can't open file '...\~\.claude\...': No such file or directory`.

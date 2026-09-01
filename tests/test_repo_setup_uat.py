@@ -203,8 +203,9 @@ class EnvExampleDocumentsTheKey(unittest.TestCase):
 
 
 class ClaudeMdUatSection(unittest.TestCase):
-    """The block is a copy of uat-hub's docs/AGENT_PROMPT.md: it states a field contract the
-    endpoint enforces, so the field names are pinned rather than left to a future paraphrase."""
+    """The block is assembled from uat-hub's docs/AGENT_PROMPT.md plus the two sections it
+    handed over in docs/toolkit-uat-block.md (v4.8): it states a field contract the endpoint
+    enforces, so the field names are pinned rather than left to a future paraphrase."""
 
     def test_written_into_a_fresh_claude_md_with_the_slug(self):
         root = make_temp_dir(self)
