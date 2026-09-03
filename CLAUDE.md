@@ -60,7 +60,7 @@ Run the due reviewers in one message, in parallel; `/post-change` does this and 
 - Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.
 - Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.
 - Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.
-- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.
+- The linter runs on the edited file after every edit (PostToolUse hook) and reports only the errors your change added on top of what the repo already accepts. Fix those before moving on; never disable a rule, and never raise the lint baseline, to make one go away. Whole-project type checking runs on push (`.githooks/checks`) and in CI - per edit it cost seconds and told nobody anything.
 - Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.
 - "Done" means: reviewers' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.
 
