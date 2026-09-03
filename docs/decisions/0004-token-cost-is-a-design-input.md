@@ -81,7 +81,8 @@ Cost is declared in the artefacts the kit ships, where it cannot be forgotten:
 
 ## Still open (v4.4)
 
-Bundle budgets, per the parked plan. And the measurement this ADR argues from is currently a
-one-off script: the worklog collects per-model tokens but records no per-session context
-high-water mark, so "which session sat at 400k for three hours" is still not answerable from the
-report. Both belong in the same release.
+Bundle budgets, per the parked plan.
+
+**Closed (v4.9/1.19):** The per-session context high-water mark was captured in ADR-0008. Worklog now records
+`context_max` per session and `tokens_by_day_by_band_by_model` for main-thread requests, so "which session sat
+at 400k for three hours" is answerable from the report and morning page. The budget gate remains future work.
