@@ -3,6 +3,8 @@ name: CI gates
 on:
   pull_request:
     branches: [main]
+permissions:
+  contents: read
 jobs:
   gates:
     name: gates
