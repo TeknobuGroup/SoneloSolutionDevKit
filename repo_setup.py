@@ -60,7 +60,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.9"
+VERSION = "4.10"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -1347,9 +1347,19 @@ exit 0
 
 POST_EDIT_SH = r'''#!/bin/sh
 # sonelo-devkit pipeline: PostToolUse hook on Edit/Write/MultiEdit.
-# Type-checks and lints the edited file's project so errors surface immediately, and nudges
-# once per branch when a full-pipeline path is edited without an impact report on record.
-# Exit 2 feeds the output back to Claude.
+# Lints the edited file and reports only what this change ADDED on top of what the repo already
+# accepts, then nudges once per branch when a full-pipeline path is edited with no impact report
+# on record. Exit 2 feeds the output back to Claude.
+#
+# Two things are deliberately NOT here, both measured rather than guessed (ADR-0009):
+#   * A whole-project type check. It ran on every single edit, and against a solution-style
+#     tsconfig ("files": [], "references": [...]) it compiles the empty file list - seconds per
+#     edit for no signal whatever. Types are checked by .githooks/checks on pre-push and by CI,
+#     which is where a whole-project check belongs.
+#   * Reporting lint errors the session did not cause. A repo with an eslint ratchet carries
+#     hundreds of accepted errors; shouting about them after every edit made the hook exit 2 on
+#     more than half of all edits and sent the session off fixing debt it had not introduced.
+#     Only a rise above the accepted level is reported.
 { [ -n "$SONELO_SKIP_HOOKS" ] || [ -n "$TEKNOBU_SKIP_HOOKS" ]; } && exit 0
 input=$(cat)
 py=python
@@ -1375,17 +1385,107 @@ Full-pipeline path touched ($p). The impact-analyst report is due for this chang
 esac
 case "$p" in
   *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts)
-    if [ -f tsconfig.json ]; then
-      tsc_out=$(timeout 90 npx --no-install tsc --noEmit -p tsconfig.json 2>&1 | grep -v '^$' | head -40)
-      [ -n "$tsc_out" ] && out="$out
-[typecheck]
-$tsc_out"
-    fi
     if [ -f eslint.config.js ] || [ -f eslint.config.mjs ] || [ -f eslint.config.ts ] || [ -f .eslintrc.json ] || [ -f .eslintrc.cjs ] || [ -f .eslintrc.js ]; then
-      es_out=$(timeout 60 npx --no-install eslint -- "$file" 2>&1 | grep -v '^$' | head -40)
-      [ -n "$es_out" ] && out="$out
+      # Call the installed binary directly. `npx` re-resolves the package on every invocation,
+      # which measured at roughly twice the wall clock for the identical result. The report goes
+      # to a file rather than a pipe because the reader below takes its program on stdin.
+      mkdir -p .claude/state/lint 2>/dev/null
+      # Per-process: concurrent sessions in one repo must not read each other's report.
+      es_file=.claude/state/lint/.report-$$.json
+      rm -f "$es_file" 2>/dev/null
+      if [ -f node_modules/eslint/bin/eslint.js ]; then
+        timeout 60 node node_modules/eslint/bin/eslint.js -f json -- "$file" > "$es_file" 2>/dev/null
+      else
+        timeout 60 npx --no-install eslint -f json -- "$file" > "$es_file" 2>/dev/null
+      fi
+      if [ -s "$es_file" ]; then
+        tracked=0
+        git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 && tracked=1
+        es_out=$($py - "$p" "$tracked" "$es_file" <<'PYEOF' 2>/dev/null
+import hashlib, json, os, sys
+
+path, tracked = sys.argv[1], sys.argv[2] == "1"
+try:
+    with open(sys.argv[3], encoding="utf-8") as fh:
+        report = json.load(fh)
+except Exception:
+    raise SystemExit
+errors = [m for r in (report or []) for m in (r.get("messages") or []) if m.get("severity") == 2]
+current = len(errors)
+
+rel = path
+cwd = os.getcwd().replace("\\", "/")
+# Case-insensitive: Windows gives back "C:/..." for a cwd Python reports as "c:/...", and a
+# missed strip leaves rel absolute, matching no baseline entry and reporting old errors as new.
+if rel.lower().startswith(cwd.lower() + "/"):
+    rel = rel[len(cwd) + 1:]
+
+
+def accepted_from_baseline():
+    """A ratchet baseline is authoritative: a file it does not list accepts zero."""
+    for name in ("scripts/eslint-baseline.json", ".eslint-baseline.json", "scripts/lint-baseline.json"):
+        try:
+            with open(name, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        counts = doc.get("counts")
+        if not isinstance(counts, dict):
+            counts = {k: v for k, v in doc.items() if isinstance(v, int)}
+        if not counts:
+            continue
+        value = counts.get(rel)
+        return value if isinstance(value, int) else 0
+    return None
+
+
+cache = os.path.join(".claude", "state", "lint", hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16])
+try:
+    with open(cache, encoding="utf-8") as fh:
+        seen = int(fh.read().strip())
+except Exception:
+    seen = None
+
+accepted = accepted_from_baseline()
+# A baseline is a ceiling that only ever falls, so it can sit above what the file really has.
+# The lower of the two is the honest bar: never nag about debt, but catch every error added.
+if accepted is None:
+    # No baseline. A file already in git arrived with whatever it has, so record that and stay
+    # quiet; a file this session created owns every error in it.
+    accepted = seen if seen is not None else (current if tracked else 0)
+elif seen is not None:
+    accepted = min(accepted, seen)
+
+try:
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as fh:
+        fh.write(str(current))
+except Exception:
+    pass
+
+if current <= accepted:
+    raise SystemExit
+
+lines = [
+    "%s: lint errors went from %d to %d, so this change added %d."
+    % (rel, accepted, current, current - accepted),
+    "Every error in the file is listed; the ones on lines you just wrote are yours. The other"
+    " %d were already accepted here - leave them alone." % accepted,
+]
+for m in errors[:12]:
+    lines.append("  %s:%s  %s  %s" % (m.get("line"), m.get("column"), m.get("message"), m.get("ruleId") or ""))
+if len(errors) > 12:
+    lines.append("  ... %d more" % (len(errors) - 12))
+print("\n".join(lines))
+PYEOF
+)
+        [ -n "$es_out" ] && out="$out
 [lint]
 $es_out"
+      fi
+      rm -f "$es_file" 2>/dev/null
     fi
     ;;
 esac
@@ -1426,7 +1526,7 @@ BUILTIN_PIPELINE = {
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
 }
-PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The type checker and linter run on every edit (PostToolUse hook). Fix what they report before moving on; never disable a rule to pass.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
+PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The linter runs on the edited file after every edit (PostToolUse hook) and reports only the errors your change added on top of what the repo already accepts. Fix those before moving on; never disable a rule, and never raise the lint baseline, to make one go away. Whole-project type checking runs on push (`.githooks/checks`) and in CI - per edit it cost seconds and told nobody anything.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
 
 UPDATE_COMMAND_MD = '''---
 description: Update the Sonelo kit and worklog on this machine to the latest release, then offer to refresh this repo
@@ -2133,7 +2233,7 @@ def merge_settings_hooks(root, rep):
     if changed:
         if not rep.dry:
             write(path, json.dumps(data, indent=2) + "\n")
-        rep.note("hooks registered (PreToolUse migrations guard, PostToolUse typecheck+lint, Stop gate, SessionStart brief)", path)
+        rep.note("hooks registered (PreToolUse migrations guard, PostToolUse lint-on-edit, Stop gate, SessionStart brief)", path)
     else:
         rep.note("unchanged (hooks present)", path)
 
