@@ -29,6 +29,23 @@ Master list of user-observable behaviours, kept current by uat-writer. Per-PR do
 - UAT-4.8-16: With a real key in the environment, nothing the kit generates contains it (the existing `NoLiteralKeyEverWritten` sweep still passes over the enlarged block).
 - UAT-4.8-17: `check` and `doctor` report kit v4.8.
 
+## Changed in this cycle (worklog v1.19)
+
+### New: cost and context reporting
+- UAT-1.19-1: Weekly report shows new "## Cost and context" section when prices are configured and range contains collected data. Line reads: `$X.XX · Y% elevated context (Z% very high) · W% subagents.`
+- UAT-1.19-2: Context band breakdown is bucketed by request size: "normal" < 150k tokens (input + cache_create + cache_read), "elevated" 150k–799,999, "very high" >= 800k. Each band's cost sums independently.
+- UAT-1.19-3: Subagent share is calculated from requests that appear in a sub_file's own "usage" dict; main-thread requests (those in rec["usage"] but not in any sub_file) go to their own context band. Subagent tokens always contribute to subagent % regardless of their context size.
+- UAT-1.19-4: Sessions collected before v1.19 contribute zero to context band reporting (tokens_by_day_by_band_by_model did not exist). Report shows "not collected" or omits the line, not a zero-cost section, for ranges containing only legacy sessions.
+- UAT-1.19-5: High-context session list appears when any session in range hit 150k+ context. Sorted by context_max descending; shows top 10; displays `project — title (tokens).`
+- UAT-1.19-6: Morning page includes cost context line (same wording as weekly report) when prices are configured and current day has data with band info available.
+- UAT-1.19-7: Morning page includes machine context note at bottom footer: model default, compaction cap, and 1M context disable status from ~/.claude/settings.json (or omitted if file absent/unparsable).
+- UAT-1.19-8: Machine context note reads: `This machine: model default \`sonnet-4\`; compaction cap 200000; 1M context not disabled.` Caps "not disabled" is shown only if setting is off AND a model/cap is present (all-defaults case does not warrant a note).
+
+### Re-test required: cost reporting sections
+- **UAT-1.18-8**: Cost per day visibility. RE-TEST REQUIRED (2026-09-03) — cost breakdown now splits by context band; per-day figures also break down by band in underlying data. Verify single-day reports show cost for that day only, no band contamination from adjacent days.
+- **UAT-1.18-9**: Cost apportionment marking with `†`. RE-TEST REQUIRED (2026-09-03) — context band report uses the same per-session per-day maps; ensure mark appears only for apportioned sessions and is consistent with main cost column.
+- **UAT-1.18-10**: Per-day token accuracy. RE-TEST REQUIRED (2026-09-03) — band buckets sum correctly per day; elevated + normal + very high must equal the total for that day.
+
 ## Changed in this cycle (worklog v1.18)
 
 ### Changed: work is reported on the day it happened
@@ -253,6 +270,16 @@ UAT-4 (CI gates): no change, still tests the ci-gates workflow.
 | UAT-98 | Unit tests — all 98+ pass | Run `python -m unittest discover -s tests` | Output shows "Ran 98 tests" (or higher) and "OK" with no FAIL or ERROR lines |
 | UAT-99 | Unit tests — pipeline-state and stop-gate tests | Run pipeline-state test suite | All tests pass covering signature computation, verdict matching, block counting, and fallback logic |
 | UAT-100 | Unit tests — auto-update and release tests | Run worklog update tests | All tests pass covering version checks, release download logic, consent flow, and offline handling |
+| UAT-101 | Cost and context — section appears | Render weekly report with prices configured and sessions collected in v1.19+; check for "## Cost and context" section | Section header appears with breakdown line: `$X.XX · Y% elevated · Z% subagents` format |
+| UAT-102 | Cost and context — band calculation | Render report; inspect band percentages in cost context line | Elevated % = (elevated cost + very high cost) / total * 100; very high % = very high cost / total * 100 |
+| UAT-103 | Cost and context — legacy sessions excluded | Render report with mixed v1.18 and v1.19 sessions in range; band section appears only if any v1.19 data exists | Report shows context line only for days/sessions with band data; no fallback estimates for pre-1.19 sessions |
+| UAT-104 | Cost and context — high-context session list | Render report covering a session that reached 150k+ context; check for session list | Section reads "Sessions that reached elevated context (150k+ tokens) in this range:" followed by top 10 sorted by context_max descending |
+| UAT-105 | Cost and context — session line format | Render report and inspect a high-context session entry | Line reads: `- project-name — "Session title (first 80 chars)" (123,456 tokens)` (comma-formatted token count) |
+| UAT-106 | Morning page — cost context line appears | Render morning.html with prices configured and current day has band data | Day-name section includes cost context line: `$X.XX · Y% elevated · Z% subagents.` (trailing period) |
+| UAT-107 | Morning page — machine context note in footer | Render morning.html; scroll to footer | Footer ends with: `This machine: model default \`model-name\`; compaction cap N; [1M context status].` |
+| UAT-108 | Machine context — model default visibility | Render morning.html with ~/.claude/settings.json containing `"model": "haiku"`; check footer | Machine note shows: `model default \`haiku\`` |
+| UAT-109 | Machine context — compaction cap visibility | Render morning.html with ~/.claude/settings.json containing `"autoCompactWindow": 250000` | Machine note shows: `compaction cap 250000` |
+| UAT-110 | Machine context — no settings file gracefully handled | Delete ~/.claude/settings.json and render morning.html | Footer omits machine context line; no error message; page renders normally |
 
 ## Client-Side Verification (Real accounts, live integrations, third-party services)
 

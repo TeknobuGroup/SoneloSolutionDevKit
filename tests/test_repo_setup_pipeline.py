@@ -194,7 +194,7 @@ class AgentModelsDeclared(unittest.TestCase):
     silently inherit the session's Opus. The three that gate correctness deliberately
     declare nothing and inherit - pinned here so nobody "tidies" them onto a cheap model."""
 
-    SONNET = ("design-reviewer", "test-writer", "test-runner", "qa-runner")
+    SONNET = ("design-reviewer", "test-writer", "test-runner", "qa-runner", "Explore")
     HAIKU = ("changelog-scribe", "docs-maintainer", "uat-writer", "uat-plan-maintainer")
     INHERITS = ("code-reviewer", "security-reviewer", "impact-analyst")
 

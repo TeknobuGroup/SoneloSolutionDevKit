@@ -60,7 +60,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.8"
+VERSION = "4.9"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -1398,6 +1398,7 @@ exit 0
 
 
 BUILTIN_PIPELINE = {
+    '.claude/agents/Explore.md': '---\nname: Explore\ndescription: Read-only search agent for broad fan-out searches — when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn\'t review or audit it. Specify search breadth: "medium" for moderate exploration, "very thorough" for multiple locations and naming conventions. Use before planning or implementing.\nmodel: sonnet\ntools: Read, Grep, Glob\n---\n\nYou search a codebase quickly and report what you find without getting buried in results.\n\n1. **Grep to locate.** When you\'re hunting a symbol, function, class, import, or filename pattern, grep first to find all occurrences and their counts. Use the minimum context needed to answer the question (usually just line numbers). Glob for directory/naming patterns.\n2. **Read only what matters.** You now have line numbers. Read only the surrounding code that teaches you something; do not read whole files. Focus on answering the question, not understanding the entire module.\n3. **Report what you found.** One or two sentences per finding, with file:line references. If the search was broad, bucket the findings (e.g., "appears in 3 utility functions" + "appears in 12 test cases") rather than listing each one.\n4. **When in doubt, ask.** If the question is ambiguous or would need you to inspect a lot of code before you can answer, say what you\'d need to clarify, rather than guessing.\n\nNever edit files. Never make recommendations for changes — you locate code and explain what you find.\n',
     '.claude/agents/design-reviewer.md': DESIGN_REVIEWER_MD,
     '.claude/agents/impact-analyst.md': '---\nname: impact-analyst\ndescription: Before any full-pipeline change, maps what the change touches and what depends on it. Use in plan mode, before editing. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git log:*), Bash(git diff:*)\n---\n\nYou map blast radius. The user is about to change something; your job is to say what else moves.\n\n1. From the request, name the files and symbols that will change.\n2. For each, find every importer and caller (`Grep` for the symbol and the module path). List them with file:line.\n3. Find shared contracts the change crosses: database tables and columns, RLS policies, edge-function request/response shapes, shared types, environment variables, routes.\n4. Name the tests that cover the touched code, and the touched code that has no tests.\n5. Name what could break that nobody asked about: callers with different assumptions, a null that becomes possible, an ordering that matters, a migration that needs a backfill.\n\nReport as: **Touches** (files) · **Depends on it** (callers, with file:line) · **Contracts crossed** · **Test coverage** (covered / uncovered) · **Risks** (one line each, most likely first) · **Recommended order of edits**. Short lines. If the change is genuinely local, say so in two lines and stop.\n',
     '.claude/agents/code-reviewer.md': '---\nname: code-reviewer\ndescription: Reviews a change for correctness - logic errors, unhandled states, regressions in neighbouring code, and whether it does what was asked and nothing else. Use after implementing, before tests. Reports; never edits.\ntools: Read, Grep, Glob, Bash(git status:*), Bash(git ls-files:*), Bash(git diff:*), Bash(git log:*)\n---\n\nYou review the diff (`git diff` against the base branch, plus any untracked files - `git status` and `git ls-files --others --exclude-standard` list them) for whether it is *right*, not whether it is pretty. You never edit.\n\nBudget your reading. The diff is the source, not the repo: read the files it touches, and follow callers only as far as the change actually reaches. Do not sweep the repo by reading it - grep to find callers, then read only the ones the change reaches. Do not read unrelated modules, and do not open a file you have no reason to suspect. Breadth is what costs; depth where the change lands is the job.\n\nWork through, in order, and stop escalating once something fails:\n\n1. **Does it do what was asked, and only that?** Compare the change to the request. Anything extra is a finding; anything missing is a finding.\n2. **Logic.** Off-by-ones, inverted conditions, wrong operator, async not awaited, a promise whose rejection goes nowhere, state updated from stale values, a loop that mutates what it iterates.\n3. **States the code does not handle.** Null, empty, one, many, duplicate, concurrent, slow, failed. For every external call: what happens when it fails, and does the user see it?\n4. **Neighbours.** Read the callers of anything whose signature or behaviour changed. A regression in a file the diff does not touch is the finding that matters most.\n5. **Data.** Migrations append-only; RLS on new tables; types regenerated; no secret in code; no `service_role` in a client path.\n6. **Tests.** Is the changed behaviour tested? Would the tests fail if the change were reverted? A test that cannot fail is not a test.\n\nReport findings ordered by user cost. For each: `file:line` · one sentence naming the defect · who it costs and how · the specific fix · severity **blocks the task** / **hurts the task** / **inconsistency** / **polish**. End with one line: `VERDICT: clear` or `VERDICT: blocked (<n> blocking)`. If it is genuinely fine, say so in a line; do not manufacture findings.\n',
@@ -3440,6 +3441,31 @@ def cmd_update(args):
     say("Repos pick the new worklog up on open; run `refresh` in a repo to take the new agents, commands and hooks.")
 
 
+def machine_line(settings_path=None):
+    """This machine's model default, compaction cap and 1M-context flag, the way doctor reports
+    them. Settings, never secrets: it names the model, the window, and whether the 1M disable
+    flag is set - and nothing else out of `env`. The twin of worklog_agent's
+    machine_context_note; the two files never import each other, so the guard lives twice."""
+    try:
+        user_settings = json.loads(Path(settings_path or "~/.claude/settings.json")
+                                   .expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        user_settings = {}
+    # json.loads is happy to return a list, a string or a number, and `env` is whatever the file
+    # says it is - none of which have .get. Guarding the parse alone left doctor dying on the very
+    # machine whose settings are malformed, which is the machine you ran doctor on.
+    if not isinstance(user_settings, dict):
+        user_settings = {}
+    model = user_settings.get("model")
+    window = user_settings.get("autoCompactWindow")
+    env = user_settings.get("env")
+    disabled = str((env if isinstance(env, dict) else {}).get("CLAUDE_CODE_DISABLE_1M_CONTEXT") or "") == "1"
+    return "Machine    model %s; compaction %s; 1M context %s" % (
+        ("default `%s`" % model) if model else "no default set",
+        ("cap %s" % window) if window else "no cap set",
+        "disabled" if disabled else "not disabled" if (model or window) else "—")
+
+
 def cmd_doctor(args):
     """Everything the setup needs, as present/absent. Never prints a value."""
     say("kit        v%s at %s%s" % (VERSION, INSTALLED, "" if INSTALLED.exists() else "  (not installed - run install)"))
@@ -3481,6 +3507,7 @@ def cmd_doctor(args):
     if not os.environ.get("HOME") and not os.environ.get("USERPROFILE"):
         say("           neither HOME nor USERPROFILE is set: the path in .mcp.json cannot resolve, "
             "so the MCP server will not start and sessions fall back to the HTTP endpoint")
+    say(machine_line())
     root = repo_root(args.repo) if hasattr(args, "repo") else repo_root()
     if root:
         items, _ = status(root)
