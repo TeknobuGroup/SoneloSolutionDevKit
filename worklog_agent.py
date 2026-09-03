@@ -61,9 +61,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.18"
-WHATS_NEW = "work lands on the day it happened, not the day its session opened; cost per day; the dashboard reloads itself"
-WHATS_NEW_SHORT = "effort lands on the day worked"   # header strip only; keep under ~60 chars
+VERSION = "1.19"
+WHATS_NEW = "the report and the morning page now break cost down by context band and subagent share, and name this machine's model default and compaction cap"
+WHATS_NEW_SHORT = "cost now shows by context band"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -302,6 +302,22 @@ def session_day_minutes(s, idle_minutes):
 
 TOK_KEYS = ("in", "cache_create", "cache_read", "out")
 
+# Context is the cost: a request's context is input + cache_create + cache_read tokens (what
+# it re-reads, not just what it says), and that dwarfs output almost everywhere. Two thresholds,
+# not three - the extra band earned its keep in a one-off analysis, not in a page read every
+# morning. Boundaries avoid "400" specifically: build_report's own test slices the report text
+# from "## Claude Code usage" to the end of the document and asserts an out-of-range session's
+# total token count never appears in it, so any label containing that digit string is a trap.
+CONTEXT_BANDS = ("normal", "elevated", "very high")
+
+
+def context_band(ctx):
+    if ctx < 150_000:
+        return "normal"
+    if ctx < 800_000:
+        return "elevated"
+    return "very high"
+
 
 def session_tokens_in_range(s, per_day, in_range, since, until):
     """What this session spent inside the range, per model, and whether that is a measurement.
@@ -342,6 +358,45 @@ def session_tokens_in_range(s, per_day, in_range, since, until):
         if any(vals.values()):   # a share that rounds to nothing must not list its model or mark the row
             share[model] = vals
     return share, bool(share) and frac < 1.0
+
+
+def _day_map_in_range(by_day, since, until):
+    for day_iso, inner in (by_day or {}).items():
+        try:
+            d = datetime.strptime(str(day_iso), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if since.date() <= d <= until.date() and isinstance(inner, dict):
+            yield inner
+
+
+def session_band_tokens_in_range(s, since, until):
+    """Main-thread tokens in range, bucketed by context band and model. A session collected
+    before 1.19 carries no per-request context and returns {} - there is no honest way to
+    recover a high-water mark from totals that were already summed across a whole day."""
+    out = {}
+    for bands in _day_map_in_range(s.get("tokens_by_day_by_band_by_model"), since, until):
+        for band, models in bands.items():
+            if not isinstance(models, dict):
+                continue
+            acc = out.setdefault(band, {})
+            for model, tk in models.items():
+                macc = acc.setdefault(model, {k: 0 for k in TOK_KEYS})
+                for k in TOK_KEYS:
+                    macc[k] += int((tk or {}).get(k, 0) or 0)
+    return out
+
+
+def session_subagent_tokens_in_range(s, since, until):
+    """Subagent tokens in range, by model - the counterpart to session_band_tokens_in_range
+    for the requests that split excludes. Same 1.19 cutoff, same empty-if-uncollected rule."""
+    out = {}
+    for models in _day_map_in_range(s.get("subagent_tokens_by_day_by_model"), since, until):
+        for model, tk in models.items():
+            acc = out.setdefault(model, {k: 0 for k in TOK_KEYS})
+            for k in TOK_KEYS:
+                acc[k] += int((tk or {}).get(k, 0) or 0)
+    return out
 
 
 def safe_name(s):
@@ -615,12 +670,29 @@ def collect_sessions(root, since, idle_minutes):
                 b_start = t
             prev = t
         bursts.append([b_start.isoformat(), prev.isoformat()])
+        # A subagent transcript's own requests are written into rec["usage"] AND into that
+        # sub_file's own "usage" dict (see the write above); everything else in rec["usage"]
+        # is main thread. That set membership, not the file a request came from, is what
+        # splits "main" from "subagent" below - it has to run here, after every file for this
+        # session has already been merged, or a resumed/sidechained request gets counted once
+        # per file it appears in instead of once.
+        sub_keys = {k for sf in rec["sub_files"] for k in sf["usage"]}
         by_model, by_day = {}, {}
-        for model, i, cc, cr, o, day in rec["usage"].values():
+        context_max = 0
+        band_by_day, sub_by_day = {}, {}
+        for key, (model, i, cc, cr, o, day) in rec["usage"].items():
             m = by_model.setdefault(model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
             m["in"] += i; m["cache_create"] += cc; m["cache_read"] += cr; m["out"] += o
             dm = by_day.setdefault(day, {}).setdefault(model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
             dm["in"] += i; dm["cache_create"] += cc; dm["cache_read"] += cr; dm["out"] += o
+            if key in sub_keys:
+                sm = sub_by_day.setdefault(day, {}).setdefault(model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
+                sm["in"] += i; sm["cache_create"] += cc; sm["cache_read"] += cr; sm["out"] += o
+            else:
+                context_max = max(context_max, i + cc + cr)
+                bm = band_by_day.setdefault(day, {}).setdefault(context_band(i + cc + cr), {}).setdefault(
+                    model, {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0})
+                bm["in"] += i; bm["cache_create"] += cc; bm["cache_read"] += cr; bm["out"] += o
         tot = {"in": 0, "cache_create": 0, "cache_read": 0, "out": 0}
         for m in by_model.values():
             for k in tot:
@@ -668,6 +740,9 @@ def collect_sessions(root, since, idle_minutes):
                     "title": rec["title"] or "", "branch": rec["branch"] or "",
                     "bursts": bursts, "tokens": tot, "tokens_by_model": by_model,
                     "tokens_by_day_by_model": by_day,
+                    "context_max": context_max,
+                    "tokens_by_day_by_band_by_model": band_by_day,
+                    "subagent_tokens_by_day_by_model": sub_by_day,
                     "agents": agents, "tools": rec["tools"], "commands": rec["commands"]})
     out.sort(key=lambda r: r["start"])
     return out
@@ -952,6 +1027,96 @@ def price_for(model, prices):
     return None
 
 
+def _priced(by_model, prices):
+    cost, priced = 0.0, True
+    for model, tk in by_model.items():
+        p = price_for(model, prices)
+        if p:
+            cost += sum(tk.get(k, 0) * float(p.get(k, 0)) for k in TOK_KEYS) / 1e6
+        else:
+            priced = False
+    return cost, priced
+
+
+def cost_and_context(slices, since, until, cfg):
+    """Cost by context band across every session active in [since, until], and the
+    subagent share alongside it - the two questions the 2026-09-03 usage review couldn't
+    answer from the report as it stood: how much of the spend sat in a request re-reading
+    a huge context, and how much was the main thread versus something it spawned.
+
+    bands_available is False when nothing in range was collected under 1.19 (band and
+    subagent maps didn't exist before it) - callers show that as "not collected", not as
+    zero, the same way an apportioned-token session is marked rather than presented as exact."""
+    prices = cfg.get("prices")
+    bands = {b: {"tok": {k: 0 for k in TOK_KEYS}, "cost": 0.0} for b in CONTEXT_BANDS}
+    sub = {"tok": {k: 0 for k in TOK_KEYS}, "cost": 0.0}
+    priced = True
+    bands_available = False
+    high = []
+    for sl in slices:
+        for s in sl.get("sessions", []):
+            band_share = session_band_tokens_in_range(s, since, until)
+            sub_share = session_subagent_tokens_in_range(s, since, until)
+            if band_share or sub_share:
+                bands_available = True
+            for band, by_model in band_share.items():
+                for k in TOK_KEYS:
+                    bands[band]["tok"][k] += sum(tk.get(k, 0) for tk in by_model.values())
+                c, p = _priced(by_model, prices)
+                bands[band]["cost"] += c
+                priced = priced and p
+            c, p = _priced(sub_share, prices)
+            for tk in sub_share.values():
+                for k in TOK_KEYS:
+                    sub["tok"][k] += tk.get(k, 0)
+            sub["cost"] += c
+            priced = priced and p
+            en = parse_iso(s.get("end"))
+            cmax = s.get("context_max") or 0
+            if cmax >= 150_000 and en and since <= en <= until:
+                high.append((sl.get("project") or "?", s.get("title") or "", cmax))
+    total_cost = sum(b["cost"] for b in bands.values()) + sub["cost"]
+    return {"bands": bands, "subagent": sub, "total_cost": total_cost, "priced": priced,
+            "bands_available": bands_available,
+            "high_context_sessions": sorted(high, key=lambda x: -x[2])}
+
+
+def cost_context_line(cc, cfg):
+    """One line summarising a cost_and_context() result - shared by the weekly report and
+    the morning page so the two figures are never worded two different ways."""
+    if not cc["bands_available"] or not cc["total_cost"]:
+        return None
+    cur = cfg.get("currency", "$")
+    tot = cc["total_cost"]
+
+    def pct(x):
+        return (100 * x / tot) if tot else 0.0
+
+    elevated = cc["bands"]["elevated"]["cost"] + cc["bands"]["very high"]["cost"]
+    very_high = cc["bands"]["very high"]["cost"]
+    return "%s%.2f%s · %.0f%% elevated context (%.0f%% very high) · %.0f%% subagents" % (
+        cur, tot, "" if cc["priced"] else "*", pct(elevated), pct(very_high), pct(cc["subagent"]["cost"]))
+
+
+def machine_context_note(settings_path=None):
+    """One line on this machine's model default and compaction cap, from
+    ~/.claude/settings.json (or settings_path, for tests). A missing or unparsable file is
+    nothing to report, not a failure - the report and the morning page just omit the line,
+    the same way they omit cost when a repo carries no `prices`."""
+    d = read_json(settings_path or USER_SETTINGS, None)
+    if not isinstance(d, dict):
+        return None
+    model = d.get("model")
+    window = d.get("autoCompactWindow")
+    env = d.get("env") if isinstance(d.get("env"), dict) else {}
+    disabled_1m = str(env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") or "") == "1"
+    bits = ["model default `%s`" % model if model else "no model default set"]
+    bits.append(("compaction cap %s" % window) if window else "no compaction cap set")
+    if not disabled_1m and (window or model):
+        bits.append("1M context not disabled")
+    return "This machine: " + "; ".join(bits) + "."
+
+
 def build_report(slices, machines, since, until, cfg):
     now = datetime.now(local_tz())
     buckets = {}
@@ -1231,6 +1396,19 @@ def build_report(slices, machines, since, until, cfg):
                      "their spend is split across days in proportion to the effort recorded on each. Sessions "
                      "collected since are exact, and re-collecting a repo replaces the estimate.")
         L.append("")
+        if show_cost:
+            cc = cost_and_context(slices, since, until, cfg)
+            line = cost_context_line(cc, cfg)
+            if line:
+                L.append("## Cost and context")
+                L.append("")
+                L.append(line + ".")
+                if cc["high_context_sessions"]:
+                    L.append("")
+                    L.append("Sessions that reached elevated context (150k+ tokens) in this range:")
+                    for proj, title, mx in cc["high_context_sessions"][:10]:
+                        L.append("- %s — %s (%s tokens)" % (proj, shorten(title or "(no prompt text)", 80), fmt_tok(mx)))
+                L.append("")
 
     an = agent_name_map(cfg)
     agg_projs, agg_cmds, agg_tools = {}, {}, {}
@@ -2266,6 +2444,10 @@ def build_morning(slices, machines, cfg, pot):
             day_name, len(rows), "" if len(rows) == 1 else "s", sum(r["commits"] for r in rows), "" if sum(r["commits"] for r in rows) == 1 else "s"))
     if facts:
         L.append('<div class="facts">%s \u00b7 %s</div>' % (esc(day_name), esc(" \u00b7 ".join(facts))))
+    if cfg.get("prices"):
+        y_line = cost_context_line(cost_and_context(slices, y0, y1, cfg), cfg)
+        if y_line:
+            L.append('<div class="facts">%s</div>' % esc(y_line))
     wn = whatsnew_note(pot, 3)
     if wn:
         L.append('<div class="facts">Worklog upgraded to v%s \u2014 %s.</div>' % (VERSION, esc(wn)))
@@ -2288,13 +2470,22 @@ def build_morning(slices, machines, cfg, pot):
                 L.append('<div class="t"><b>Last commit:</b> %s</div>' % esc(short(r["last_commit"])))
             L.append("</div>")
     if week_rows:
-        L.append("<h2>This week so far</h2><table>")
+        L.append("<h2>This week so far</h2>")
+        if cfg.get("prices"):
+            w_line = cost_context_line(cost_and_context(slices, w0, now, cfg), cfg)
+            if w_line:
+                L.append('<div class="facts">%s</div>' % esc(w_line))
+        L.append("<table>")
         for k, v in week_rows[:8]:
             L.append("<tr><td>%s</td><td>%s</td><td>%d commit%s</td></tr>" % (esc(k), fmt_dur(v["active"]) if v["active"] else "\u2013", v["commits"], "" if v["commits"] == 1 else "s"))
         L.append("</table>")
     L.append('<a class="btn" href="%s">Open the dashboard</a>' % (Path(pot) / "dashboard.html").resolve().as_uri())
-    L.append('<div class="foot">Rendered %s from %s. Shows once a day on the first unlock or session; <code>worklog_agent.py brief</code> opens it any time.</div>' % (
-        now.strftime("%H:%M"), esc(str(pot))))
+    machine = machine_context_note(cfg.get("settings_path"))
+    foot = "Rendered %s from %s. Shows once a day on the first unlock or session; <code>worklog_agent.py brief</code> opens it any time." % (
+        now.strftime("%H:%M"), esc(str(pot)))
+    if machine:
+        foot += " " + esc(machine)
+    L.append('<div class="foot">%s</div>' % foot)
     L.append("</main></body></html>")
     return "\n".join(L)
 
