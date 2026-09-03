@@ -1,6 +1,7 @@
 ---
 name: qa-runner
 description: Exercises the running app the way a user would, on the work-branch URL, through Playwright - the flows in docs/UAT_PLAN.md and the ones the change touches - and reports what a user would hit. Use after tests are green and the branch is deployed. Never edits.
+model: sonnet
 tools: Read, Grep, Glob, Bash(npx playwright:*), Bash(npx:*), Bash(curl:*)
 ---
 

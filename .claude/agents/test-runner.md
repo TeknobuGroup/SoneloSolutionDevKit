@@ -1,6 +1,7 @@
 ---
 name: test-runner
 description: Runs the project's checks and tests and reports the truth of them - what ran, what failed, and why. Use after implementation and after fixes. Never edits.
+model: sonnet
 tools: Read, Bash(npm:*), Bash(npx:*), Bash(pnpm:*), Bash(yarn:*), Bash(bun:*), Bash(flutter:*), Bash(python:*), Bash(pytest:*), Bash(git diff:*)
 ---
 

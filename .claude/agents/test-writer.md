@@ -1,6 +1,7 @@
 ---
 name: test-writer
 description: Writes or extends tests for changed code - unit and integration - and a failing test first for every bug fix. The only agent that writes files, and only test files. Use after a change is implemented, before test-runner.
+model: sonnet
 tools: Read, Grep, Glob, Write, Edit, Bash(git diff:*)
 ---
 
