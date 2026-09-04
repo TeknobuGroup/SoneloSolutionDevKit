@@ -73,7 +73,7 @@ Run the due reviewers in one message, in parallel; `/post-change` does this and 
 - Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.
 <!-- sonelo-devkit:pipeline:end -->
 
-<!-- sonelo-devkit:uat:start v4.9 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:uat:start v4.10 (managed by repo_setup.py; edit outside these markers) -->
 ## Writing UAT
 
 When you finish building a feature, write its UAT test cases and push them to UAT Hub.
@@ -314,7 +314,7 @@ Report what you pushed, to which project and module, and how many cases.
 
 <!-- sonelo-devkit:uat:end -->
 
-<!-- sonelo-devkit:start v4.9 (managed by repo_setup.py; edit outside these markers) -->
+<!-- sonelo-devkit:start v4.10 (managed by repo_setup.py; edit outside these markers) -->
 ## Sonelo standards
 
 **Branches.** Work on `prelive`; it deploys to its own URL and database. `main` is production and only changes through a pull request from `prelive` (`gh pr create --base main --head prelive --fill`). Never push to `main` directly and never force-push `prelive` or `main`. If you find yourself on `main` with uncommitted work, switch to `prelive` first.
