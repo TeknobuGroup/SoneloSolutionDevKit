@@ -27,9 +27,11 @@ import repo_setup as rs
 
 KIT = Path(__file__).resolve().parents[1]
 
-# A value that must never be echoed back by anything the sweep prints or writes. Built at run time
-# so a key-shaped literal never sits in the source for the repo's own pre-commit scanner to find.
-FAKE_SECRET = "sk" + "_live_" + "z9y8x7w6v5u4t3s2r1q0"
+# A canary, not a secret: a key-shaped value planted in the fixture so the tests can prove the sweep
+# never echoes an env value back. Built at run time so no key-shaped literal sits in the source for
+# the repo's own pre-commit scanner to find - and named for what it does, because a name with
+# SECRET in it makes every static analyser treat the fixture as real credential storage.
+CANARY = "sk" + "_live_" + "z9y8x7w6v5u4t3s2r1q0"
 LOVABLE_REF = "pxqckcvyymppsrulnebb"
 
 LOVABLE_FILES = {
@@ -64,7 +66,7 @@ LOVABLE_FILES = {
     ".env": (
         "VITE_SUPABASE_URL=https://%s.supabase.co\n"
         "VITE_SUPABASE_PUBLISHABLE_KEY=eyJhbGciOiJIUzI1NiJ9.notreal\n"  # sonelo:allow
-        "STRIPE_SECRET_KEY=%s\n" % (LOVABLE_REF, FAKE_SECRET)
+        "STRIPE_SECRET_KEY=%s\n" % (LOVABLE_REF, CANARY)
     ),
     "public/placeholder.svg": "<svg></svg>\n",
     "public/favicon.ico": "icon\n",
@@ -215,7 +217,7 @@ class TheSweepNeverPrintsAnEnvValue(unittest.TestCase):
     def test_no_env_value_reaches_the_command_output(self):
         out = subprocess.run([sys.executable, str(KIT / "repo_setup.py"), "lovable", "--repo", str(self.root)],
                              capture_output=True, text=True)
-        self.assertNotIn(FAKE_SECRET, out.stdout + out.stderr)
+        self.assertNotIn(CANARY, out.stdout + out.stderr)
         self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", out.stdout + out.stderr)
         # the key NAME is what a connections sweep is for
         self.assertIn("STRIPE_SECRET_KEY", out.stdout)
@@ -223,7 +225,7 @@ class TheSweepNeverPrintsAnEnvValue(unittest.TestCase):
     def test_no_env_value_reaches_the_generated_migration_document(self):
         rs.lovable_notes(self.root, {}, rs.Report(False))
         md = (self.root / "MIGRATION.md").read_text(encoding="utf-8")
-        self.assertNotIn(FAKE_SECRET, md)
+        self.assertNotIn(CANARY, md)
         self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", md)
         self.assertIn(LOVABLE_REF, md)
 
