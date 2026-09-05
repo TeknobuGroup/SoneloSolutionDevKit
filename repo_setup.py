@@ -23,6 +23,10 @@ One file, standard library only. Lives at ~/.claude/sonelo/repo_setup.py and is 
                                         #   .env / .env.<work> / .env.production, set the GitHub deploy secrets
   python repo_setup.py vercel --create --domain <work>.example.com
                                         # also creates the Vercel project from the GitHub repo if it doesn't exist
+  python repo_setup.py lovable [--strict]
+                                        # in a repo: sweep a Lovable migration - what still points at Lovable, every
+                                        #   external connection to keep/replace/drop, the SEO and branding to rewrite;
+                                        #   --strict exits 1 while anything is left, so a cutover can be gated
   python repo_setup.py uninstall        # remove the commands and the nudge (repos keep their files)
 
 What apply lays down (adapted to what it finds: package.json, supabase/, pubspec.yaml, tests), plus the worklog agent
@@ -60,7 +64,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.10"
+VERSION = "4.11"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -1127,8 +1131,19 @@ LOVABLE_MD = """<!-- {MARK} v{VERSION} -->
 # Migrating {REPO} off Lovable
 
 This repo was built on Lovable ({MARKERS}). The standards, {WORK} branch and deploy workflow are in place;
-this is the order for moving the running app onto your own Supabase, Vercel and OpenRouter. Keep the Lovable
-project alive until {WORK} has proven out.
+what follows moves the running app onto instances you own, and takes Lovable out of it entirely.
+
+## The rule this checklist exists to enforce
+
+**Nothing Lovable created is kept.** Not its Supabase project, not the repo its GitHub app writes to, not its
+hosting, not its branding. A migration that "works" while still reading Lovable Cloud has not happened - the
+source code has moved and nothing else has, and the day the Lovable project lapses the app goes down with it.
+
+- Lovable Cloud's database is a thing you copy **from**, once. It is never the database the app runs on.
+- Do not pass `--only {WORK}` and do not answer "production already exists" - both are for an app that
+  already has a production project **of yours**, and on a Lovable repo that project is Lovable's. Create both.
+- The only value that comes back into a chat session is the **project ref** - it is public and it is in the
+  dashboard URL. Never the database password, never the service_role or secret key.
 
 ## Found in the code
 - Routes: {ROUTES}. Router: {ROUTER}.
@@ -1136,19 +1151,83 @@ project alive until {WORK} has proven out.
 - Browser-only touches (`window`, `localStorage`, `document` at render time): {BROWSER}. Relevant only if you later
   move to TanStack Start; a plain Vite SPA does not care.
 - Supabase client: {CLIENT}.
+- Git remote: {REMOTE}
+- Supabase project refs this tree still names: {OLD_REFS}
 
-## In order
-1. [ ] `repo_setup.py supabase --create` - new {WORK} and production databases; `.env` / `.env.{WORK}` / `.env.production` written.
-2. [ ] Rename env usage: `VITE_SUPABASE_PUBLISHABLE_KEY` -> `VITE_SUPABASE_ANON_KEY`, `VITE_SUPABASE_PROJECT_ID` -> `VITE_SUPABASE_PROJECT_REF` (the kit writes the new names; grep for the old ones).
-3. [ ] Database: from the Lovable project, `supabase db dump --db-url <lovable-db-url> -f schema.sql` and `--data-only -f data.sql`; restore into {WORK} first (`psql` with the {WORK} DB password from `.env.{WORK}`), then production when {WORK} is proven.
-4. [ ] Storage buckets: recreate with the same names and policies; copy objects.
-5. [ ] Auth: providers, redirect URLs (`https://{WORK}.<domain>`, `https://<domain>`), email templates, SMTP.
-6. [ ] Edge functions: `supabase functions deploy` to {WORK} (the deploy workflow does this from the {WORK} branch once `supabase/` is committed); set their secrets with `supabase secrets set`.
-7. [ ] AI Gateway -> OpenRouter: replace each call site listed above; `OPENROUTER_API_KEY` as an edge-function secret, never in the client.
-8. [ ] Webhooks and third parties (Twilio, Stripe, Zoho, Meta): repoint to the new function URLs.
-9. [ ] `repo_setup.py vercel --create --domain {WORK}.<domain>`; custom domains move last, after {WORK} is proven.
-10. [ ] Rotate every key that ever lived in this repo's git history (Lovable projects usually have at least one).
-11. [ ] Remove `lovable-tagger` from package.json and `vite.config.ts`.
+Re-run the sweep whenever you want, and before calling the migration done:
+
+    python "$HOME/.claude/sonelo/repo_setup.py" lovable --strict
+
+It exits non-zero while anything still points at Lovable, so it also works as a cutover gate.
+
+## 1. New instances - all three, before anything else
+
+1. [ ] **GitHub.** A repo of yours, not the one Lovable's GitHub app writes to.
+       `repo_setup.py github --org <org>` creates it, pushes {MAIN} and {WORK}, and protects {MAIN}.
+       Then turn off Lovable's GitHub sync at the Lovable end, or it keeps pushing to the old repo and the two
+       drift apart without anyone noticing.
+2. [ ] **Supabase.** `repo_setup.py supabase --create` - both databases, {WORK} and production.
+       Do not pass `--only {WORK}` here, and do not answer "production already exists": it is Lovable's.
+       By hand instead (dashboard -> New project) if you have no access token - note the dashboard URL gives you
+       the **organisation** id first, and a project ref only exists once the project does:
+       - Name: cosmetic; the repo name is the obvious one.
+       - Region: {REGION} (the configured kit default) - keep the database near the users.
+       - Database password: generate a strong one and save it in the password manager. It cannot be read back
+         afterwards, and the `SUPABASE_DB_PASSWORD` GitHub secret needs it.
+       - Plan: Free is a fine start; edge functions and analytics tables are what grow it.
+       Then run `repo_setup.py supabase --create` anyway: it reuses a project of the same name, writes the env
+       files and sets the GitHub secrets rather than leaving you to do it by hand.
+3. [ ] **Vercel.** `repo_setup.py vercel --create --domain {WORK}.<domain>`. Custom production domains move last,
+       once {WORK} has proven out. Leave Lovable's hosting up until then - and turn it off when it has.
+
+## 2. Connections sweep - keep, replace or drop, for every one
+
+Every external service this code talks to. What Lovable provisioned lives on Lovable's account and does not
+travel with the code; the rest is yours and mostly needs keys rotated and callbacks repointed. Decide each one
+before cutover - "not looked at" is not a decision, and an unrecognised host is not the same as a safe one.
+
+{CONNECTIONS}
+
+Not in the source, so check them by hand: Supabase auth providers and their redirect URLs, storage buckets and
+their policies, database webhooks, scheduled functions and cron, and any third party (Stripe, Twilio, Meta,
+a payment provider, a CRM) holding a webhook that still points at a Lovable or old-project URL.
+
+## 3. Data, functions and auth
+1. [ ] Rename env usage: `VITE_SUPABASE_PUBLISHABLE_KEY` -> `VITE_SUPABASE_ANON_KEY`, `VITE_SUPABASE_PROJECT_ID` -> `VITE_SUPABASE_PROJECT_REF` (the kit writes the new names; grep for the old ones).
+2. [ ] Database: from the Lovable project, `supabase db dump --db-url <lovable-db-url> -f schema.sql` and `--data-only -f data.sql`; restore into {WORK} first (`psql` with the {WORK} DB password from `.env.{WORK}`), then production when {WORK} is proven.
+3. [ ] Storage buckets: recreate with the same names and policies; copy the objects.
+4. [ ] Auth: providers, redirect URLs (`https://{WORK}.<domain>`, `https://<domain>`), email templates, SMTP.
+5. [ ] Edge functions: `supabase functions deploy` to {WORK} (the deploy workflow does this from the {WORK} branch once `supabase/` is committed); set their secrets with `supabase secrets set`.
+6. [ ] AI Gateway -> OpenRouter: replace each call site listed above; `OPENROUTER_API_KEY` as an edge-function secret, never in the client.
+7. [ ] Webhooks and third parties: repoint everything from section 2 at the new function URLs.
+
+## 4. SEO, branding and what Lovable leaves in the markup
+
+Lovable ships a default `index.html` head, a default favicon set and its own Open Graph image. They are the most
+visible thing left behind, they follow the app into search results and every shared link, and nothing about the
+app failing to work will tell you they are still there. Rewrite all of it - do not edit around it.
+
+{BRANDING}
+
+Then, whatever the sweep found or missed:
+- [ ] `<title>` and `<meta name="description">`: the product's own, not "Lovable Generated Project" and not the
+      framework template's.
+- [ ] Open Graph and Twitter cards: `og:title`, `og:description`, `og:image`, `og:url`, `twitter:card`,
+      `twitter:image` - image served from your own domain, 1200x630, and `og:url` on the production domain.
+      Remove `twitter:site` if it still says an account you do not own.
+- [ ] Favicons: `favicon.ico`, the PNG sizes and `apple-touch-icon.png`, generated from your own mark.
+- [ ] `site.webmanifest` / `manifest.json`: name, short_name, theme colour, icons.
+- [ ] `robots.txt` and `sitemap.xml`: your production domain, and not blocking it.
+- [ ] `package.json` `name`, and the README: no Lovable badge, no lovable.dev links, no "built with Lovable".
+- [ ] Remove `lovable-tagger` from `package.json` and `vite.config.ts`, and the `cdn.gpteng.co` script tag from
+      `index.html`.
+
+## 5. Cutover
+1. [ ] `repo_setup.py lovable --strict` is clean: no Lovable host, no old project ref, no Lovable branding.
+2. [ ] Rotate every key that ever lived in this repo's git history - a Lovable project usually has at least one,
+       and Lovable Cloud's anon key is in the committed `.env` by design.
+3. [ ] Turn off Lovable's GitHub sync, then archive or delete the Lovable project once production has run on
+       your own instances long enough that you would have noticed.
 """
 
 
@@ -1631,7 +1710,7 @@ Start with one question: "Existing repo, new project, or migrating a Lovable pro
 Gather everything before doing anything, in one message, defaults in brackets; the user can answer "defaults":
 1. Brand and product guidelines: paste them, name a file, or say "defaults" / "none yet". [defaults]
 2. Deploys on Vercel? If yes, {WORK} domain [{WORK}.<production domain>] and production domain [{DOMAIN_EXAMPLE}].
-3. Supabase: already has a production project [yes for an existing app] - then create only the {WORK} database; or create both.
+3. Supabase: already has a production project **of yours** [yes for an existing app] - then create only the {WORK} database; or create both. **On a Lovable migration the answer is always "create both"**: the project it has now is Lovable's, it does not travel with the code, and reusing it means the migration never happened. Never `--only {WORK}` there.
 4. GitHub branch protection on main [yes].
 5. UAT Hub project slug, so sessions can push UAT test cases to {UAT_HUB} instead of writing a Markdown file [the repo folder name]. The project must already exist in the hub - a push to an unknown slug is refused rather than creating one, so ask the user rather than guessing. "skip" leaves the default in place; the wiring stays inert until the project exists.
 Confirm the plan in four lines, including that Supabase projects may be billable. Then run without further questions.
@@ -1642,11 +1721,11 @@ Do, reporting each step's output:
 3. Brand: write the guidelines verbatim to `docs/BRAND.md` if given, and rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the one call-to-action colour, the off-brand list, the design lint command if any). Put the product's one-line description and voice rules into CLAUDE.md and the pipeline's ARCHITECTURE/STATUS/UAT placeholders. Take the stack from the repo, not from the guidelines; if they disagree (e.g. the document still says Lovable Cloud), say so in the summary.
 4. Fill every remaining `TODO` in the pipeline files from what is true of the repo. Ask nothing; leave a TODO only if it is genuinely unknowable.
 5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply sonelo repo standards` on `{WORK}`.
-6. If wanted: `repo_setup.py protect` (requires `checks` and the pipeline's gates job). Then `supabase --create [--only {WORK}]` and `vercel --create --domain <{WORK} domain> --production-domain <prod>` as answered. Commit `.env.example` and `vercel.json` if created.
+6. If wanted: `repo_setup.py protect` (requires `checks` and the pipeline's gates job). Then `supabase --create [--only {WORK}]` (never `--only` on a Lovable migration - see question 3) and `vercel --create --domain <{WORK} domain> --production-domain <prod>` as answered. Commit `.env.example` and `vercel.json` if created.
 7. `git push -u origin {WORK}`.
 8. Summary: branch model, what is enforced, what was created, DNS records outstanding, and anything that differed from the plan. Keep it short.
 
-Rules: never print secrets, tokens, or the contents of `.env*` files, and never inspect environment variables with shell echo - `repo_setup.py doctor` reports presence without values. If a step fails, stop, show the error, ask before retrying. These are the user's standards; do not reinterpret them.
+Rules: never print secrets, tokens, or the contents of `.env*` files, and never inspect environment variables with shell echo - `repo_setup.py doctor` reports presence without values. When a project is created by hand, the only value that comes back into the session is the **project ref** - it is public and it is in the dashboard URL; never the database password and never the service_role or secret key. If a step fails, stop, show the error, ask before retrying. These are the user's standards; do not reinterpret them.
 '''
 
 NEW_COMMAND_MD = '''---
@@ -1676,7 +1755,7 @@ i. `repo_setup.py vercel --create --domain <{WORK} domain> --production-domain <
 j. Commit anything new (`.env.example`, `vercel.json`, the deploy workflow) on {WORK} and push.
 k. Summary: where it lives, the URLs, DNS records outstanding, and the first three things to do next. Short.
 
-Rules: never print secrets, tokens, or the contents of `.env*` files; never inspect environment variables with shell echo - `repo_setup.py doctor` reports presence without values. Ask before anything billable beyond the confirmed plan. If a step fails, stop, show the error, ask before retrying. These are the user's standards; do not reinterpret them.
+Rules: never print secrets, tokens, or the contents of `.env*` files; never inspect environment variables with shell echo - `repo_setup.py doctor` reports presence without values. When a project is created by hand rather than by the kit, the only value that comes back into the session is the **project ref** - it is public and it is in the dashboard URL; never the database password and never the service_role or secret key. Ask before anything billable beyond the confirmed plan. If a step fails, stop, show the error, ask before retrying. These are the user's standards; do not reinterpret them.
 '''
 
 
@@ -2289,24 +2368,347 @@ def spa_rewrites(root, d, rep):
         rep.note("created (SPA rewrite so client routes survive refresh)", path)
 
 
-def lovable_audit(root):
-    """Counts for the migration checklist; all by grep, nothing executed."""
-    files = [p for p in root.rglob("*") if p.is_file() and p.suffix in (".ts", ".tsx", ".js", ".jsx") and "node_modules" not in p.parts and ".git" not in p.parts]
-    ai = routes = browser = 0
-    router = "none found"
-    client = "none found"
-    for f in files:
-        t = read(f) or ""
-        ai += len(re.findall(r"ai\.gateway\.lovable\.dev|LOVABLE_API_KEY|lovable-ai|/v1/chat/completions", t))
-        routes += len(re.findall(r"<Route\b|createRoute\(|createFileRoute\(", t))
-        browser += len(re.findall(r"\b(?:window|localStorage|sessionStorage|document)\.", t))
-        if "react-router" in t:
-            router = "react-router"
-        elif "@tanstack/react-router" in t and router == "none found":
-            router = "TanStack Router"
-        if "createClient(" in t and "supabase" in t.lower():
-            client = str(f.relative_to(root)).replace("\\", "/")
-    return {"AI_SITES": ai, "ROUTES": routes, "BROWSER": browser, "ROUTER": router, "CLIENT": client}
+# Hosts that are Lovable's own. cdn.gpteng.co is the tagger script Lovable writes into index.html, and
+# it is the marker that survives longest: it lives in the markup rather than the dependencies, so
+# dropping lovable-tagger from package.json leaves it in place and still loading on every page view.
+LOVABLE_HOSTS = ("lovable.dev", "lovable.app", "lovableproject.com", "lovable-api.com", "gpteng.co")
+
+# Text Lovable leaves behind that is not a host: its scaffold's package name, its Open Graph defaults,
+# its Twitter handle, the env names only Lovable Cloud uses.
+LOVABLE_TEXT = ("lovable-tagger", "VITE_SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_PROJECT_ID", "LOVABLE_API_KEY",
+                "vite_react_shadcn_ts", "Lovable Generated Project", "@lovable_dev", "gptengineer.js")
+
+# What a host is, for the sweep's table. This table NAMES things; it does not decide what gets looked at.
+# Every external host found is reported, and one matching nothing here is reported as unrecognised rather
+# than dropped - "not in our list" and "safe to keep" are different statements, and only the second is a
+# decision a person is allowed to make.
+SERVICES = (
+    ("Lovable", r"lovable\.dev|lovable\.app|lovableproject\.com|lovable-api\.com|gpteng\.co"),
+    ("Supabase", r"(^|\.)supabase\.(co|com|in|net)$"),
+    ("Stripe", r"stripe\.(com|network)$"),
+    ("Twilio", r"twilio\.com$"),
+    ("Resend", r"resend\.com$"),
+    ("SendGrid", r"sendgrid\.(com|net)$"),
+    ("Mailgun", r"mailgun\.(com|net|org)$"),
+    ("Postmark", r"postmarkapp\.com$"),
+    ("OpenAI", r"openai\.com$"),
+    ("Anthropic", r"anthropic\.com$"),
+    ("OpenRouter", r"openrouter\.ai$"),
+    ("Google APIs", r"googleapis\.com$|google\.com$"),
+    ("Google Analytics / Tag Manager", r"google-analytics\.com$|googletagmanager\.com$"),
+    ("PostHog", r"posthog\.com$"),
+    ("Sentry", r"sentry\.io$"),
+    ("Plausible", r"plausible\.io$"),
+    ("Vercel", r"vercel\.(app|com|sh)$"),
+    ("Mapbox", r"mapbox\.com$"),
+    ("Cloudinary", r"cloudinary\.com$"),
+    ("Zoho", r"zoho\.(com|eu|in)$"),
+    ("Meta / WhatsApp", r"facebook\.com$|whatsapp\.com$|fbcdn\.net$"),
+    ("Slack", r"slack\.com$"),
+    ("GitHub", r"github\.com$|githubusercontent\.com$"),
+    ("Google Fonts", r"fonts\.(googleapis|gstatic)\.com$"),
+    ("CDN", r"unpkg\.com$|jsdelivr\.net$|cdnjs\.cloudflare\.com$"),
+    # Everything below is appended deliberately: a host claimed by a more specific entry above keeps
+    # that name - cdnjs.cloudflare.com stays CDN, firebasestorage.googleapis.com stays Google APIs.
+    # The leading (^|\.) stops a short common word matching a domain that merely ends in it.
+    ("Zapier", r"(^|\.)zapier\.com$"),
+    ("Make", r"(^|\.)make\.com$|(^|\.)integromat\.com$"),
+    ("n8n", r"(^|\.)n8n\.(cloud|io)$"),
+    ("Airtable", r"(^|\.)airtable\.com$"),
+    ("Firebase", r"(^|\.)firebaseio\.com$|(^|\.)firebaseapp\.com$|(^|\.)firebasedatabase\.app$"),
+    ("AWS", r"(^|\.)amazonaws\.com$"),
+    ("Cloudflare", r"(^|\.)cloudflare\.com$|(^|\.)workers\.dev$|(^|\.)cloudflarestorage\.com$"),
+    ("Netlify", r"(^|\.)netlify\.(app|com)$"),
+    ("Clerk", r"(^|\.)clerk\.(dev|com)$|(^|\.)clerk\.accounts\.dev$"),
+    ("Auth0", r"(^|\.)auth0\.com$"),
+    ("PayPal", r"(^|\.)paypal\.(com|me)$"),
+    ("HubSpot", r"(^|\.)hubspot\.com$|(^|\.)hubapi\.com$"),
+    ("Intercom", r"(^|\.)intercom\.(io|com)$"),
+    ("Segment", r"(^|\.)segment\.(com|io)$"),
+    ("Calendly", r"(^|\.)calendly\.com$"),
+    ("Notion", r"(^|\.)notion\.(so|com)$"),
+    ("Algolia", r"(^|\.)algolia\.(net|com)$"),
+    ("Discord", r"(^|\.)discord\.(com|gg)$|(^|\.)discordapp\.com$"),
+)
+
+# Hosts that say nothing about who the app depends on: loopback, the reserved example domains, and the
+# namespace URLs that appear in every SVG and XML file ever written.
+SCAN_IGNORED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "example.com", "example.org", "example.net",
+                      "www.w3.org", "w3.org", "schema.org", "json-schema.org", "www.gnu.org", "creativecommons.org")
+SCAN_SKIP_DIRS = {"node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", ".output", ".svelte-kit",
+                  ".vercel", ".turbo", ".cache", "coverage", ".venv", "venv", "__pycache__", ".temp", ".branches",
+                  "ios", "android", ".dart_tool", ".claude"}
+SCAN_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".html", ".htm", ".json", ".toml", ".yml", ".yaml",
+                 ".md", ".sql", ".css", ".txt", ".webmanifest", ".env", ".sh", ".dart", ".vue", ".svelte"}
+SCAN_NAMES = {"robots.txt", "sitemap.xml", "site.webmanifest", "manifest.json", "Dockerfile"}
+SCAN_MAX_BYTES = 512 * 1024
+
+URL_RE = re.compile(r"https?://([A-Za-z0-9._~%:@-]+)")
+# A Supabase project ref is 20 lowercase characters, and the URL is the only place it can be read
+# unambiguously - which is also why it is the one env VALUE this sweep reads. It is public: it is in the
+# dashboard URL. Nothing else in an env file is looked at, only key names.
+SUPA_URL_RE = re.compile(r"https?://([a-z0-9]{20})\.supabase\.(?:co|in|net)")
+SUPA_REF_RE = re.compile(r"(?:project_id|PROJECT_ID|PROJECT_REF|project_ref)\s*[=:]\s*[\"']?([a-z0-9]{20})[\"']?")
+ENV_NAME_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=", re.M)
+ENV_USE_RE = re.compile(r"(?:process\.env\.|import\.meta\.env\.)([A-Z][A-Z0-9_]{2,})|Deno\.env\.get\(\s*[\"']([A-Z][A-Z0-9_]{2,})[\"']")
+
+
+def is_env_file(name):
+    return name == ".env" or name.startswith(".env.")
+
+
+def scan_files(root):
+    """Every file worth reading, with build output and dependencies pruned as we descend - os.walk
+    rather than rglob, so a repo with a node_modules is not enumerated before being ignored."""
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        dirnames[:] = sorted(d for d in dirnames if d not in SCAN_SKIP_DIRS)
+        for name in sorted(filenames):
+            p = Path(dirpath) / name
+            if not (p.suffix.lower() in SCAN_SUFFIXES or name in SCAN_NAMES or is_env_file(name)):
+                continue
+            try:
+                if p.stat().st_size > SCAN_MAX_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield p
+
+
+def host_of(authority):
+    """The host alone: credentials before an '@' are dropped rather than reported, the port goes, and
+    anything carrying a template placeholder was never a host."""
+    host = authority.split("@")[-1].split("/")[0]
+    host = re.sub(r":\d+$", "", host).strip().lower().rstrip(".")
+    if not host or "$" in host or "%" in host or "*" in host:
+        return ""
+    if not re.match(r"^[a-z0-9.-]+$", host) or "." not in host:
+        return ""
+    return host
+
+
+def service_of(host):
+    for name, pat in SERVICES:
+        if re.search(pat, host):
+            return name
+    return ""
+
+
+def is_lovable_host(host):
+    return any(host == h or host.endswith("." + h) for h in LOVABLE_HOSTS)
+
+
+def lovable_scan(root):
+    """One pass over the tree for everything a migration has to decide about: what still points at
+    Lovable, every external service this code talks to, and the branding Lovable leaves behind.
+
+    Reads files; executes nothing and calls nothing out. The only env VALUE it looks at is a Supabase
+    project ref, which is public and sits in the dashboard URL - key names otherwise, never values."""
+    counts = {"AI_SITES": 0, "ROUTES": 0, "BROWSER": 0}
+    router, client = "none found", "none found"
+    hosts, refs, env_refs, hard_refs, env_keys, lov, unreadable = {}, {}, set(), {}, set(), {}, []
+    for p in scan_files(root):
+        try:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            continue
+        text = read(p)
+        if text is None:
+            unreadable.append(rel)
+            continue
+        env_file = is_env_file(p.name)
+        for m in SUPA_URL_RE.finditer(text):
+            refs.setdefault(m.group(1), set()).add(rel)
+            if env_file:
+                env_refs.add(m.group(1))
+            elif p.name != "config.toml":
+                hard_refs.setdefault(m.group(1), set()).add(rel)
+        for m in SUPA_REF_RE.finditer(text):
+            refs.setdefault(m.group(1), set()).add(rel)
+            if env_file:
+                env_refs.add(m.group(1))
+        if env_file:
+            env_keys.update(ENV_NAME_RE.findall(text))
+        else:
+            for m in URL_RE.finditer(text):
+                host = host_of(m.group(1))
+                if host and host not in SCAN_IGNORED_HOSTS:
+                    hosts.setdefault(host, set()).add(rel)
+            for a, b in ENV_USE_RE.findall(text):
+                env_keys.add(a or b)
+        for marker in LOVABLE_TEXT:
+            if marker in text:
+                lov.setdefault(marker, set()).add(rel)
+        if p.suffix.lower() in (".ts", ".tsx", ".js", ".jsx"):
+            counts["AI_SITES"] += len(re.findall(r"ai\.gateway\.lovable\.dev|LOVABLE_API_KEY|lovable-ai|/v1/chat/completions", text))
+            counts["ROUTES"] += len(re.findall(r"<Route\b|createRoute\(|createFileRoute\(", text))
+            counts["BROWSER"] += len(re.findall(r"\b(?:window|localStorage|sessionStorage|document)\.", text))
+            if "react-router" in text:
+                router = "react-router"
+            elif "@tanstack/react-router" in text and router == "none found":
+                router = "TanStack Router"
+            if "createClient(" in text and "supabase" in text.lower():
+                client = rel
+    for host in list(hosts):
+        if is_lovable_host(host):
+            lov.setdefault(host, set()).update(hosts[host])
+    scan = dict(counts)
+    scan.update({"ROUTER": router, "CLIENT": client, "hosts": hosts, "refs": refs, "env_refs": env_refs,
+                 "hardcoded_refs": hard_refs, "env_keys": sorted(env_keys), "lovable": lov,
+                 "unreadable": unreadable, "remote": lovable_remote(root)})
+    scan["branding"] = lovable_branding(root, scan)
+    return scan
+
+
+def lovable_remote(root):
+    slug = github_slug(root)
+    return "%s/%s" % slug if slug else "none found"
+
+
+def lovable_branding(root, scan):
+    """The artefacts a visitor and a search engine actually see. Absent is a finding too: a page with no
+    og:image has nothing to show when it is shared, and one with no description is quoted at random.
+
+    Each finding says whether it BLOCKS - i.e. whether it is Lovable's, or only something the sweep cannot
+    judge. A favicon file is the second kind: nobody can tell from the bytes whose mark it is, so it is work
+    to confirm, never a reason for the cutover gate to fail."""
+    out = []
+    html = None
+    for name in ("index.html", "public/index.html", "src/index.html"):
+        p = root / name
+        if p.exists():
+            html = (name, read(p) or "")
+            break
+    if html:
+        name, text = html
+        found = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+        title = re.sub(r"\s+", " ", found.group(1)).strip() if found else ""
+        if not title:
+            out.append((name, "no <title> - the tab and every search result show the URL", False))
+        elif re.search(r"lovable|generated project|^vite|react app", title, re.I):
+            out.append((name, "<title> is still a default: %s" % title[:70], True))
+        else:
+            out.append((name, "<title> reads %s - confirm it is the product's, not the scaffold's" % title[:70], False))
+        found = re.search(r"<meta[^>]+name=[\"']description[\"'][^>]*content=[\"']([^\"']*)[\"']", text, re.I)
+        desc = re.sub(r"\s+", " ", found.group(1)).strip() if found else ""
+        if not re.search(r"<meta[^>]+name=[\"']description[\"']", text, re.I):
+            out.append((name, "no meta description - search results quote the page at random instead", False))
+        elif not desc:
+            out.append((name, "the meta description is empty - search results quote the page at random instead", False))
+        elif re.search(r"lovable|generated project|^vite|react app", desc, re.I):
+            # It follows the app into every search result and every shared link, under its own name.
+            out.append((name, "the meta description is still a default: %s" % desc[:70], True))
+        for prop in ("og:title", "og:description", "og:image", "og:url", "twitter:card"):
+            if prop not in text:
+                out.append((name, "no %s - a shared link has no card" % prop, False))
+        for m in re.finditer(r"<meta[^>]+(?:property|name)=[\"'](og:image|og:url|twitter:image|twitter:site|author)[\"'][^>]*content=[\"']([^\"']*)[\"']", text, re.I):
+            prop, val = m.group(1), m.group(2).strip()
+            found = URL_RE.match(val)
+            host = host_of(found.group(1)) if found else ""
+            if is_lovable_host(host) or re.search(r"lovable", val, re.I):
+                out.append((name, "%s still points at Lovable: %s" % (prop, val[:80]), True))
+            elif host and prop in ("og:image", "twitter:image", "og:url"):
+                out.append((name, "%s is served from %s - confirm that is your domain" % (prop, host), False))
+        if "gpteng.co" in text or "gptengineer.js" in text:
+            out.append((name, "the Lovable tagger script tag is still in the markup", True))
+    else:
+        out.append(("index.html", "not found - if this app has an HTML entry point, the sweep could not read it", False))
+    pkg = read(root / "package.json") or ""
+    found = re.search(r"\"name\"\s*:\s*\"([^\"]*)\"", pkg)
+    if found and re.search(r"vite_react_shadcn_ts|lovable", found.group(1), re.I):
+        out.append(("package.json", "name is still the Lovable scaffold's: %s" % found.group(1), True))
+    if "lovable-tagger" in pkg:
+        out.append(("package.json", "lovable-tagger is still a dependency (and in vite.config.ts)", True))
+    readme = read(root / "README.md") or ""
+    if re.search(r"lovable\.(dev|app)|lovableproject\.com|built with lovable", readme, re.I):
+        out.append(("README.md", "still links to or credits Lovable", True))
+    assets = []
+    for folder in ("public", "static", "assets"):
+        d = root / folder
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if p.is_file() and re.search(r"favicon|apple-touch-icon|og[-_]?image|placeholder\.svg|icon-\d|manifest|robots\.txt|sitemap", p.name, re.I):
+                assets.append("%s/%s" % (folder, p.name))
+    for a in assets:
+        if a.endswith("placeholder.svg"):
+            out.append((a, "the Lovable scaffold's placeholder image - delete it or replace every use", True))
+        else:
+            out.append((a, "replace with your own, or confirm it is not Lovable's default", False))
+    for name in ("robots.txt", "sitemap.xml"):
+        if not any(a.endswith(name) for a in assets) and not (root / name).exists():
+            out.append((name, "absent - decide whether this app should have one", False))
+    return out
+
+
+# The honest answer for most hosts, and the reason the table has a Decision column at all. Named so the
+# command can say it once for the section instead of once per row, where it stops being read.
+CONNECTION_UNKNOWN = "confirm whose account this is"
+
+
+def connection_origin(host, scan):
+    """Whose account this host belongs to - the column no scan can fill in for certain, so it says what
+    it knows and asks where it does not. Shared by the command and the generated checklist: they were
+    written apart and disagreed, and a person reads the command."""
+    if is_lovable_host(host):
+        return "Lovable - dies with the project"
+    if re.search(r"supabase\.(co|in|net)$", host):
+        # While a Lovable trace is left anywhere in the tree, the env files are still Lovable's and so is
+        # the ref in them. Presuming Lovable's is the safe direction: being wrong costs a line of reading,
+        # the other way round costs the whole migration.
+        return "Lovable Cloud - the database to copy FROM" if scan["lovable"] else "Supabase - yours"
+    return CONNECTION_UNKNOWN
+
+
+def lovable_connections_md(scan):
+    """The sweep's table. Nothing is filtered out for looking harmless: a decision per connection is the
+    point, and the column that matters is the one no scan can fill in."""
+    rows = ["| Service | Host | Where | Provisioned by | Decision |", "|---|---|---|---|---|"]
+    for host in sorted(scan["hosts"]):
+        files = sorted(scan["hosts"][host])
+        where = ", ".join("`%s`" % f for f in files[:3]) + (" +%d more" % (len(files) - 3) if len(files) > 3 else "")
+        name = service_of(host) or "**unrecognised - identify it**"
+        origin = connection_origin(host, scan)
+        rows.append("| %s | `%s` | %s | %s | [ ] keep / replace / drop |" % (name, host, where, origin))
+    if len(rows) == 2:
+        rows.append("| _none found in the source_ | | | | check the dashboards by hand |")
+    keys = [k for k in scan["env_keys"] if not k.startswith(("VITE_SUPABASE", "SUPABASE"))]
+    if keys:
+        rows.append("")
+        rows.append("Env keys the code reads, each one a connection to something (names only, never values): "
+                    + ", ".join("`%s`" % k for k in keys))
+    return "\n".join(rows)
+
+
+def lovable_branding_md(scan):
+    if not scan["branding"]:
+        return "_Nothing found to rewrite - confirm by opening the page and looking at the tab and at a shared link._"
+    return "\n".join("- [ ] `%s` - %s" % (path, note) for path, note, _ in scan["branding"])
+
+
+def lovable_blockers(scan):
+    """What makes a cutover incomplete.
+
+    Lovable's generated client hardcodes the Supabase URL and publishable key, so the app goes on reading
+    whatever project is written into the source no matter what the env files say - the exact way a migration
+    silently does not happen. So a hardcoded URL naming a project that appears in NO env file blocks: that is
+    the old database, still live, still being read. One that matches the env files is reported and does not
+    block - by then it is a question of style, and a gate that cannot be passed gets switched off."""
+    out = []
+    for marker in sorted(scan["lovable"]):
+        files = sorted(scan["lovable"][marker])
+        out.append("Lovable trace %s in %s" % (marker, ", ".join(files[:4]) + (" +%d more" % (len(files) - 4) if len(files) > 4 else "")))
+    for ref in sorted(scan["hardcoded_refs"]):
+        if ref in scan["env_refs"]:
+            continue
+        files = sorted(scan["hardcoded_refs"][ref])
+        out.append("Supabase URL hardcoded in source, and ref %s is in no env file - the app reads that project "
+                   "whatever you configure: %s" % (ref, ", ".join(files[:4])))
+    for path, note, blocking in scan["branding"]:
+        if blocking:
+            out.append("%s - %s" % (path, note))
+    for path in scan["unreadable"]:
+        out.append("could not be read, so it was not swept: %s" % path)
+    return out
 
 
 def lovable_notes(root, d, rep):
@@ -2320,10 +2722,66 @@ def lovable_notes(root, d, rep):
     if path.exists() and not ours(path):
         rep.note("unchanged (yours)", path)
         return
-    a = lovable_audit(root)
+    a = lovable_scan(root)
     if not rep.dry:
-        write(path, fill(LOVABLE_MD, REPO=root.name, WORK=WORK_BRANCH, MARKERS=", ".join(hits), **{k: str(v) for k, v in a.items()}))
-    rep.note("Lovable project detected: migration checklist (%s AI gateway call sites, %s routes)" % (a["AI_SITES"], a["ROUTES"]), path)
+        write(path, fill(LOVABLE_MD, REPO=root.name, WORK=WORK_BRANCH, MAIN=PROTECTED[0],
+                         REGION=DEFAULT_SUPABASE_REGION, MARKERS=", ".join(hits), REMOTE=a["remote"],
+                         OLD_REFS=", ".join(sorted(a["refs"])) or "none found",
+                         CONNECTIONS=lovable_connections_md(a), BRANDING=lovable_branding_md(a),
+                         **{k: str(a[k]) for k in ("AI_SITES", "ROUTES", "BROWSER", "ROUTER", "CLIENT")}))
+    rep.note("Lovable project detected: migration checklist (%s AI gateway call sites, %s routes, %s external hosts, %s to rewrite)"
+             % (a["AI_SITES"], a["ROUTES"], len(a["hosts"]), len(a["branding"])), path)
+
+
+def cmd_lovable(args):
+    root = repo_root(args.repo)
+    if not root:
+        sys.exit("not inside a git repository")
+    use_repo_config(root)
+    scan = lovable_scan(root)
+    say("repo       %s (remote %s)" % (root.name, scan["remote"]))
+    say("")
+    say("-- still pointing at Lovable " + "-" * 40)
+    blockers = lovable_blockers(scan)
+    for b in blockers:
+        say("  ! %s" % b)
+    if not blockers:
+        say("  nothing found")
+    say("")
+    say("-- external connections (%d) " % len(scan["hosts"]) + "-" * 38)
+    say("   keep, replace or drop each one. Unannotated means: %s." % CONNECTION_UNKNOWN)
+    for host in sorted(scan["hosts"]):
+        files = sorted(scan["hosts"][host])
+        where = ", ".join(files[:2]) + (" +%d" % (len(files) - 2) if len(files) > 2 else "")
+        say("  %-38s %-14s %s" % (host, service_of(host) or "unrecognised", where))
+        origin = connection_origin(host, scan)
+        if origin != CONNECTION_UNKNOWN:
+            say("  %-38s -> %s" % ("", origin))
+    if scan["env_keys"]:
+        say("  env keys read by the code: %s" % ", ".join(scan["env_keys"]))
+    say("")
+    for ref in sorted(scan["hardcoded_refs"]):
+        if ref in scan["env_refs"]:
+            say("  - Supabase URL hardcoded in %s (ref %s, the one the env files name) - env files do not control it"
+                % (", ".join(sorted(scan["hardcoded_refs"][ref])[:3]), ref))
+    say("")
+    say("-- Supabase project refs named in this tree " + "-" * 23)
+    for ref in sorted(scan["refs"]):
+        where = "env files" if ref in scan["env_refs"] else "NOT in any env file"
+        say("  %s  (%s) %s" % (ref, where, ", ".join(sorted(scan["refs"][ref])[:3])))
+    if not scan["refs"]:
+        say("  none found")
+    say("")
+    say("-- SEO and branding to rewrite (%d) " % len(scan["branding"]) + "-" * 31)
+    for path, note, blocking in scan["branding"]:
+        say("  %s %-28s %s" % ("!" if blocking else " ", path, note))
+    say("")
+    if blockers:
+        say("%d thing(s) still tie this repo to Lovable. MIGRATION.md has the order to unpick them." % len(blockers))
+        if args.strict:
+            sys.exit(1)
+    else:
+        say("No Lovable traces found. The connections and the branding above are still a person's decisions.")
 
 
 def install_worklog(root, rep):
@@ -4091,6 +4549,10 @@ def main():
     p.add_argument("--repo")
     p.add_argument("--api", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_vercel)
+    p = sub.add_parser("lovable", help="sweep a Lovable migration: what still points at Lovable, every external connection, the SEO and branding to rewrite")
+    p.add_argument("--strict", action="store_true", help="exit 1 while anything still ties the repo to Lovable (use it as the cutover gate)")
+    p.add_argument("--repo")
+    p.set_defaults(fn=cmd_lovable)
     sub.add_parser("nudge", help="session-start hook entry point").set_defaults(fn=cmd_nudge)
     p = sub.add_parser("install", help="install the kit, the worklog, the pipeline, the CLIs and the Claude Code commands")
     p.add_argument("--no-presence", action="store_true", help="skip the worklog's lock/unlock Task Scheduler tasks")
