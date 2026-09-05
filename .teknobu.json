@@ -1,11 +1,11 @@
 {
-  "kit": "4.9",
+  "kit": "4.10",
   "work_branch": "prelive",
   "protected": [
     "main"
   ],
   "commit_format": "conventional",
-  "applied": "2026-09-03",
+  "applied": "2026-09-04",
   "stack": {
     "node": false,
     "pm": "npm",
