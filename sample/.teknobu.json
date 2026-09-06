@@ -13,5 +13,8 @@
     "flutter": false,
     "python": false,
     "vercel": false
+  },
+  "diary": {
+    "tier": "private"
   }
 }

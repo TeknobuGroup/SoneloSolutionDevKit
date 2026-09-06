@@ -14,5 +14,9 @@
     "python": false,
     "vercel": false
   },
-  "generated_types": "src/types/database.ts"
+  "generated_types": "src/types/database.ts",
+  "diary": {
+    "tier": "own",
+    "description": "the developer kit I work inside"
+  }
 }

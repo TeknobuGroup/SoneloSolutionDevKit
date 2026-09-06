@@ -333,5 +333,69 @@ class ProtectedIsValidatedBeforeItReachesGeneratedShell(unittest.TestCase):
         self.assertEqual(self.config(["; rm -rf /"]), self.saved)
 
 
+class TestBundledToolsAreInstalledIndependently(unittest.TestCase):
+    """Kit 4.12: adding the diary broke the worklog's URL-install fetch.
+
+    The worklog's `elif not bundled.exists():` fetch was chained onto the diary's `if`, so on an
+    install run straight from a URL - the only case either fetch exists for - the diary was
+    fetched and the worklog silently never was."""
+
+    def setUp(self):
+        self.tmp = make_temp_dir(self, "repo-setup-bundle-")
+        self.src = self.tmp / "src"
+        self.src.mkdir()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.saved = {k: getattr(rs, k) for k in ("WORKLOG", "DIARY", "http_get", "say")}
+        rs.WORKLOG = self.home / "worklog_agent.py"
+        rs.DIARY = self.home / "diary_agent.py"
+        self.said = []
+        rs.say = lambda *a: self.said.append(" ".join(str(x) for x in a))
+        self.asked = []
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        for k, v in self.saved.items():
+            setattr(rs, k, v)
+
+    def fetcher(self, fails=()):
+        def http_get(url, to=None):
+            self.asked.append(url)
+            name = url.rsplit("/", 1)[-1]
+            if name in fails:
+                raise IOError("no route to host")
+            return ("# %s agent" % name.split("_")[0]).encode("utf-8")
+        return http_get
+
+    def test_both_are_fetched_when_neither_is_bundled(self):
+        rs.http_get = self.fetcher()
+        rs.install_bundled_tools(here=self.src)
+        self.assertTrue(rs.WORKLOG.exists(), "the worklog was not fetched: " + "; ".join(self.said))
+        self.assertTrue(rs.DIARY.exists())
+        self.assertEqual(len(self.asked), 2)
+
+    def test_the_diary_failing_does_not_stop_the_worklog(self):
+        rs.http_get = self.fetcher(fails=("diary_agent.py",))
+        rs.install_bundled_tools(here=self.src)
+        self.assertTrue(rs.WORKLOG.exists())
+        self.assertFalse(rs.DIARY.exists())
+        self.assertTrue(any("diary" in line and "could not fetch" in line for line in self.said))
+
+    def test_a_bundled_copy_is_used_and_nothing_is_fetched(self):
+        (self.src / "worklog_agent.py").write_text("# worklog agent", encoding="utf-8")
+        (self.src / "diary_agent.py").write_text("# diary agent", encoding="utf-8")
+        rs.http_get = self.fetcher()
+        rs.install_bundled_tools(here=self.src)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(rs.WORKLOG.read_text(encoding="utf-8"), "# worklog agent")
+        self.assertEqual(rs.DIARY.read_text(encoding="utf-8"), "# diary agent")
+
+    def test_a_page_that_is_not_the_tool_is_not_written(self):
+        rs.http_get = lambda url, to=None: b"<html>404: Not Found</html>"
+        rs.install_bundled_tools(here=self.src)
+        self.assertFalse(rs.WORKLOG.exists())
+        self.assertFalse(rs.DIARY.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
