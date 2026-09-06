@@ -8,6 +8,13 @@
 reconciled across releases and regrouped into six numbered modules, so a tester runs them in
 order rather than per release. The section below records why they sat here until then.
 
+Cases 01-13 below are module `06. UAT Hub wiring, the types gate and the kit's own checks`, which
+also carries three general kit checks (install and report the diary, the suite is green, the tools
+compile) as its cases 14-16. Cases 14-16 below are diary cases and went to module
+`04. Diary - notes and collecting a day` as its cases 11-13, next to the `doctor` case they belong
+with; that module was re-pushed whole at the same time, because `diary_agent.py doctor`'s
+registration snippet changed in this release. The hub holds 16 cases in each.
+
 
 The `uat-hub` MCP server failed to connect at the start of this session (CONNECTION_CLOSED) — which
 is the defect this release fixes, so it could not have been otherwise. The fix reaches a session
@@ -225,8 +232,9 @@ the JSON and not knowing the file is where this stalls.
   fails if that guard is removed — but it is not something a tester can see from the interface.
 - Any platform other than Windows, on this machine. The Mac and Linux path is exercised by case 06
   as a committed value and by the test suite, but no case here starts the server on a Mac.
-- The backlog push itself. It happened on 2026-09-06 — 99 cases into round 1 — and it is what
-  proved the fix in anger, but it is not a case a tester re-runs.
+- The backlog push itself. It happened on 2026-09-06 — 99 cases into round 1, then 105 after
+  modules 04 and 06 were re-pushed — and it is what proved the fix in anger, but it is not a case a
+  tester re-runs.
 - Whether the Claude desktop app actually starts the diary server from the snippet in cases 13-15.
   The app is not installed on this machine, so the cases check what `doctor` tells you to do, not
   the app doing it.
