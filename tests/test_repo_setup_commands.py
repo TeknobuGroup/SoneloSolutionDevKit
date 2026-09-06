@@ -82,9 +82,26 @@ class UpdateCommand(unittest.TestCase):
     def test_it_points_on_to_refresh(self):
         self.assertIn("refresh", rs.UPDATE_COMMAND_MD)
 
-    def test_all_four_commands_are_owned(self):
+    def test_every_command_the_kit_writes_is_owned(self):
+        """An exact set on purpose: a command added to install but not to KIT_COMMAND_FILES is one
+        uninstall leaves behind, which is how landing.md outlived the kit. Adding one here is
+        meant to be a deliberate edit, not something a new release does quietly."""
         names = {p.name for p in rs.KIT_COMMAND_FILES}
-        self.assertEqual(names, {"repo-setup.md", "new-repo.md", "landing.md", "update.md"})
+        self.assertEqual(
+            names,
+            {"repo-setup.md", "new-repo.md", "landing.md", "update.md", "diary.md"},
+        )
+
+    def test_install_writes_every_command_it_owns(self):
+        """The other half of the same rule: owned but never written is a file uninstall promises to
+        remove and nothing ever creates."""
+        for f in rs.KIT_COMMAND_FILES:
+            const = next(k for k, v in vars(rs).items() if v is f)
+            self.assertIn(
+                "write(%s" % const,
+                SOURCE,
+                "%s is owned but nothing writes it" % f.name,
+            )
 
     def test_uninstall_removes_every_one_of_them(self):
         """landing.md was written by install and never removed by uninstall - it outlived the kit."""

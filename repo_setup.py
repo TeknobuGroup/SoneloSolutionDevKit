@@ -64,7 +64,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.12"
+VERSION = "4.13"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -79,8 +79,10 @@ COMMAND_FILE = Path("~/.claude/commands/repo-setup.md").expanduser()
 NEW_COMMAND_FILE = Path("~/.claude/commands/new-repo.md").expanduser()
 LANDING_COMMAND_FILE = Path("~/.claude/commands/landing.md").expanduser()
 UPDATE_COMMAND_FILE = Path("~/.claude/commands/update.md").expanduser()
+DIARY_COMMAND_FILE = Path("~/.claude/commands/diary.md").expanduser()
 # every command the kit owns: install writes them, uninstall and worklog mode remove them all
-KIT_COMMAND_FILES = (COMMAND_FILE, NEW_COMMAND_FILE, LANDING_COMMAND_FILE, UPDATE_COMMAND_FILE)
+KIT_COMMAND_FILES = (COMMAND_FILE, NEW_COMMAND_FILE, LANDING_COMMAND_FILE, UPDATE_COMMAND_FILE,
+                     DIARY_COMMAND_FILE)
 USER_SETTINGS = Path("~/.claude/settings.json").expanduser()
 HOOK_MARK = "repo_setup.py"
 CONFIG_FILE = HOME_DIR / "config.json"
@@ -1628,6 +1630,32 @@ description: Open this repo's landing page - commands, agents, state, environmen
 Run `python "$HOME/.claude/sonelo/repo_setup.py" landing` and report in one line that the page opened (the command prints its path). Do nothing else.
 '''
 
+DIARY_COMMAND_MD = '''---
+description: Classify the repos on this machine for the dev diary - what each one may say about itself, one pass down the list
+---
+Run `python "$HOME/.claude/sonelo/repo_setup.py" diary --json`. Each row is a repo the worklog knows about, with the tier recorded in its own `.teknobu.json`. A row with `"declared": false` has nothing recorded, so the diary counts its hours and says nothing else about it - those are the ones this pass is for.
+
+If every row is declared, say so in one line and stop.
+
+Otherwise say how many are unclassified, then go down them **oldest name first, one message per repo**, showing: the repo name, its path, and - only if it is on disk - one line of evidence you can see for yourself (the folder name is not evidence; `git log -1 --format=%s` or the first line of its README is). Then ask which tier it is, offering the three:
+
+- **private** - hours only. The day-file records that time was spent and calls it "client work". Anything a client owns.
+- **nickname** - what it did, under a codename. The diary may say a feature was built and roughly what kind of thing it was; it may never name the product, the client, the repo, a branch or a person. Ask for a codename, or say you will generate one - `--nickname auto` picks from a fixed list and is never derived from the repo's name.
+- **own** - full detail. Commit subjects, session narrative, the lot. Only your own work, and it still never prints the repo's name: `--description` is what to call it, e.g. "a scheduling tool".
+
+**Never choose for the user, and never infer a tier from the repo's name, its remote or its contents.** A tier nobody chose is a classification nobody made, and the default is private precisely so that silence is the safe answer. If they are unsure, the answer is private; it can be raised later, and a day-file that has already been published cannot be unpublished.
+
+For each answer, run one command and report its output verbatim:
+
+    python "$HOME/.claude/sonelo/repo_setup.py" diary --repo "<path>" --tier private
+    python "$HOME/.claude/sonelo/repo_setup.py" diary --repo "<path>" --tier nickname --nickname auto
+    python "$HOME/.claude/sonelo/repo_setup.py" diary --repo "<path>" --tier own --description "<what it is, not its name>"
+
+The user can say "the rest are private" or "skip the rest" at any point; do exactly that and stop asking. They can also say "stop" - leaving repos unclassified is safe, because unclassified is private.
+
+It writes one key into each repo's `.teknobu.json` and touches nothing else. That file is committed, so at the end list the repos you changed and say the change needs committing in each - you are not in those repos, so do not commit them yourself. Finish with `diary --list` so the user can see the state, and mention that `diary collect yesterday` is what turns it into a day-file.
+'''
+
 LANDING_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{NAME} &mdash; Sonelo</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1714,11 +1742,12 @@ Gather everything before doing anything, in one message, defaults in brackets; t
 3. Supabase: already has a production project **of yours** [yes for an existing app] - then create only the {WORK} database; or create both. **On a Lovable migration the answer is always "create both"**: the project it has now is Lovable's, it does not travel with the code, and reusing it means the migration never happened. Never `--only {WORK}` there.
 4. GitHub branch protection on main [yes].
 5. UAT Hub project slug, so sessions can push UAT test cases to {UAT_HUB} instead of writing a Markdown file [the repo folder name]. The project must already exist in the hub - a push to an unknown slug is refused rather than creating one, so ask the user rather than guessing. "skip" leaves the default in place; the wiring stays inert until the project exists.
+6. Dev diary: how may this repo appear in it? [private] **private** - hours only, called "client work"; anything a client owns. **nickname** - what it did, under a codename that is never the product, the client or a person; ask for one or say "auto" and the kit generates one. **own** - full detail, only for your own work; ask what to call it in a sentence ("a scheduling tool"), never its name. Never choose for them and never infer it from the repo: private is the default because a classification nobody made must be the closed one, and a published day-file cannot be unpublished.
 Confirm the plan in four lines, including that Supabase projects may be billable. Then run without further questions.
 
 Do, reporting each step's output:
 1. `python "$HOME/.claude/sonelo/repo_setup.py" doctor` - stop and tell the user if a login the plan needs is missing; don't work around it.
-2. `python "$HOME/.claude/sonelo/repo_setup.py" apply --uat-project <slug>` (drop the flag to keep whatever the repo already recorded). It lays down hooks, CI, {ENVDOC}, CLAUDE.md and its "Writing UAT" section, `.mcp.json` registering the UAT Hub MCP server (merged into any that exists; the key stays the `${UAT_HUB_KEY}` placeholder and is never written out), `UAT_HUB_KEY` in `.env.example`, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, prefer `repo_setup.py refresh --uat-project <slug>`: it takes the kit's current agents, commands, hooks and CI *gates* (ci-gates.yml, pull_request_template.md), keeps a backup of everything it replaces, and touches nothing else - not the repo's own ci.yml, env files, design contract or branches. Never pass `--force` unless asked.
+2. `python "$HOME/.claude/sonelo/repo_setup.py" apply --uat-project <slug> --diary-tier <tier>` (add `--diary-nickname <name|auto>` for nickname, `--diary-description "<what it is>"` for own; drop any flag to keep whatever the repo already recorded). It lays down hooks, CI, {ENVDOC}, CLAUDE.md and its "Writing UAT" section, `.mcp.json` registering the UAT Hub MCP server (merged into any that exists; the key stays the `${UAT_HUB_KEY}` placeholder and is never written out), `UAT_HUB_KEY` in `.env.example`, the pipeline (agents, /post-change, /design-pass, /pr, the three Claude Code hooks, CI gates, rules), the design contract, the worklog, creates `{WORK}` from `{MAIN}` and checks it out, and for a Lovable project writes MIGRATION.md. On a repo that already has an older pipeline, prefer `repo_setup.py refresh --uat-project <slug> --diary-tier <tier>` (it takes the same `--diary-*` flags): it takes the kit's current agents, commands, hooks and CI *gates* (ci-gates.yml, pull_request_template.md), keeps a backup of everything it replaces, and touches nothing else - not the repo's own ci.yml, env files, design contract or branches. Never pass `--force` unless asked.
 3. Brand: write the guidelines verbatim to `docs/BRAND.md` if given, and rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the one call-to-action colour, the off-brand list, the design lint command if any). Put the product's one-line description and voice rules into CLAUDE.md and the pipeline's ARCHITECTURE/STATUS/UAT placeholders. Take the stack from the repo, not from the guidelines; if they disagree (e.g. the document still says Lovable Cloud), say so in the summary.
 4. Fill every remaining `TODO` in the pipeline files from what is true of the repo. Ask nothing; leave a TODO only if it is genuinely unknowable.
 5. Stage the generated files, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: apply sonelo repo standards` on `{WORK}`.
@@ -1741,6 +1770,7 @@ Ask everything in ONE message, defaults in brackets. The user can reply "default
 5. Supabase. [{DB_PLAN}, region {REGION}]
 6. Vercel. [create the project; {WORK}.{DOMAIN_PATTERN} for {WORK}, {DOMAIN_PATTERN} for production]
 7. Brand and product guidelines: paste, name a file, or "defaults" / "none yet". [defaults]
+8. Dev diary: how may this project appear in it? [private] **private** - hours only, called "client work". **nickname** - what it did, under a codename; ask for one or say "auto". **own** - full detail, your own work; ask what to call it in a sentence ("a scheduling tool"), never its name. Never choose for them and never infer it from the project name: private is the default because a classification nobody made must be the closed one.
 
 Confirm the plan in a few lines, including that the Supabase projects may be billable, and that it will run to the end without further questions. Then do all of this, reporting each step briefly:
 
@@ -1748,7 +1778,7 @@ a. `python "$HOME/.claude/sonelo/repo_setup.py" doctor`. If a login the plan nee
 b. Create the folder. `git init -b main`. Commit nothing yet.
 c. Agents and rules FIRST: `python "$HOME/.claude/sonelo/repo_setup.py" apply`. It lays down the pipeline (agents, /post-change, stop gate, CI gates, rules, docs), the design-reviewer, `.claude/rules/design.md`, CLAUDE.md, hooks and CI before any application code exists. If brand guidelines were given: write them verbatim to `docs/BRAND.md`, rewrite `.claude/rules/design.md` from them (tokens and roles, type families and weights, radius, borders vs shadows, the single call-to-action colour, the off-brand list), and put the one-line description and voice rules into CLAUDE.md. The stack comes from the plan, not from the guidelines.
 d. Scaffold the chosen stack into the folder with its current official scaffolding command (check the docs if unsure; non-interactive flags; keep the existing files). For "empty", a README.md. Make sure `.gitignore` exists.
-e. `apply` again (now it detects the stack and fills the pipeline's build/test/types placeholders; it also creates `{WORK}` from `{MAIN}` and checks it out). Fill any remaining TODOs from what is true of the repo; leave none unless genuinely unknowable.
+e. `apply --diary-tier <tier>` again (plus `--diary-nickname <name|auto>` or `--diary-description "<what it is>"` as answered; now it detects the stack and fills the pipeline's build/test/types placeholders, and it creates `{WORK}` from `{MAIN}` and checks it out). Fill any remaining TODOs from what is true of the repo; leave none unless genuinely unknowable.
 f. Stage everything, `git update-index --chmod=+x .githooks/commit-msg .githooks/pre-commit .githooks/pre-push .claude/hooks/*.sh`, commit `chore: scaffold <stack> with sonelo standards and pipeline` on {MAIN}, then `git checkout {WORK}` (or create it from {MAIN} if apply could not).
 g. `repo_setup.py github --org <org>` (add `--public` only if asked). Creates the repository, pushes {MAIN} and {WORK}, protects {MAIN} with `checks` and the pipeline's gates job.
 h. `repo_setup.py supabase --create` (plus `--org` if doctor listed more than one). Creates the database(s) per the configured strategy ({DATABASE}), runs `supabase init` if the CLI is present so the deploy workflow exists, writes the env files, sets the five GitHub secrets. Then `apply` once more so the deploy workflow is generated, and commit it.
@@ -1991,6 +2021,218 @@ def uat_slug(root, explicit=None):
             return folded
         say("warning    .teknobu.json records an unusable uat_project; falling back to the folder name")
     return normalise_slug(root.name) or "project"
+
+
+# ----------------------------------------------------------------------------- diary tiers
+
+DIARY_TIERS = ("private", "nickname", "own")
+DIARY_LIMITS = {"nickname": 40, "description": 120}
+# Codenames for a project whose real name may never be printed. Ordinary nouns from nowhere in
+# particular: the point of a codename is that it says nothing about the thing it names, so there is
+# no software word, no client word and no product word in this list.
+CODENAMES = ("Kestrel", "Harrier", "Redwing", "Curlew", "Bittern", "Fulmar", "Merlin", "Wheatear",
+             "Lapwing", "Dunlin", "Siskin", "Linnet", "Chough", "Serin", "Twite", "Brambling",
+             "Hawthorn", "Blackthorn", "Rowan", "Alder", "Hazel", "Juniper", "Bracken", "Sorrel",
+             "Teasel", "Comfrey", "Yarrow", "Vetch", "Clover", "Meadowsweet", "Foxglove", "Campion",
+             "Granite", "Basalt", "Slate", "Flint", "Quartz", "Gypsum", "Marl", "Shale",
+             "Northerly", "Westerly", "Squall", "Halyard", "Capstan", "Windlass", "Ketch",
+             "Lantern", "Beacon", "Anvil", "Bellows", "Trestle", "Lintel", "Keystone", "Cornice")
+
+
+def diary_text(kind, value):
+    """A diary nickname or description, normalised and bounded.
+
+    Validated for the same reason `uat_slug` is: this string is written into `.teknobu.json`, read
+    back by `diary_agent.py`, and printed verbatim into a day-file whose whole purpose is to be safe
+    to publish. A newline, a control character or a paragraph in it lands in that file, and the blog
+    is written from the file rather than from the repo."""
+    text = " ".join(str(value).split())
+    if not text:
+        raise argparse.ArgumentTypeError("the diary %s is empty" % kind)
+    unprintable = [c for c in text if not c.isprintable()]
+    if unprintable:
+        raise argparse.ArgumentTypeError("the diary %s holds a character that cannot be printed "
+                                         "(%r), and it goes into a published file" % (kind, unprintable[0]))
+    if len(text) > DIARY_LIMITS[kind]:
+        raise argparse.ArgumentTypeError("the diary %s is %d characters; keep it under %d - it is a "
+                                         "label in a day-file, not a paragraph"
+                                         % (kind, len(text), DIARY_LIMITS[kind]))
+    return text
+
+
+def nickname_arg(value):
+    """argparse `type=`. "auto" is the one reserved value: it asks for a generated codename."""
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    return diary_text("nickname", value)
+
+
+def description_arg(value):
+    return diary_text("description", value)
+
+
+def codename(taken=()):
+    """A codename for a project whose real name may never appear in the diary.
+
+    Random, from a fixed list, and never derived from the repo's name, folder, remote or
+    description - a codename you can reverse is not a codename. It avoids the ones already in use,
+    so two projects in one day-file are never the same word."""
+    used = set(str(t).strip().lower() for t in taken if str(t).strip())
+    free = [w for w in CODENAMES if w.lower() not in used]
+    if free:
+        return _secrets.choice(free)
+    return "%s %d" % (_secrets.choice(CODENAMES), _secrets.randbelow(89) + 11)
+
+
+def read_diary_block(root):
+    """A repo's `diary` block, normalised. An absent or unusable one is `private`.
+
+    Deliberately duplicated from `diary_agent.py:repo_diary_cfg`: each tool in this kit is one
+    self-contained file, so there is nothing to import. The two must agree, and
+    tests/test_repo_setup_diary.py compares them directly on the same inputs - the worklog's
+    `session_day_minutes` drifted between copies once and nobody noticed for weeks."""
+    data = read_json(Path(root) / ".teknobu.json", {})
+    block = data.get("diary") if isinstance(data, dict) else None
+    declared = isinstance(block, dict) and str(block.get("tier") or "").strip().lower() in DIARY_TIERS
+    if not isinstance(block, dict):
+        block = {}
+    tier = str(block.get("tier") or "").strip().lower()
+    return {"tier": tier if tier in DIARY_TIERS else "private",
+            "nickname": " ".join(str(block.get("nickname") or "").split()),
+            "description": " ".join(str(block.get("description") or "").split()),
+            "declared": declared}
+
+
+DIARY_PRIVATE_LABEL = "client work"         # diary_agent.py:PRIVATE_LABEL - kept in step by the tests
+
+
+def diary_label(block):
+    """What the day-file would call a repo with this block - `diary_agent.py:label_for`, so the
+    operator sees the consequence of the tier they picked at the moment they pick it. Never the repo
+    name at any tier: `own` is permission to describe the work in full, not to name the product."""
+    tier = block.get("tier")
+    if tier == "private":
+        return DIARY_PRIVATE_LABEL
+    if tier == "nickname":
+        return block.get("nickname") or DIARY_PRIVATE_LABEL
+    return block.get("description") or "a project"
+
+
+def diary_block(current, tier=None, nickname=None, description=None, taken=()):
+    """The block to record, from what was asked for and what the repo already holds. -> (block, notes)
+
+    Only the codename is ever generated. The tier and the description stay the operator's own words:
+    a tier inferred from a folder name is a classification nobody made, and the reason the default is
+    `private` is that classifying has to be an act rather than an omission (docs/decisions/0011).
+    A flag that was not passed changes nothing, so `--diary-description` alone can correct a label
+    without disturbing the tier. A key the new tier does not use is kept rather than cleared: a
+    codename that changed every time a repo was raised and lowered would make the diary incoherent
+    from one post to the next, and the reader has no way to know two names are one project."""
+    notes = []
+    # .get, because the two dicts that reach this look alike and are not: `read_diary_block` always
+    # fills every key, a block read back out of .teknobu.json fills only the ones it uses.
+    tier = tier or current.get("tier") or "private"
+    nick, desc = current.get("nickname") or "", current.get("description") or ""
+    if description is not None:
+        desc = description
+    if nickname is not None:
+        nick = codename(taken) if nickname == "auto" else nickname
+        if nickname == "auto":
+            notes.append("codename %s, generated - it is not derived from the repo's name" % nick)
+    if tier == "nickname" and not nick:
+        # label_for() raises on this combination and the collect downgrades the whole project to
+        # private for the day. Generating one is strictly better than recording a tier that cannot work.
+        nick = codename(taken)
+        notes.append("tier nickname needs a codename and none was given, so: %s" % nick)
+    if tier == "own" and not desc:
+        notes.append("tier own with no description, so the day-file will call it 'a project' - "
+                     "--diary-description says what it is without naming it")
+    block = {"tier": tier}
+    if nick:
+        block["nickname"] = nick
+    if desc:
+        block["description"] = desc
+    return block, notes
+
+
+def write_diary_block(root, block, dry=False):
+    """Record the block in a repo's .teknobu.json, touching nothing else in the file.
+
+    The sweep writes into repos other than the one the session is in, so a config it cannot parse
+    stops it rather than being replaced - the v4.6 lesson, one file over. -> True if it changed."""
+    root = Path(root)
+    require_readable_config(root)
+    path = root / ".teknobu.json"
+    cfg = read_json(path, {})
+    if not isinstance(cfg, dict):
+        sys.exit("%s is not a JSON object, so there is nowhere to record a diary tier" % path)
+    changed = cfg.get("diary") != block
+    cfg["diary"] = block
+    if not dry:
+        write(path, json.dumps(cfg, indent=2) + "\n")
+    return changed
+
+
+def worklog_pot(explicit=None):
+    """Where the worklog keeps its slices - the kit's registry of repos.
+
+    The same order `diary_agent.py` resolves it in: what was asked for, then the worklog's own
+    config, then the default. Read only; nothing in this file ever writes into the pot."""
+    if explicit:
+        return Path(str(explicit)).expanduser()
+    wcfg = read_json(Path("~/.claude/worklog.json").expanduser(), {})
+    if isinstance(wcfg, dict) and wcfg.get("pot"):
+        return Path(str(wcfg["pot"])).expanduser()
+    return Path("~/Worklog").expanduser()
+
+
+def pot_repos(pot):
+    """Every repo the worklog knows about, with its diary classification.
+
+    Alphabetical, because this is a list a person reads and works down. One row per path: a repo
+    with a worktree reports a slice for each, and they are separate checkouts with separate config
+    files, so both are shown - classifying one does not classify the other."""
+    rows, seen = [], set()
+    for f in sorted((Path(pot) / "slices").glob("*.json")):
+        d = read_json(f, None)
+        if not isinstance(d, dict) or d.get("kind") == "machine" or "project" not in d:
+            continue
+        path = str(d.get("path") or "").strip()
+        if not path or path.lower() in seen:
+            continue
+        seen.add(path.lower())
+        row = read_diary_block(Path(path))
+        project, repo = str(d.get("project") or ""), str(d.get("repo") or "")
+        row.update({"project": project, "repo": repo, "path": path, "on_disk": Path(path).is_dir(),
+                    # Two checkouts of one project - a worktree, or a second repo under the same
+                    # name - are separate .teknobu.json files. Naming both makes it clear that
+                    # classifying one has not classified the other.
+                    "name": project if repo in ("", project) else "%s/%s" % (project, repo)})
+        rows.append(row)
+    return sorted(rows, key=lambda r: r["name"].lower())
+
+
+def taken_codenames(pot, excluding=None):
+    """Codenames already in use, so a generated one never collides. A pot that is missing or
+    unreadable is not a reason to fail a setup - it only means we cannot check."""
+    try:
+        skip = str(Path(excluding).resolve()).lower() if excluding else None
+        return [r["nickname"] for r in pot_repos(pot)
+                if r["nickname"] and (not skip or str(Path(r["path"]).resolve()).lower() != skip)]
+    except (OSError, ValueError):
+        return []
+
+
+def diary_from_args(root, args):
+    """The diary block asked for on an `apply` or `refresh` command line, or (None, []) if nothing
+    was asked for. Shared by both so the two cannot drift."""
+    tier = getattr(args, "diary_tier", None)
+    nick = getattr(args, "diary_nickname", None)
+    desc = getattr(args, "diary_description", None)
+    if not (tier or nick or desc):
+        return None, []
+    return diary_block(read_diary_block(root), tier, nick, desc,
+                       taken=taken_codenames(worklog_pot(None), excluding=root))
 
 
 def backup_copy(root, name, text, into=None):
@@ -2953,8 +3195,12 @@ def cmd_apply(args):
                 "stack": {k: d[k] for k in ("node", "pm", "supabase", "flutter", "python", "vercel")}})
     cfg.setdefault("generated_types", "src/types/database.ts")
     # A repo nobody has classified is a client's: the diary reads this and, at "private",
-    # contributes the repo's hours to a day and nothing else. Raise it per repo by hand.
+    # contributes the repo's hours to a day and nothing else. --diary-tier raises it; /repo-setup
+    # asks for it, so a repo is classified when it is set up rather than eighteen at a time later.
     cfg.setdefault("diary", {"tier": "private"})
+    dblock, dnotes = diary_from_args(root, args)
+    if dblock:
+        cfg["diary"] = dblock
     text = json.dumps(cfg, indent=2) + "\n"
     existed = cfg_path.exists()
     if read(cfg_path) == text:
@@ -2992,6 +3238,10 @@ def cmd_apply(args):
     say("")
     if created:
         say("PRELIVE_BRANCH_CREATED")
+    for note in dnotes:
+        say("diary      %s" % note)
+    if dblock:
+        say("diary      tier %s, so the day-file calls this repo %r" % (dblock["tier"], diary_label(dblock)))
     say("Next: read %s for the manual wiring, commit these files on %s, then `git push -u origin %s`." % (env_doc(), WORK_BRANCH, WORK_BRANCH))
 
 
@@ -3080,19 +3330,29 @@ def cmd_refresh(args):
     cfg_path = root / ".teknobu.json"
     cfg = read_json(cfg_path, {})
     asked = (getattr(args, "uat_project", None) or "").strip()
+    dblock, dnotes = diary_from_args(root, args)
     # `asked` alone is enough: a repo with no .teknobu.json (or an empty one) would have
     # its slug wired into .mcp.json and CLAUDE.md but never recorded, and the next plain refresh
     # would revert both to the folder name - exactly the regression this flag exists to prevent.
-    if isinstance(cfg, dict) and (asked or (cfg and cfg.get("kit") != VERSION)):
+    # `dblock` is in the same condition for the same reason: a diary-only refresh on an
+    # already-current repo would otherwise print a tier it never wrote down.
+    if isinstance(cfg, dict) and (asked or dblock or (cfg and cfg.get("kit") != VERSION)):
         cfg["kit"] = VERSION                    # the rest of the file is the repo's own, with one exception:
         cfg["applied"] = datetime.now().strftime("%Y-%m-%d")
         if asked:
             cfg["uat_project"] = asked          # explicitly handed to us, so remember it - otherwise the
-        if not dry:                             # next plain refresh reverts to the folder-name default
+        if dblock:                              # next plain refresh reverts to the folder-name default
+            cfg["diary"] = dblock
+        if not dry:
             write(cfg_path, json.dumps(cfg, indent=2) + "\n")
-        rep.note("kit version recorded (v%s)%s" % (VERSION, "; UAT Hub project %s" % asked if asked else ""), cfg_path)
+        rep.note("kit version recorded (v%s)%s%s" % (VERSION, "; UAT Hub project %s" % asked if asked else "",
+                                                     "; diary tier %s" % dblock["tier"] if dblock else ""), cfg_path)
 
     say("Pipeline %srefreshed from kit v%s: %s" % ("(dry run) " if dry else "", VERSION, root))
+    for note in dnotes:
+        say("diary      %s" % note)
+    if dblock:
+        say("diary      tier %s, so the day-file calls this repo %r" % (dblock["tier"], diary_label(dblock)))
     say("")
     if rep.rows:
         width = max(len(a) for a, _ in rep.rows)
@@ -4028,6 +4288,65 @@ def machine_line(settings_path=None):
         "disabled" if disabled else "not disabled" if (model or window) else "—")
 
 
+def cmd_diary(args):
+    """Classify repos for the diary: list what the pot holds, or record one repo's tier.
+
+    The tier is written per repo, in that repo's own committed `.teknobu.json`, because that is
+    where the classification belongs - it travels with the code and it is reviewable in a diff. This
+    command exists because doing that by hand across every repo on a machine is the reason nobody
+    does it, and an unclassified repo is silently reduced to a number of hours."""
+    pot = worklog_pot(getattr(args, "pot", None))
+    dry = getattr(args, "dry_run", False)
+    if getattr(args, "repo", None):
+        root = Path(args.repo).expanduser()
+        if not root.is_dir():
+            sys.exit("no such folder: %s" % root)
+        current = read_diary_block(root)
+        asked = (getattr(args, "tier", None), getattr(args, "nickname", None), getattr(args, "description", None))
+        if not any(asked):
+            say("%-9s %s" % (current["tier"], root))
+            say("           the day-file would call it %r%s"
+                % (diary_label(current), "" if current["declared"] else " (nothing recorded; private is the default)"))
+            say("           set it with --tier private|nickname|own")
+            return
+        block, notes = diary_block(current, asked[0], asked[1], asked[2],
+                                   taken=taken_codenames(pot, excluding=root))
+        changed = write_diary_block(root, block, dry=dry)
+        for note in notes:
+            say("           %s" % note)
+        say("%-9s %s%s" % (block["tier"], root, "" if changed else "  (already recorded)"))
+        say("           the day-file %s call it %r"
+            % ("would" if dry else "will", diary_label(block)))
+        if not dry:
+            say("           commit .teknobu.json: the classification belongs with the code")
+        return
+
+    rows = pot_repos(pot)
+    if getattr(args, "json", False):
+        say(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        say("no repos in the worklog pot at %s - the worklog records one the first time you open a "
+            "repo in Claude Code, so classify those by path: diary --repo <path> --tier <tier>" % pot)
+        return
+    width = max([7] + [len(r["name"]) for r in rows])
+    say("  %s %-*s %-9s %s" % (" ", width, "repo", "tier", "what the diary would call it"))
+    for r in rows:
+        say("  %s %-*s %-9s %s" % (" " if r["declared"] else "!", width, r["name"], r["tier"],
+                                   (diary_label(r) if r["declared"] else "hours only, by default")
+                                   + ("" if r["on_disk"] else "   (not on this machine)")))
+    undeclared = [r for r in rows if not r["declared"]]
+    say("")
+    say("%d of %d classified. ! means nothing is recorded, so the diary counts its hours and says "
+        "nothing else about it." % (len(rows) - len(undeclared), len(rows)))
+    if undeclared:
+        say("Set one:  python \"%s\" diary --repo \"%s\" --tier private"
+            % (INSTALLED.as_posix(), undeclared[0]["path"]))
+        say("          ...--tier nickname --nickname auto   what it did, under a generated codename")
+        say("          ...--tier own --description \"a scheduling tool\"   full detail, your own work")
+        say("In Claude Code, /diary walks the list and does this for each one.")
+
+
 def cmd_doctor(args):
     """Everything the setup needs, as present/absent. Never prints a value."""
     say("kit        v%s at %s%s" % (VERSION, INSTALLED, "" if INSTALLED.exists() else "  (not installed - run install)"))
@@ -4036,6 +4355,14 @@ def cmd_doctor(args):
     say("worklog    %s" % ("v%s" % ".".join(map(str, version_of(WORKLOG))) if WORKLOG.exists() else "missing"))
     say("diary      %s%s" % ("v%s" % ".".join(map(str, version_of(DIARY))) if DIARY.exists() else "missing",
                              "  (python \"%s\" doctor for the detail)" % DIARY.as_posix() if DIARY.exists() else ""))
+    rows = pot_repos(worklog_pot(None))
+    if rows:
+        # Counted here as well as in the diary's own doctor, because this is the tool that can fix
+        # it: an unclassified repo is silently reduced to hours, and silence is the whole problem.
+        undeclared = [r for r in rows if not r["declared"]]
+        say("           %d of %d repos in the pot have a diary tier%s"
+            % (len(rows) - len(undeclared), len(rows),
+               "; `repo_setup.py diary --list` names the rest" if undeclared else ""))
     for name in ("git", "node", "npm", "gh", "vercel", "supabase"):
         say("%-10s %s" % (name, tool(name) or "not found"))
     gh = tool("gh")
@@ -4448,6 +4775,7 @@ def cmd_install(args):
     write(NEW_COMMAND_FILE, command_text(NEW_COMMAND_MD))
     write(LANDING_COMMAND_FILE, LANDING_COMMAND_MD)
     write(UPDATE_COMMAND_FILE, UPDATE_COMMAND_MD)
+    write(DIARY_COMMAND_FILE, DIARY_COMMAND_MD)
     data = read_json(USER_SETTINGS, None) if USER_SETTINGS.exists() else {}
     if data is None:
         sys.exit("cannot parse %s; fix it first" % USER_SETTINGS)
@@ -4509,11 +4837,26 @@ def cmd_uninstall(args):
     for f in KIT_COMMAND_FILES:
         if f.exists():
             f.unlink()
-    say("removed the /repo-setup, /new-repo, /landing and /update commands and the session-start nudge; "
+    say("removed the /repo-setup, /new-repo, /landing, /update and /diary commands and the session-start nudge; "
         "%s and the repos' files are left in place" % HOME_DIR)
 
 
 # ----------------------------------------------------------------------------- main
+
+def add_diary_args(p):
+    """The diary flags, on apply and on refresh. One function so the help text, the validators and
+    the choices cannot differ between the two commands that both write this block."""
+    p.add_argument("--diary-tier", choices=DIARY_TIERS,
+                   help="how this repo may appear in the dev diary - private: hours only (the default for "
+                        "any repo nobody has classified) | nickname: what it did, under a codename | "
+                        "own: full detail, for your own work")
+    p.add_argument("--diary-nickname", type=nickname_arg,
+                   help="the codename for --diary-tier nickname; 'auto' generates one that is not derived "
+                        "from the repo's name")
+    p.add_argument("--diary-description", type=description_arg,
+                   help="what --diary-tier own calls it, e.g. \"a scheduling tool\" - what it is, never the "
+                        "product's name")
+
 
 def main():
     ap = argparse.ArgumentParser(description="Teknobu repo standards kit v%s" % VERSION)
@@ -4524,6 +4867,7 @@ def main():
     p.add_argument("--force", action="store_true", help="replace files that exist without the kit marker")
     p.add_argument("--update-pipeline", action="store_true", help="refresh the built-in pipeline files (agents, commands, hooks, gates) from this kit version; backups kept")
     p.add_argument("--uat-project", metavar="SLUG", type=slug_arg, help="UAT Hub project slug for this repo (default: the recorded one, else the folder name); the project must already exist in the hub")
+    add_diary_args(p)
     p.set_defaults(fn=cmd_apply)
 
     p = sub.add_parser("refresh", help="take this kit's agents, commands, hooks and CI gates - and "
@@ -4532,7 +4876,19 @@ def main():
     p.add_argument("--repo", help="repo path (default: current directory)")
     p.add_argument("--dry-run", action="store_true", help="show what would change")
     p.add_argument("--uat-project", metavar="SLUG", type=slug_arg, help="record this repo's UAT Hub project slug and wire .mcp.json to it (default: the recorded one, else the folder name)")
+    add_diary_args(p)
     p.set_defaults(fn=cmd_refresh)
+
+    p = sub.add_parser("diary", help="classify repos for the diary: --list what the worklog knows about, or --repo <path> --tier ... to record one")
+    p.add_argument("--list", action="store_true", help="every repo in the worklog pot with its tier (the default when --repo is not given)")
+    p.add_argument("--json", action="store_true", help="the same list, machine-readable")
+    p.add_argument("--repo", help="the repo to classify; with no --tier it reports what is recorded")
+    p.add_argument("--tier", choices=DIARY_TIERS, help="private: hours only | nickname: what it did, under a codename | own: full detail, your own work")
+    p.add_argument("--nickname", type=nickname_arg, help="the codename for tier nickname; 'auto' generates one that is not derived from the repo's name")
+    p.add_argument("--description", type=description_arg, help="what tier own calls it, e.g. \"a scheduling tool\" - what it is, never the product's name")
+    p.add_argument("--dry-run", action="store_true", help="show the change without writing it")
+    p.add_argument("--pot", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_diary)
 
     p = sub.add_parser("check", help="what's in place in the current repo")
     p.add_argument("--repo")
