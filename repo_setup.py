@@ -64,7 +64,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.13"
+VERSION = "4.14"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -95,11 +95,23 @@ UAT_HUB_URL = "https://testing.teknobugroup.com"
 UAT_HUB_KEY_VAR = "UAT_HUB_KEY"                         # read from the environment; never written into a file
 UAT_MCP_NAME = "uat-hub"                                # the server's key in .mcp.json
 UAT_HUB_SERVER = Path("~/uat-hub/mcp/server.mjs").expanduser()   # resolved, for doctor's existence check
-# What goes into .mcp.json. Claude Code expands ${VAR} in command/args/env alike (verified with
-# `claude mcp list`: it validates the reference and warns only about variables that are unset), so
-# the committed file names no machine's home directory - no developer's username in a client repo's
-# history, and the same canonical value on every machine, which keeps the rewrite self-healing.
-UAT_HUB_SERVER_REF = "${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs"
+# What goes into .mcp.json. The committed file names no machine's home directory, so no developer's
+# username reaches a client repo's history.
+#
+# NEVER nest a ${...} inside a :- default here. Claude Code expands ${VAR} and ${VAR:-literal}, but
+# a nested default is not parsed as one: `${HOME:-${USERPROFILE}}` resolved the inner variable and
+# left the outer brace stranded, launching `C:\Users\<user>}/uat-hub/mcp/server.mjs`. node exited
+# MODULE_NOT_FOUND and the server never started - in any repo, on any machine, from 4.6 to 4.13,
+# while every check in this file reported it correct. `claude mcp list` accepting the syntax proves
+# only that it parsed; the launched path is the thing to test.
+#
+# Two constants rather than one because neither variable is portable: HOME is not a Windows
+# environment variable (absent from the registry; Git Bash sets it per-process, which is what made
+# an earlier ${HOME}-only version look verified), and USERPROFILE does not exist off Windows. Both
+# are accepted everywhere a reference is validated, so a mixed-platform team sees no drift.
+UAT_HUB_SERVER_REFS = ("${USERPROFILE}/uat-hub/mcp/server.mjs",   # Windows
+                       "${HOME}/uat-hub/mcp/server.mjs")          # macOS, Linux
+UAT_HUB_SERVER_REF = UAT_HUB_SERVER_REFS[0] if os.name == "nt" else UAT_HUB_SERVER_REFS[1]
 KIT_ENV_KEYS = ("UAT_HUB_KEY",)                         # keys .env.example documents because the kit needs them,
                                                         # not because a .env in the repo mentioned them
 
@@ -394,8 +406,12 @@ files=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR
 py=python
 command -v python >/dev/null 2>&1 || py=python3
 mcpcheck='
-import json, sys
-hub, srv = sys.argv[1], sys.argv[2]
+import json, os, sys
+# argv[2:] are the launch references this kit accepts, Windows first, in a fixed order so the hook
+# is byte-identical on every platform. Either is valid in a committed file - a repo set up on
+# Windows is cloned onto a Mac - but the advice names the one this machine can actually resolve.
+hub, refs = sys.argv[1], sys.argv[2:]
+srv = refs[0] if os.name == "nt" else refs[-1]
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -410,7 +426,8 @@ if env.get("UAT_HUB_KEY") != "${UAT_HUB_KEY}":
     bad.append("UAT_HUB_KEY must be exactly ${UAT_HUB_KEY}; it is committed and one key covers every project")
 if env.get("UAT_HUB_URL") != hub:
     bad.append("UAT_HUB_URL must be exactly " + hub + "; that is where the shared key is sent")
-if s.get("command") != "node" or s.get("args") != [srv]:
+a = s.get("args")
+if s.get("command") != "node" or not (isinstance(a, list) and len(a) == 1 and a[0] in refs):
     bad.append("command/args must be node " + srv + "; they name the process started with the key in scope")
 for b in bad:
     print("    " + b)
@@ -442,7 +459,7 @@ patterns="$shapes|$named"
 for f in $files; do
   case "$f" in
     .mcp.json|*/.mcp.json)
-      if ! git show ":$f" 2>/dev/null | $py -c "$mcpcheck" '{UAT_HUB}' '{UAT_SERVER}'; then
+      if ! git show ":$f" 2>/dev/null | $py -c "$mcpcheck" '{UAT_HUB}' '{UAT_SERVER_WIN}' '{UAT_SERVER_NIX}'; then
         echo "blocked: $f - the uat-hub entry must be exactly what the kit writes (above)."
         echo "  Run: python \"\$HOME/.claude/sonelo/repo_setup.py\" refresh   to restore it."
         fail=1
@@ -737,7 +754,7 @@ What the kit wired automatically: git hooks (commit format, secrets, protected b
 ### UAT Hub
 - [ ] The project must exist at {UAT_HUB} before anything can be pushed: a push never creates one, so an unknown slug is refused (which is what stops a typo inventing a phantom client). Until then the wiring is inert, not broken.
 - [ ] Set `UAT_HUB_KEY` in your environment - not in `.env`, not in `.mcp.json`, which is committed. `repo_setup.py doctor` reports whether it is set, never its value.
-- [ ] `.mcp.json` records the slug and the server as `${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs` - unresolved, so the committed file names no machine and no username. Do **not** hand-edit that path: `check` and `doctor` report an edited one as missing its wiring, and the next `refresh` rewrites it (that entry names the process Claude Code launches with your `UAT_HUB_KEY` in scope, so it self-heals on purpose). If your checkout lives elsewhere, move it or symlink it; a session with no working server falls back to the HTTP endpoint.
+- [ ] `.mcp.json` records the slug and the server as `${USERPROFILE}/uat-hub/mcp/server.mjs` on Windows and `${HOME}/uat-hub/mcp/server.mjs` on macOS and Linux - a variable, not a path, so the committed file names no machine and no username. Both forms are accepted by `check`, `doctor` and the pre-commit hook, so a repo set up on one platform and cloned onto the other does not churn. Neither nests a variable inside a `:-` default: Claude Code does not expand that, and the kit shipped one that never resolved from 4.6 to 4.13. Do **not** hand-edit the path: an edited one reads as missing its wiring, and the next `refresh` rewrites it (that entry names the process Claude Code launches with your `UAT_HUB_KEY` in scope, so it self-heals on purpose). If your checkout lives elsewhere, move it or symlink it; a session with no working server falls back to the HTTP endpoint.
 
 ### GitHub
 - [ ] `python "$HOME/.claude/sonelo/repo_setup.py" protect` (needs the `gh` CLI logged in) - or Settings -> Branches -> add rule for `{MAIN}`: require a pull request, require the `checks` status, block force pushes and deletions.
@@ -1602,13 +1619,13 @@ BUILTIN_PIPELINE = {
     '.claude/hooks/pipeline-state.sh': PIPELINE_STATE_SH,
     '.claude/hooks/session-brief.sh': SESSION_BRIEF_SH,
     '.claude/rules/supabase.md': '---\npaths: ["supabase/**", "src/integrations/supabase/**", "src/lib/supabase*"]\n---\n# Supabase rules\n- Migrations are append-only files under `supabase/migrations/`; never edit an existing one, never change schema in a dashboard. After any migration change regenerate types: `{GEN_TYPES}` and commit the result.\n- Every table has RLS enabled with a policy per allowed operation, scoped to the owner or tenant. No `using (true)` outside intentionally public reads.\n- `service_role` only in edge functions. Clients use the publishable/anon key.\n- Edge functions validate input, return shaped errors (no stack traces), set CORS explicitly, and read secrets from `Deno.env.get`, never from code.\n- Local development and tests point at the work-branch database or `supabase start`; never at production.\n',
-    '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\npermissions:\n  contents: read\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            echo "::error::Migration changed but {TYPES} was not regenerated."; exit 1; fi\n',
+    '.github/workflows/ci-gates.yml': '# sonelo-devkit pipeline - pull-request gates: changelog entry, UAT document, types regenerated after migrations.\nname: CI gates\non:\n  pull_request:\n    branches: [{MAIN}]\npermissions:\n  contents: read\njobs:\n  gates:\n    name: gates\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Changed files\n        id: files\n        run: |\n          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > changed.txt\n          echo "code=$(grep -Ev \'^(docs/|CHANGELOG\\.md|\\.claude/|\\.github/|.*\\.md$|\\.env)\' changed.txt | head -1)" >> "$GITHUB_OUTPUT"\n      - name: Changelog entry present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^CHANGELOG\\.md$\' changed.txt || { echo "::error::Code changed but CHANGELOG.md has no entry. Run /post-change."; exit 1; }\n      - name: UAT document present\n        if: steps.files.outputs.code != \'\'\n        run: grep -q \'^docs/uat/\' changed.txt || { echo "::error::Code changed but no docs/uat/ document was added for this PR. Run /pr (uat-writer)."; exit 1; }\n      - name: Types regenerated after migrations\n        run: |\n          if grep -q \'^supabase/migrations/\' changed.txt && ! grep -q \'^{TYPES}$\' changed.txt; then\n            why=$(git log --format=%B "origin/${{ github.base_ref }}"..HEAD | grep -iE \'^Types-not-affected:[[:space:]]*[^[:space:]]\' | head -1)\n            if [ -n "$why" ]; then\n              echo "Types gate waived by the author: $why"\n            else\n              echo "::error::Migration changed but {TYPES} was not regenerated. If this migration cannot change types - a policy, grant or data-only migration produces no type diff - say so in a commit trailer, with a reason: Types-not-affected: policy-only migration"; exit 1\n            fi\n          fi\n',
     '.github/pull_request_template.md': '<!-- sonelo-devkit -->\n## Summary\n\n## UAT\nDocument: docs/uat/<file>\n\n## Checklist\n- [ ] Pipeline verdict clear (/post-change)\n- [ ] Tests green\n- [ ] CHANGELOG.md updated\n- [ ] Tried on the {WORK} URL\n- [ ] Migrations applied to the {WORK} database (if any)\n\n## Risk\n<!-- fast lane (docs/copy/styling) or full pipeline (db, auth, edge functions, shared types) -->\n',
     'docs/STATUS.md': '# STATUS - {NAME}\n\n## Now\n- <the one thing being worked on>\n\n## Done recently\n\n## Blocked\n\n## Next\n1.\n2.\n3.\n',
     'docs/ARCHITECTURE.md': '# ARCHITECTURE - {NAME}\n\n## Services and hosting\n<services, hosting, domains - five to ten lines>\n\n## Data\n<core tables, tenancy model, where RLS lives>\n\n## Edge functions\n<one line each>\n\n## Frontend\n<stack, routing, state, key screens>\n\n## Integrations\n<each third party and its auth model>\n\n## Environments\n<local, {WORK}, production - how they differ>\n',
     'docs/UAT_PLAN.md': '# UAT PLAN - {NAME}\n\nMaster list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.\n\n| ID | Area | Flow | Expected |\n|----|------|------|----------|\n',
 }
-PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The linter runs on the edited file after every edit (PostToolUse hook) and reports only the errors your change added on top of what the repo already accepts. Fix those before moving on; never disable a rule, and never raise the lint baseline, to make one go away. Whole-project type checking runs on push (`.githooks/checks`) and in CI - per edit it cost seconds and told nobody anything.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
+PIPELINE_CLAUDE_SECTION = '## Change pipeline\n\nEvery change goes through: plan -> implement -> review -> test -> verdict -> docs. The lead is this session; the agents are its specialists. Run `/post-change` once per work block - before reporting the work done, not per edit.\n\n### Risk tiers\n- **Fast lane**: docs, copy, styling, comments, and design-lane changes (below). No plan mode, no impact report. Reviewers, hooks, the Stop gate and CI still apply - a `.tsx` is application code, so `code-reviewer` is due on it like any other.\n- **Spike lane**: on a `spike/`, `draft/` or `proto/` branch the Stop gate reports outstanding work instead of blocking. Nothing that fails irreversibly is relaxed - secrets, protected branches and the migrations guard are unchanged on every branch. **Be clear about what this costs:** the review debt is reported at the time and is not recorded anywhere afterwards - `pipeline-state.sh` sees only uncommitted work, so committing makes it invisible, and no gate recomputes it when the branch merges. A spike branch is unreviewed work, and the only thing that reviews it is you running `/post-change` on the branch you merge into.\n- **Full pipeline**: anything touching the database or migrations, auth, edge functions, shared types or contracts, or code used in more than one place. Plan mode and the impact-analyst report are mandatory before editing; after the report, record `.claude/state/<branch>/impact.json` (`{"at": "<ISO time>", "touches": ["..."]}`) - the post-edit hook nudges once per branch until it exists.\n- If unsure which tier a change is, it is full pipeline.\n\n### Reviewers are triggered by the diff, not by memory\nThe hooks compute what is due from the changed files (`sh .claude/hooks/pipeline-state.sh due`), the session is briefed at start, and the Stop gate requires a fresh verdict covering:\n\n| Changed | Reviewer due |\n|---|---|\n| any code | `code-reviewer` |\n| *.tsx, *.jsx, *.css, *.scss, tailwind.config.* | `design-reviewer` |\n| supabase/, functions/, auth paths, .github/workflows/, .mcp.json | `security-reviewer` |\n\nRun the due reviewers in one message, in parallel; `/post-change` does this and records the verdict. If something blocks a reviewer from running - a missing tool, a worktree, a session instruction - say so in the same message as the work: after two blocked stops the gate lets the session end so the gap is reported, never hidden.\n\n### Rules that prevent bugs\n- Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.\n- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them. If a migration genuinely cannot change types - policy, grant or data only - the regeneration produces no diff, so say so in a commit trailer with a reason (`Types-not-affected: policy-only migration`). CI reads the trailer and prints the reason; a bare trailer with no reason does not count.\n- Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.\n- The linter runs on the edited file after every edit (PostToolUse hook) and reports only the errors your change added on top of what the repo already accepts. Fix those before moving on; never disable a rule, and never raise the lint baseline, to make one go away. Whole-project type checking runs on push (`.githooks/checks`) and in CI - per edit it cost seconds and told nobody anything.\n- Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.\n- "Done" means: reviewers\' verdict clear, tests green, CHANGELOG.md entry, UAT document for the PR, STATUS.md current.\n\n### Design-led, build-safe\n- When building or changing a screen, make the design decisions yourself, within `.claude/rules/design.md`: hierarchy, empty/loading/error states, spacing, reuse of the existing component for the same job. Do not ask; decide and say what you decided.\n- A design decision may never change data flow, contracts, or logic. If it would, it is a full-pipeline change and is planned first.\n- `/design-pass <screen>` applies the design-reviewer\'s polish and consistency findings in the fast lane and leaves anything that blocks or hurts the task for a human.\n\n### Loop cap\n- Review -> fix -> re-review runs at most twice. If a reviewer still reports a blocker after two rounds, stop and ask the user. The Stop gate blocks at most twice per work-state, then requires plain disclosure of what is unmet.\n'
 
 UPDATE_COMMAND_MD = '''---
 description: Update the Sonelo kit and worklog on this machine to the latest release, then offer to refresh this repo
@@ -1965,10 +1982,12 @@ def mcp_ok(root):
     args, env = entry.get("args"), entry.get("env")
     if not isinstance(env, dict) or not isinstance(args, list) or len(args) != 1:
         return False
-    # exact, not endswith: `./tools/uat-hub/mcp/server.mjs` satisfies a suffix test and is a
-    # redirected launch target. A repo written by an older kit carries an absolute path and reports
-    # as drift here, which is true - `refresh` rewrites it.
-    if entry.get("command") != "node" or args[0] != UAT_HUB_SERVER_REF:
+    # Exact membership, not endswith: `./tools/uat-hub/mcp/server.mjs` satisfies a suffix test and is
+    # a redirected launch target. Either canonical reference is accepted - both are written by this
+    # file, and a Windows repo opened on a Mac must not read as drift - but nothing else is. A repo
+    # written by an older kit carries an absolute path, or the nested reference that never resolved,
+    # and reports as drift here, which is true: `refresh` rewrites it.
+    if entry.get("command") != "node" or args[0] not in UAT_HUB_SERVER_REFS:
         return False
     return env.get("UAT_HUB_KEY") == "${%s}" % UAT_HUB_KEY_VAR and env.get("UAT_HUB_URL") == UAT_HUB_URL
 
@@ -2248,6 +2267,20 @@ def backup_copy(root, name, text, into=None):
     return into
 
 
+def existing_ref(entry):
+    """The launch reference an existing uat-hub entry carries, or None if it has no single one.
+
+    Deliberately total: .mcp.json is a file people and other tools edit, so `args` may be missing, a
+    string, or a list of any length. Only the one shape the kit writes yields a value; everything
+    else returns None and is rewritten by the caller."""
+    if not isinstance(entry, dict):
+        return None
+    args = entry.get("args")
+    if not isinstance(args, list) or len(args) != 1 or not isinstance(args[0], str):
+        return None
+    return args[0]
+
+
 def mcp_json(root, rep, slug, into=None):
     """Register the UAT Hub MCP server, merging into whatever .mcp.json the repo already has.
 
@@ -2274,10 +2307,18 @@ def mcp_json(root, rep, slug, into=None):
         servers = data.get("mcpServers")
         dropped = servers is not None and not isinstance(servers, dict)
         data["mcpServers"] = servers if isinstance(servers, dict) else {}
-        # `args` is deliberately rewritten to the canonical path on every run rather than
-        # preserved. It names the process Claude Code launches at session start with UAT_HUB_KEY in
-        # its environment, so a redirected one that survived a refresh would be a persistent hijack;
-        # rewriting it means any tampering self-heals on the next apply or refresh.
+        # `args` is deliberately rewritten rather than preserved. It names the process Claude Code
+        # launches at session start with UAT_HUB_KEY in its environment, so a redirected one that
+        # survived a refresh would be a persistent hijack; rewriting it means any tampering
+        # self-heals on the next apply or refresh.
+        #
+        # The one exception is the *other* canonical reference: this file writes ${USERPROFILE} on
+        # Windows and ${HOME} elsewhere, and both are ours. Rewriting a valid one would make every
+        # refresh flip the file back and forth across a mixed-platform team and churn the diff for
+        # no gain. Anything not in UAT_HUB_SERVER_REFS is still replaced.
+        prior = existing_ref(data["mcpServers"].get(UAT_MCP_NAME))
+        if prior in UAT_HUB_SERVER_REFS:
+            server = dict(server, args=[prior])
         data["mcpServers"][UAT_MCP_NAME] = server
         action = "updated"
         if dropped:
@@ -3145,7 +3186,7 @@ def cmd_apply(args):
 
     # hooks
     rep.put(root / ".githooks" / "commit-msg", fill(COMMIT_MSG), executable=True, force=args.force)
-    rep.put(root / ".githooks" / "pre-commit", fill(PRE_COMMIT, UAT_HUB=UAT_HUB_URL, UAT_SERVER=UAT_HUB_SERVER_REF), executable=True, force=args.force)
+    rep.put(root / ".githooks" / "pre-commit", fill(PRE_COMMIT, UAT_HUB=UAT_HUB_URL, UAT_SERVER_WIN=UAT_HUB_SERVER_REFS[0], UAT_SERVER_NIX=UAT_HUB_SERVER_REFS[1]), executable=True, force=args.force)
     rep.put(root / ".githooks" / "pre-push", fill(PRE_PUSH, PROTECTED=prot, WORK=WORK_BRANCH), executable=True, force=args.force)
     checks_path = root / ".githooks" / "checks"
     if checks_path.exists() and not args.force:
@@ -3293,7 +3334,7 @@ def cmd_refresh(args):
     # marker has been removed alone, so a repo that has taken ownership of one keeps it.
     d = detect(root)
     rep.put(root / ".githooks" / "commit-msg", fill(COMMIT_MSG), executable=True)
-    rep.put(root / ".githooks" / "pre-commit", fill(PRE_COMMIT, UAT_HUB=UAT_HUB_URL, UAT_SERVER=UAT_HUB_SERVER_REF), executable=True)
+    rep.put(root / ".githooks" / "pre-commit", fill(PRE_COMMIT, UAT_HUB=UAT_HUB_URL, UAT_SERVER_WIN=UAT_HUB_SERVER_REFS[0], UAT_SERVER_NIX=UAT_HUB_SERVER_REFS[1]), executable=True)
     rep.put(root / ".githooks" / "pre-push", fill(PRE_PUSH, PROTECTED=" ".join(PROTECTED), WORK=WORK_BRANCH), executable=True)
     if (root / ".githooks" / "checks").exists():
         rep.note("unchanged (yours to edit)", root / ".githooks" / "checks")
@@ -4391,13 +4432,17 @@ def cmd_doctor(args):
         "set" if os.environ.get(UAT_HUB_KEY_VAR) else "not set - export it in your environment"))
     say("           MCP server %s" % (UAT_HUB_SERVER.as_posix() if UAT_HUB_SERVER.exists() else
         "not found at %s (sessions fall back to the HTTP endpoint)" % UAT_HUB_SERVER.as_posix()))
-    # .mcp.json names ${HOME:-${USERPROFILE}}. HOME is not a Windows variable (it is absent from
-    # the registry; Git Bash sets it per-process), so USERPROFILE is what carries this on Windows.
-    # doctor's own existence check above uses Python's expanduser, which reads USERPROFILE - so it
-    # can report the file found while Claude Code cannot resolve the reference. Report the variables.
-    if not os.environ.get("HOME") and not os.environ.get("USERPROFILE"):
-        say("           neither HOME nor USERPROFILE is set: the path in .mcp.json cannot resolve, "
-            "so the MCP server will not start and sessions fall back to the HTTP endpoint")
+    # The existence check above uses Python's expanduser, which resolves from USERPROFILE on Windows
+    # and HOME elsewhere - so it can report the file found while Claude Code cannot resolve the
+    # reference .mcp.json actually carries. Check the variable that reference needs, by name.
+    #
+    # This guard used to read `if not HOME and not USERPROFILE`, which on Windows can never be true:
+    # USERPROFILE is always set, so doctor reported the wiring healthy for every release in which
+    # the server had never once started. A check that cannot fail is not a check.
+    need = "USERPROFILE" if os.name == "nt" else "HOME"
+    if not os.environ.get(need):
+        say("           %s is not set, and .mcp.json names it: the MCP server will not start and "
+            "sessions fall back to the HTTP endpoint" % need)
     say(machine_line())
     root = repo_root(args.repo) if hasattr(args, "repo") else repo_root()
     if root:

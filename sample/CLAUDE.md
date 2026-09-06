@@ -26,7 +26,7 @@ Run the due reviewers in one message, in parallel; `/post-change` does this and 
 
 ### Rules that prevent bugs
 - Any bug fix starts with a failing test that reproduces it, then the fix, then the test goes green. No exceptions.
-- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them.
+- Migrations are append-only: never edit an existing file under `supabase/migrations/`; add a new one. After any migration change, regenerate types and commit them. If a migration genuinely cannot change types - policy, grant or data only - the regeneration produces no diff, so say so in a commit trailer with a reason (`Types-not-affected: policy-only migration`). CI reads the trailer and prints the reason; a bare trailer with no reason does not count.
 - Errors must surface: a request that can fail has a visible failure state in the interface and a logged error on the server. A silent catch is a bug.
 - The linter runs on the edited file after every edit (PostToolUse hook) and reports only the errors your change added on top of what the repo already accepts. Fix those before moving on; never disable a rule, and never raise the lint baseline, to make one go away. Whole-project type checking runs on push (`.githooks/checks`) and in CI - per edit it cost seconds and told nobody anything.
 - Never report a visual change as done on the strength of type checks, lint, tests and the build alone - none of them can see the screen. Render it, or run `design-reviewer`.

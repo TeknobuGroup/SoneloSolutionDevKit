@@ -54,10 +54,11 @@ def canonical_mcp(key="${UAT_HUB_KEY}", url=None, args=None, command="node", ext
 
 def rendered_hook():
     """Exactly what `apply` writes. A test that renders it with fewer substitutions leaves
-    `{UAT_SERVER}` in the comparison, so the hook rejects every .mcp.json and the test failure
+    `{UAT_SERVER_WIN}` in the comparison, so the hook rejects every .mcp.json and the test failure
     points at the wrong thing - which is how an hour went once."""
-    text = rs.fill(rs.PRE_COMMIT, UAT_HUB=rs.UAT_HUB_URL, UAT_SERVER=rs.UAT_HUB_SERVER_REF)
-    for ph in ("{UAT_SERVER}", "{UAT_HUB}"):   # NB ${UAT_HUB_KEY} legitimately contains "{UAT_"
+    text = rs.fill(rs.PRE_COMMIT, UAT_HUB=rs.UAT_HUB_URL,
+                   UAT_SERVER_WIN=rs.UAT_HUB_SERVER_REFS[0], UAT_SERVER_NIX=rs.UAT_HUB_SERVER_REFS[1])
+    for ph in ("{UAT_SERVER", "{UAT_HUB}"):   # NB ${UAT_HUB_KEY} legitimately contains "{UAT_"
         assert ph not in text, "unsubstituted %s left in the hook" % ph
     return text
 
@@ -421,13 +422,72 @@ class TheServerPathIsMachineIndependent(unittest.TestCase):
         root = make_temp_dir(self)
         rs.mcp_json(root, rs.Report(False), "fortex-hub")
         text = (root / ".mcp.json").read_text(encoding="utf-8")
-        self.assertEqual(rs.UAT_HUB_SERVER_REF, "${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs")
+        self.assertIn(rs.UAT_HUB_SERVER_REF, rs.UAT_HUB_SERVER_REFS)
         self.assertIn(rs.UAT_HUB_SERVER_REF, text)
-        # HOME is not a Windows variable - absent from the registry, set only by Git Bash -
-        # so USERPROFILE is what carries this on the kit's first-class platform.
-        self.assertIn("USERPROFILE", rs.UAT_HUB_SERVER_REF)
+        # Two constants, because neither variable is portable. HOME is not a Windows variable -
+        # absent from the registry, set only by Git Bash, which is exactly what let a ${HOME}-only
+        # version read as verified once - so USERPROFILE carries it on the kit's first-class
+        # platform; USERPROFILE does not exist off Windows.
+        self.assertEqual(rs.UAT_HUB_SERVER_REFS[0], "${USERPROFILE}/uat-hub/mcp/server.mjs")
+        self.assertEqual(rs.UAT_HUB_SERVER_REFS[1], "${HOME}/uat-hub/mcp/server.mjs")
+        self.assertEqual(rs.UAT_HUB_SERVER_REF,
+                         rs.UAT_HUB_SERVER_REFS[0] if os.name == "nt" else rs.UAT_HUB_SERVER_REFS[1])
         self.assertNotIn(str(Path.home()), text)
         self.assertNotIn(Path.home().as_posix(), text)
+
+    def test_no_reference_nests_a_variable_inside_a_default(self):
+        """The 4.14 regression. From 4.6 to 4.13 the kit wrote `${HOME:-${USERPROFILE}}/...`.
+        Claude Code expands `${VAR}` and `${VAR:-literal}` but not a `${...}` inside a default: it
+        resolved the inner variable and stranded the outer brace, so node was launched on
+        `C:/Users/<user>}/uat-hub/mcp/server.mjs`, exited MODULE_NOT_FOUND, and the uat-hub server
+        never started - in any repo, on any machine, for eight releases. Every test here passed
+        throughout, the pre-commit hook enforced the broken string, and sessions quietly wrote UAT
+        to Markdown files instead. Nesting is the whole bug: no accepted reference may contain a
+        default at all, because nothing in this repo can execute the expander to find out."""
+        for ref in rs.UAT_HUB_SERVER_REFS:
+            self.assertNotIn(":-", ref, "a :- default cannot be verified by any check here: %s" % ref)
+            self.assertEqual(ref.count("${"), 1, ref)
+            self.assertEqual(ref.count("}"), 1, ref)
+            self.assertTrue(ref.endswith("}/uat-hub/mcp/server.mjs"), ref)
+
+    def test_either_platform_reference_is_accepted_and_nothing_else_is(self):
+        """A repo set up on Windows is cloned onto a Mac; neither may read as drift. Everything
+        else does, including the reference the older kit wrote - `refresh` rewrites it."""
+        for ref in rs.UAT_HUB_SERVER_REFS:
+            root = make_temp_dir(self)
+            (root / ".mcp.json").write_text(canonical_mcp(args=[ref]), encoding="utf-8")
+            self.assertTrue(rs.mcp_ok(root), ref)
+        for ref in ("./tools/uat-hub/mcp/server.mjs", "/home/x/uat-hub/mcp/server.mjs",
+                    "${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs",
+                    "${USERPROFILE}/uat-hub/mcp/server.mjs.bak"):
+            root = make_temp_dir(self)
+            (root / ".mcp.json").write_text(canonical_mcp(args=[ref]), encoding="utf-8")
+            self.assertFalse(rs.mcp_ok(root), ref)
+
+    def test_the_other_platforms_reference_survives_a_refresh(self):
+        """The no-churn half. Both constants are ours, so rewriting a valid one would flip a
+        committed file back and forth across a mixed-platform team on every refresh, for nothing.
+        Its opposite - that anything NOT ours is still rewritten - is the test below."""
+        other = [r for r in rs.UAT_HUB_SERVER_REFS if r != rs.UAT_HUB_SERVER_REF][0]
+        root = make_temp_dir(self)
+        (root / ".mcp.json").write_text(canonical_mcp(args=[other]), encoding="utf-8")
+        rs.mcp_json(root, rs.Report(False), "fortex-hub")
+        data = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["mcpServers"][rs.UAT_MCP_NAME]["args"], [other])
+
+    def test_anything_not_ours_is_still_rewritten(self):
+        """The anti-hijack half, and the mechanism by which the estate self-heals off the broken
+        reference: nobody edits .mcp.json by hand, `refresh` replaces it. A malformed `args` is
+        included because .mcp.json is a file people and other tools edit."""
+        for bad in (["./tools/evil.mcp/server.mjs"], ["${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs"],
+                    [str(Path.home() / "uat-hub" / "mcp" / "server.mjs")],
+                    [], ["a", "b"], [3]):
+            root = make_temp_dir(self)
+            (root / ".mcp.json").write_text(canonical_mcp(args=bad), encoding="utf-8")
+            rs.mcp_json(root, rs.Report(False), "fortex-hub")
+            data = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["mcpServers"][rs.UAT_MCP_NAME]["args"],
+                             [rs.UAT_HUB_SERVER_REF], bad)
 
     def test_a_suffix_match_is_not_enough(self):
         """`./tools/uat-hub/mcp/server.mjs` satisfies endswith and is a redirected launch target."""
@@ -579,6 +639,18 @@ class TheHookParsesRatherThanMatches(unittest.TestCase):
     def test_the_canonical_entry_commits(self):
         root = self.hook_repo()
         self.assertEqual(self.run_hook(root, ".mcp.json", canonical_mcp()), 0)
+
+    def test_the_hook_accepts_either_platform_reference(self):
+        """The hook is what made the 4.6-4.13 bug unfixable in place: it rejected any .mcp.json
+        that did not carry the broken string, so a developer who corrected the path by hand could
+        not commit it. It must now accept both of ours - a Windows repo is cloned onto a Mac - and
+        still refuse a third, including the reference that never resolved."""
+        root = self.hook_repo()
+        for ref in rs.UAT_HUB_SERVER_REFS:
+            self.assertEqual(self.run_hook(root, ".mcp.json", canonical_mcp(args=[ref])), 0, ref)
+        for ref in ("${HOME:-${USERPROFILE}}/uat-hub/mcp/server.mjs",
+                    "./tools/uat-hub/mcp/server.mjs"):
+            self.assertEqual(self.run_hook(root, ".mcp.json", canonical_mcp(args=[ref])), 1, ref)
 
 
 class ANonAsciiPathDoesNotDisableTheHook(unittest.TestCase):

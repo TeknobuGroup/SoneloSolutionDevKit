@@ -27,4 +27,10 @@ jobs:
       - name: Types regenerated after migrations
         run: |
           if grep -q '^supabase/migrations/' changed.txt && ! grep -q '^src/types/database.ts$' changed.txt; then
-            echo "::error::Migration changed but src/types/database.ts was not regenerated."; exit 1; fi
+            why=$(git log --format=%B "origin/${{ github.base_ref }}"..HEAD | grep -iE '^Types-not-affected:[[:space:]]*[^[:space:]]' | head -1)
+            if [ -n "$why" ]; then
+              echo "Types gate waived by the author: $why"
+            else
+              echo "::error::Migration changed but src/types/database.ts was not regenerated. If this migration cannot change types - a policy, grant or data-only migration produces no type diff - say so in a commit trailer, with a reason: Types-not-affected: policy-only migration"; exit 1
+            fi
+          fi
