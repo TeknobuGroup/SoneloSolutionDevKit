@@ -1,4 +1,4 @@
-# Diary agent · v1.0 (part of the Sonelo Solution DevKit v4.12)
+# Diary agent · v1.0 (part of the Sonelo Solution DevKit v4.13)
 
 One day of real work, gathered into one file that is safe to write from, and served to Claude
 over MCP. It reads what the machine already records - the worklog pot, git, Claude Code
@@ -20,7 +20,7 @@ already fills.
 description. That is not a bug to work around; it is the default that makes the feature safe to
 run across an estate of client repos where most of them may never be written about.
 
-Raise it per repo, by hand, in that repo's `.teknobu.json`:
+Raise it per repo, in that repo's own `.teknobu.json`:
 
 ```json
 {
@@ -30,6 +30,28 @@ Raise it per repo, by hand, in that repo's `.teknobu.json`:
   }
 }
 ```
+
+You do not have to write that by hand. From kit 4.13 the setup command asks for it, and
+`repo_setup.py` writes it:
+
+```
+repo_setup.py diary --list                                  every repo the worklog knows, with its tier
+repo_setup.py diary --repo <path> --tier private            hours only
+repo_setup.py diary --repo <path> --tier nickname --nickname auto
+repo_setup.py diary --repo <path> --tier own --description "a scheduling tool"
+repo_setup.py apply|refresh --diary-tier own --diary-description "..."
+```
+
+In Claude Code, `/diary` walks the unclassified repos and asks about each one; `/repo-setup` and
+`/new-repo` ask as part of setting a repo up, so a repo is classified when it is created rather
+than eighteen at a time a year later. `.teknobu.json` is committed, so the classification travels
+with the code and is reviewable in a diff - commit it after the sweep.
+
+**Only the codename is ever generated.** `--nickname auto` picks a word from a fixed list and
+avoids the ones already in use; it is never derived from the repo's name, folder, remote or
+description, because a codename you can reverse is not a codename. The tier and the description
+are always yours: a tier inferred from a folder name would be a classification nobody made, which
+is the thing the private default exists to prevent (`docs/decisions/0011`).
 
 | tier | what reaches the day-file |
 |---|---|

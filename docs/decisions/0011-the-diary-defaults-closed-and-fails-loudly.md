@@ -70,3 +70,38 @@ Three things about that material forced choices:
   because a day-file that undercounts the day is a day-file you cannot trust to write from.
 - The kit now ships three Python files instead of two. `install` copies the diary next to the
   worklog; `doctor` reports its version.
+
+## Addendum — 2026-09-06, kit 4.13: the kit writes the block, but never chooses it
+
+The default was right and, on its own, unlivable. `diary --list` on the machine that built it
+reported **1 of 19 repos classified**: the only route out of `private` was hand-editing
+`.teknobu.json` in each repo, so nobody did, and the diary could report hours and silence for
+almost everything. A default nobody can leave is not a safe default; it is a switched-off feature.
+
+So 4.13 gives the decision a route: `apply`/`refresh --diary-tier|--diary-nickname|--diary-description`
+at setup time, `repo_setup.py diary` (`--list`, `--repo <path> --tier ...`) as a sweep over the
+worklog pot, `/diary` to drive that conversationally, and a `doctor` count so an unclassified estate
+is visible rather than quiet.
+
+**What did not move is the line this ADR is about.** Automating the *route* to a classification is
+not automating the classification:
+
+- **Only the codename may be generated.** `--nickname auto` draws from a fixed list of ordinary
+  nouns and avoids the ones in use. It is never derived from the repo's name, folder, remote or
+  description — a codename you can reverse is not a codename.
+- **The tier and the description have no automatic path at all**, and `/diary` is written to insist
+  on it: one repo per message, a line of evidence the user can check, all three tiers offered with
+  what each one means, and never a choice made for them. A tier inferred from a folder name would be
+  a classification nobody made, which is the thing the whole default exists to prevent.
+- **A plain re-run never lowers a repo.** A flag not passed changes nothing, and `apply` writes the
+  `private` default only where there is no block at all.
+- **A key the new tier does not use is kept, not cleared** — a codename that changed every time a
+  repo was raised and lowered would make the diary incoherent from one post to the next.
+
+Two mechanical consequences worth recording. `tier: nickname` with no nickname is the one
+combination that cannot work (`label_for` raises, and the collect downgrades that project to
+"client work" for the whole day, silently), so a codename is generated rather than the unusable
+pair being written. And because the kit is one self-contained file per tool, `repo_setup.py`
+duplicates the diary's normaliser instead of importing it; the two are pinned against each other by
+a test that runs both over the same thirteen config shapes, label included, for the same reason
+`session_day_minutes` is imported rather than copied.
