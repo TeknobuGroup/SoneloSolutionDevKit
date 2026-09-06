@@ -64,7 +64,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "4.11"
+VERSION = "4.12"
 KIT_NAME = "Sonelo Solution DevKit"
 MARK = "sonelo-devkit"                                 # marker line in every generated file we own
 OLD_MARKS = ("teknobu-kit",)                           # earlier releases' marker; files carrying it are still ours
@@ -74,6 +74,7 @@ OLD_HOME_DIR = Path("~/.claude/teknobu").expanduser()
 INSTALLED = HOME_DIR / "repo_setup.py"
 PIPELINE_DIR = HOME_DIR / "pipeline"                    # optional: files here are copied into every repo (your Claude pipeline)
 WORKLOG = HOME_DIR / "worklog_agent.py"                 # the worklog agent, bundled with the kit
+DIARY = HOME_DIR / "diary_agent.py"                     # the diary agent, bundled with the kit
 COMMAND_FILE = Path("~/.claude/commands/repo-setup.md").expanduser()
 NEW_COMMAND_FILE = Path("~/.claude/commands/new-repo.md").expanduser()
 LANDING_COMMAND_FILE = Path("~/.claude/commands/landing.md").expanduser()
@@ -2951,6 +2952,9 @@ def cmd_apply(args):
                 "applied": datetime.now().strftime("%Y-%m-%d"), "uat_project": slug,
                 "stack": {k: d[k] for k in ("node", "pm", "supabase", "flutter", "python", "vercel")}})
     cfg.setdefault("generated_types", "src/types/database.ts")
+    # A repo nobody has classified is a client's: the diary reads this and, at "private",
+    # contributes the repo's hours to a day and nothing else. Raise it per repo by hand.
+    cfg.setdefault("diary", {"tier": "private"})
     text = json.dumps(cfg, indent=2) + "\n"
     existed = cfg_path.exists()
     if read(cfg_path) == text:
@@ -4030,6 +4034,8 @@ def cmd_doctor(args):
     say("pipeline   built in (%d files: agents, commands, hooks, gates)%s" % (len(BUILTIN_PIPELINE),
         ("; plus your starter (%d files) which takes precedence" % sum(1 for p in PIPELINE_DIR.rglob("*") if p.is_file())) if pipeline_present() else ""))
     say("worklog    %s" % ("v%s" % ".".join(map(str, version_of(WORKLOG))) if WORKLOG.exists() else "missing"))
+    say("diary      %s%s" % ("v%s" % ".".join(map(str, version_of(DIARY))) if DIARY.exists() else "missing",
+                             "  (python \"%s\" doctor for the detail)" % DIARY.as_posix() if DIARY.exists() else ""))
     for name in ("git", "node", "npm", "gh", "vercel", "supabase"):
         say("%-10s %s" % (name, tool(name) or "not found"))
     gh = tool("gh")
@@ -4386,27 +4392,43 @@ def migrate_old_home():
     return True
 
 
+def install_bundled_tools(here=None):
+    """Put worklog_agent.py and diary_agent.py beside the installed kit.
+
+    Each tool is handled on its own. An installer run straight from a URL has neither file beside
+    it and fetches both; the diary failing to fetch must not stop the worklog fetching. They were
+    one if/elif chain once, and the branch that fetched the worklog could never be reached."""
+    here = Path(here) if here else Path(__file__).resolve().parent
+    for label, src_name, dest, marker in (("worklog", "worklog_agent.py", WORKLOG, "worklog"),
+                                          ("diary", "diary_agent.py", DIARY, "diary")):
+        bundled = here / src_name
+        if bundled.exists():
+            if bundled.resolve() != dest.resolve():
+                shutil.copyfile(str(bundled), str(dest))
+            continue
+        # installed straight from a URL: fetch it from the same repo the kit came from
+        raw = os.environ.get("TEKNOBU_RAW", "https://raw.githubusercontent.com")
+        src = CONFIG.get("source") or DEFAULTS["source"]
+        try:
+            text = http_get("%s/%s/main/%s" % (raw, src, src_name), to=120).decode("utf-8")
+            if marker not in text[:2000].lower():
+                raise ValueError("it does not look like the %s agent" % label)
+            old_v = version_of(dest) if dest.exists() else None
+            dest.write_text(text, encoding="utf-8")
+            say("%-10s fetched from github.com/%s%s"
+                % (label, src, "" if not old_v else " (was v%s)" % ".".join(map(str, old_v))))
+        except Exception as e:
+            say("%-10s not bundled and could not fetch from github.com/%s (%s) - kit works, %s "
+                "absent until you run install from a clone" % (label, src, e, label))
+
+
 def cmd_install(args):
     migrate_old_home()
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     me = Path(__file__).resolve()
     if me != INSTALLED.resolve():
         shutil.copyfile(str(me), str(INSTALLED))
-    bundled = Path(__file__).resolve().parent / "worklog_agent.py"
-    if bundled.exists() and bundled.resolve() != WORKLOG.resolve():
-        shutil.copyfile(str(bundled), str(WORKLOG))
-    elif not bundled.exists():
-        # installed straight from a URL: fetch the worklog from the same repo
-        raw = os.environ.get("TEKNOBU_RAW", "https://raw.githubusercontent.com")
-        src = CONFIG.get("source") or DEFAULTS["source"]
-        try:
-            text = http_get("%s/%s/main/worklog_agent.py" % (raw, src), to=120).decode("utf-8")
-            if "WORKLOG_VERSION" in text or "worklog" in text[:2000]:
-                old_v = version_of(WORKLOG) if WORKLOG.exists() else None
-                WORKLOG.write_text(text, encoding="utf-8")
-                say("worklog    fetched from github.com/%s%s" % (src, "" if not old_v else " (was v%s)" % ".".join(map(str, old_v))))
-        except Exception as e:
-            say("worklog    not bundled and could not fetch from github.com/%s (%s) - kit works, worklog absent until you run install from a clone" % (src, e))
+    install_bundled_tools()
     cfg = configure(args)
     say("config     %s (mode %s, work branch %s, database %s)" % (CONFIG_FILE, cfg["mode"], cfg["work_branch"], cfg["database"]))
     if cfg["mode"] == "worklog":
