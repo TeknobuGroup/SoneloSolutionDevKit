@@ -4,6 +4,11 @@
 
 ## Cases were NOT pushed to UAT Hub
 
+**Pushed on 2026-09-06.** These cases are now in UAT Hub, project `teknobu-kit`, round 1 -
+reconciled across releases and regrouped into six numbered modules, so a tester runs them in
+order rather than per release. The section below records why they sat here until then.
+
+
 `repo_setup.py doctor` reports `UAT_HUB_KEY not set` on this machine, and the `uat-hub` MCP
 server failed to connect this session (CONNECTION_CLOSED). The cases below are written out in
 full here instead and **must be pushed to UAT Hub before a tester picks them up** — nothing is
@@ -155,8 +160,10 @@ field and the reason. Remove the blocklist term afterwards.
 **Expected.** A line reading `blocklist  2 terms (values are never printed)`. Neither term
 appears anywhere in the output. The output also names the transcript folder, says the output
 directory is writable, gives the worklog version and pot, lists every repo with its tier and
-label, warns by name about repos defaulting to private, and ends with a JSON snippet under
-`Register the MCP server in the Claude desktop app with:`.
+label, warns by name about repos defaulting to private, and finishes with a registration block
+headed `Register the MCP server in the Claude desktop app with:` — a JSON snippet, then a line
+beginning `in ` that names the Claude desktop config file for your operating system, then a line
+telling you to quit the app fully and reopen it.
 
 ### 11. The MCP server answers on stdin
 

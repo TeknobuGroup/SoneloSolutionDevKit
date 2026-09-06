@@ -1234,11 +1234,46 @@ def leak_report(hits):
     return "\n".join(L)
 
 
+def registration_target():
+    """The path the snippet hands the desktop app, and whether it is the durable one.
+
+    The app reads this once and keeps it, so a working copy is the wrong thing to give it: it
+    moves with the branch and disappears if the folder is renamed, and the failure is silent -
+    the app simply stops having a diary. `repo_setup.py install` maintains a stable copy under
+    KIT_HOME, so prefer that and fall back to the running file only when the kit is not
+    installed - a snippet naming a file that is not there would be worse."""
+    installed = KIT_HOME / "diary_agent.py"
+    if installed.exists():
+        return installed.resolve(), True
+    return Path(__file__).resolve(), False
+
+
+def desktop_config_path():
+    """Where the snippet goes. Knowing the JSON and not knowing the file is where this stalls."""
+    if os.name == "nt":
+        return "%APPDATA%\\Claude\\claude_desktop_config.json"
+    if sys.platform == "darwin":
+        return "~/Library/Application Support/Claude/claude_desktop_config.json"
+    return "~/.config/Claude/claude_desktop_config.json"
+
+
 def mcp_registration():
+    target, _installed = registration_target()
     py = Path(sys.executable).as_posix()
     return json.dumps({"mcpServers": {"diary": {"command": py,
-                                                "args": [Path(__file__).resolve().as_posix(), "serve"]}}},
+                                                "args": [target.as_posix(), "serve"]}}},
                       indent=2)
+
+
+def say_mcp_registration():
+    say("Register the MCP server in the Claude desktop app with:")
+    for line in mcp_registration().splitlines():
+        say("  " + line)
+    say("  in %s" % desktop_config_path())
+    say("  Quit the app fully and reopen it - a reload keeps the environment it started with.")
+    if not registration_target()[1]:
+        say("  The path above is this working copy, so it moves with the branch and the folder.")
+        say("  Run repo_setup.py install for a stable one under %s." % KIT_HOME.as_posix())
 
 
 def cmd_doctor(cfg, args):
@@ -1269,9 +1304,7 @@ def cmd_doctor(cfg, args):
         say("worklog    NOT FOUND - collect cannot run. Looked in: %s"
             % ", ".join(p.as_posix() for p in worklog_search_paths()))
         say("")
-        say("Register the MCP server in the Claude desktop app with:")
-        for line in mcp_registration().splitlines():
-            say("  " + line)
+        say_mcp_registration()
         return 1
     pot = pot_dir(cfg, wl)
     say("worklog    v%s at %s" % (getattr(wl, "VERSION", "?"), getattr(wl, "__diary_path__", "?")))
@@ -1303,9 +1336,7 @@ def cmd_doctor(cfg, args):
         say('           Add {"diary": {"tier": "own", "description": "..."}} to each repo that '
             "should tell its story.")
     say("")
-    say("Register the MCP server in the Claude desktop app with:")
-    for line in mcp_registration().splitlines():
-        say("  " + line)
+    say_mcp_registration()
     return 0
 
 

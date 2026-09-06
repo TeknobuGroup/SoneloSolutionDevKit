@@ -4,6 +4,10 @@
 
 ## Cases were NOT pushed to UAT Hub
 
+**Pushed on 2026-09-06.** These cases are now in UAT Hub, project `teknobu-kit`, round 1 -
+reconciled across releases and regrouped into six numbered modules, so a tester runs them in
+order rather than per release. The section below records why they sat here until then.
+
 The `uat-hub` MCP server failed to connect this session (CONNECTION_CLOSED) and `UAT_HUB_KEY`
 is not set on this machine — `repo_setup.py doctor` reports both. The cases below are written
 out in full here instead, and **must be pushed to UAT Hub before a tester picks them up**;

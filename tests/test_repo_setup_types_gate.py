@@ -67,7 +67,9 @@ def gate_script(base_ref="main"):
     return script.replace("${{ github.base_ref }}", base_ref)
 
 
-class TheTypesGateCanBeSatisfied(unittest.TestCase):
+class GateHarness(unittest.TestCase):
+    """Builds real git history and runs the gate's own shell against it. Carries no tests itself,
+    so the cases below are not re-run once per subclass."""
 
     def setUp(self):
         self.git, self.sh = shutil.which("git"), shutil.which("sh")
@@ -110,11 +112,48 @@ class TheTypesGateCanBeSatisfied(unittest.TestCase):
         self.work, self.origin = work, origin
         return work
 
+    def migration_branch(self, commits):
+        """Like `branch`, but each entry really touches `supabase/migrations/`, so
+        `git log -- supabase/migrations/` counts it the way CI does.
+
+        `commits` is a list of (filename, message). The cases below need real migration commits
+        because the defect is about *which* commit a waiver covers, and a hand-written changed.txt
+        cannot express that."""
+        origin = self.temp_dir("types-gate-origin-")
+        self.run_git(origin, "init", "-b", "main", ".")
+        (origin / "README.md").write_text("x\n", encoding="utf-8")
+        self.run_git(origin, "add", "-A")
+        self.run_git(origin, "commit", "-m", "chore: base")
+        work = self.temp_dir("types-gate-work-")
+        shutil.rmtree(str(work), ignore_errors=True)
+        out = subprocess.run([self.git, "clone", str(origin), str(work)], capture_output=True,
+                             text=True, env=self.env, **rs.NOWIN)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.run_git(work, "checkout", "-b", "feature")
+        changed = []
+        for name, message in commits:
+            path = work / "supabase" / "migrations" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("-- %s\n" % name, encoding="utf-8")
+            self.run_git(work, "add", "-A")
+            self.run_git(work, "commit", "-m", message)
+            changed.append("supabase/migrations/" + name)
+        (work / "changed.txt").write_text("\n".join(changed) + "\n", encoding="utf-8", newline="\n")
+        self.work, self.origin = work, origin
+        return work
+
     def run_gate(self, root=None):
         root = root or self.work
-        out = subprocess.run([self.sh, "-c", gate_script()], cwd=str(root), capture_output=True,
-                             text=True, env=self.env, **rs.NOWIN)
-        return out.returncode, out.stdout + out.stderr
+        # `-e`, because GitHub Actions runs a `run:` block under `bash -e`. Without it the `|| true`
+        # guards in the gate are never exercised and a non-zero grep would abort CI, not this test.
+        # Bytes rather than `text=True`, because universal newlines rewrites a lone carriage return
+        # to a newline - and a lone carriage return is the whole of the injection case below.
+        out = subprocess.run([self.sh, "-e", "-c", gate_script()], cwd=str(root),
+                             capture_output=True, env=self.env, **rs.NOWIN)
+        return out.returncode, (out.stdout + out.stderr).decode("utf-8", "replace")
+
+
+class TheTypesGateCanBeSatisfied(GateHarness):
 
     def test_a_migration_without_regenerated_types_fails(self):
         """Unchanged behaviour, and the reason the gate exists: a schema migration whose types were
@@ -171,6 +210,99 @@ class TheTypesGateCanBeSatisfied(unittest.TestCase):
 
     def test_a_change_with_no_migration_is_not_the_gate_s_business(self):
         self.branch(["feat: a button"], changed=("src/App.tsx",))
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+
+
+class TheWaiverIsADisclosureNotAnEnforcement(GateHarness):
+    """What the trailer is, stated plainly, because a generator that overclaims is worse than one
+    that underclaims. It is an author putting a reason in the git record where a reviewer can read
+    it. It is *not* proof that every migration in the range was considered.
+
+    `..HEAD` keeps a trailer already on `main` from waiving this pull request, which is real. Inside
+    the range nothing is enforced, and under this kit's branching standard the range is a whole
+    release train: work happens on `prelive`, the pull request is `prelive` -> `main`, so one
+    author's trailer sits in scope alongside every other author's migration.
+
+    A per-commit count was tried and removed in 4.14. It did not close that - repeating the trailer,
+    or adding a docs-only trailer commit, satisfied it - and it blocked honest authors, because
+    renumbering a migration after a timestamp clash makes two migration commits and one reason. It
+    bought a false sentence in the documentation and nothing else. The tests below pin both halves:
+    what it does, and what it does not."""
+
+    def test_one_declaration_waives_the_whole_range_and_that_is_known(self):
+        """The limit, asserted rather than left to be discovered. A reviewer reads the reason in the
+        CI log and decides; the gate does not decide for them. If this ever needs to be enforced, it
+        has to key on the migration commit itself - see
+        docs/decisions/0012-the-types-gate-waiver-is-a-disclosure.md."""
+        self.migration_branch([
+            ("0001_policy.sql", "fix: tighten the read policy\n\nTypes-not-affected: policy-only migration"),
+            ("0002_add_table.sql", "feat: add the audit table"),
+        ])
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("policy-only migration", out, "the reason must reach the log, since it is the "
+                                                    "only thing standing between this and nothing")
+
+    def test_renumbering_a_migration_does_not_re_block_the_author(self):
+        """The case that removed the count. Two migrations land on prelive with the same timestamp
+        prefix, so the author renames one - a second commit touching supabase/migrations/, and no
+        second reason to give for it. Under the count this was the exact author 4.14 was written to
+        unblock, blocked again."""
+        work = self.migration_branch([
+            ("20260906_policy.sql", "fix: tighten the read policy\n\nTypes-not-affected: policy-only migration"),
+        ])
+        migrations = work / "supabase" / "migrations"
+        self.run_git(work, "mv", str(migrations / "20260906_policy.sql"),
+                     str(migrations / "20260906120000_policy.sql"))
+        self.run_git(work, "commit", "-m", "chore: renumber after a timestamp clash")
+        (work / "changed.txt").write_text("supabase/migrations/20260906120000_policy.sql\n",
+                                          encoding="utf-8", newline="\n")
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+
+    def test_the_printed_reason_cannot_open_a_workflow_command(self):
+        """The log line is attacker-influenced text - it is whatever an author typed in a commit
+        message. `^`-anchoring in the grep closes the newline route; a lone carriage return is the
+        other one, because the runner splits log lines on it too. `tr -d` is what closes it."""
+        self.migration_branch([
+            ("0001_policy.sql", "fix: policy\n\nTypes-not-affected: policy only\r::error::injected"),
+        ])
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+        for line in out.replace("\r", "\n").splitlines():
+            self.assertFalse(line.startswith("::"),
+                             "a commit message opened a workflow command:\n" + out)
+
+    def test_every_migration_commit_declared_waives_it(self):
+        self.migration_branch([
+            ("0001_policy.sql", "fix: tighten the read policy\n\nTypes-not-affected: policy-only migration"),
+            ("0002_grant.sql", "chore: grant select to the reporting role\n\nTypes-not-affected: grant only"),
+        ])
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("policy-only migration", out)
+        self.assertIn("grant only", out)
+
+    def test_the_documented_flow_of_a_separate_declaring_commit_still_passes(self):
+        """CLAUDE.md and the shipped UAT both tell an author to add the declaration as its own
+        commit after CI has failed. That must keep working - the fix is about coverage, not about
+        forcing the trailer onto the migration commit itself."""
+        self.migration_branch([("0001_policy.sql", "fix: tighten the read policy")])
+        self.run_git(self.work, "commit", "--allow-empty", "-m",
+                     "chore: declare\n\nTypes-not-affected: policy-only migration")
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+
+    def test_a_single_commit_carrying_several_migrations_needs_one_declaration(self):
+        """One author, one act, one reason - splitting it per file would be busywork."""
+        work = self.migration_branch([("0001_policy.sql", "fix: policies\n\nTypes-not-affected: policy-only migration")])
+        (work / "supabase" / "migrations" / "0002_policy.sql").write_text("-- x\n", encoding="utf-8")
+        self.run_git(work, "add", "-A")
+        self.run_git(work, "commit", "--amend", "--no-edit")
+        (work / "changed.txt").write_text("supabase/migrations/0001_policy.sql\n"
+                                          "supabase/migrations/0002_policy.sql\n",
+                                          encoding="utf-8", newline="\n")
         code, out = self.run_gate()
         self.assertEqual(code, 0, out)
 

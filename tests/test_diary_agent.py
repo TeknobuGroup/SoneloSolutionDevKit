@@ -731,6 +731,34 @@ class TestDoctor(DiaryTest):
         snippet = text[text.index("{"):text.rindex("}") + 1]
         self.assertIn("diary", json.loads(snippet)["mcpServers"])
 
+    def test_the_snippet_points_at_the_installed_copy_not_the_checkout(self):
+        """The desktop app reads this path once and keeps it. A working copy is the wrong thing
+        to hand it: it moves with the branch and disappears if the folder is renamed, and the
+        failure is silent - the app just stops having a diary. `repo_setup.py install` maintains
+        a stable copy under KIT_HOME, so that is what the snippet must name when it exists."""
+        da.KIT_HOME.mkdir(parents=True, exist_ok=True)
+        installed = da.KIT_HOME / "diary_agent.py"
+        installed.write_text("# the installed copy\n", encoding="utf-8")
+        _code, text = self.run_doctor()
+        snippet = text[text.index("{"):text.rindex("}") + 1]
+        args = json.loads(snippet)["mcpServers"]["diary"]["args"]
+        self.assertEqual(args[0], installed.resolve().as_posix())
+        self.assertEqual(args[1], "serve")
+
+    def test_without_an_installed_copy_it_falls_back_and_says_so(self):
+        """Falling back to the checkout is right - a snippet naming a file that is not there is
+        worse - but it must not pass silently as the durable answer."""
+        _code, text = self.run_doctor()
+        snippet = text[text.index("{"):text.rindex("}") + 1]
+        args = json.loads(snippet)["mcpServers"]["diary"]["args"]
+        self.assertEqual(args[0], Path(da.__file__).resolve().as_posix())
+        self.assertIn("repo_setup.py install", text)
+
+    def test_it_says_which_file_the_snippet_goes_in(self):
+        """Knowing the JSON and not knowing where it goes is where this actually stalled."""
+        _code, text = self.run_doctor()
+        self.assertIn("claude_desktop_config.json", text)
+
     def test_it_warns_about_repos_that_default_to_private(self):
         root = self.repo("unclassified")
         (self.pot / "slices").mkdir(parents=True, exist_ok=True)
