@@ -768,3 +768,161 @@ class TestDoctor(DiaryTest):
         _code, text = self.run_doctor()
         self.assertIn("no diary tier", text)
         self.assertIn("unclassified", text)
+
+
+
+class TestTheAuthorWarningOnlyNamesReposThatContributed(DiaryTest):
+    """A warning is a sentence about the day, not a list of every repo on the machine.
+
+    The no-git-identity warning says the day may contain other people's commits, which is worth
+    saying - but it was written above the `if not sessions and not commits: continue` that its
+    two neighbours sit below, so it fired for repos with nothing in the day at all. That is a
+    leak as well as noise: warnings are not redacted the way the day file is, and `mcp_call`
+    merges them back into what it returns, so a private-tier repo whose whole point is to appear
+    as a label only had its real name travel out with them."""
+
+    def quiet_checkout(self, name):
+        root = self.repo(name, {"tier": "private"})
+        (root / ".git").write_text("", encoding="utf-8")
+        self.cfg["authors"] = []                      # nothing configured, so git is asked
+        saved_id, saved_commits = da.git_identity, da.day_commits
+        da.git_identity = lambda path: set()          # a repo with no user.name or user.email
+        da.day_commits = lambda root, d, authors: []  # and nothing committed on this day
+        self.addCleanup(lambda: (setattr(da, "git_identity", saved_id),
+                                 setattr(da, "day_commits", saved_commits)))
+        return root
+
+    def test_a_repo_with_nothing_in_the_day_is_not_named(self):
+        root = self.quiet_checkout("dormant-client")
+        _day, _metas, warnings = self.build([a_slice(root, "Dormant Client", "dormant-client")])
+        self.assertEqual([w for w in warnings if "dormant-client" in w or "Dormant Client" in w],
+                         [], "a repo with no work in the day was named in the warnings: %r"
+                         % (warnings,))
+
+    def test_a_repo_that_did_contribute_is_still_warned_about(self):
+        """The warning has to survive the move: this is the case it exists for."""
+        root = self.quiet_checkout("busy-client")
+        _day, _metas, warnings = self.build([
+            a_slice(root, "Busy Client", "busy-client",
+                    [a_session("s1", "%sT09:00:00+00:00" % self.iso, 60, self.iso)])])
+        self.assertTrue(any("no git user.name" in w for w in warnings),
+                        "the day can contain other people's commits and nothing said so: %r"
+                        % (warnings,))
+
+    def test_an_off_disk_repo_says_its_commits_were_not_filtered_by_author(self):
+        """The on-disk fix covered half the door. Off disk there is no git to ask for an
+        identity, so `authors` is empty unless diary.json names one and the same filter falls
+        open - and the slice's commits came from `git log --all`, which reaches refs/remotes.
+        The only thing said today is that the commits carry no file counts, which is not this."""
+        root = self.repo("remote-client", {"tier": "own", "description": "the remote work"})
+        self.cfg["authors"] = []                      # nothing configured, and no git to ask
+        _day, _metas, warnings = self.build([
+            a_slice(root, "Remote Client", "remote-client",
+                    commits=[{"hash": "a" * 7, "subject": "not your commit",
+                              "time": "%sT10:00:00+00:00" % self.iso,
+                              "author": "Somebody Else"}])])
+        self.assertTrue(any("not only yours" in w for w in warnings),
+                        "a colleague's commit went into the day with nothing said: %r"
+                        % (warnings,))
+
+
+class TestDuplicateCheckout(DiaryTest):
+    """A worktree, or a nested directory, is a second checkout of ONE repository.
+
+    worklog_agent.load_slices() reports that repository's commits under one slice and marks the
+    rest `dup_of`. The diary does not simply use that list: whenever the path is on disk it asks
+    git itself, for the file and line counts the slice does not carry. Without a guard it would
+    ask git in the second checkout as well - and git answers for the repository, so the day
+    would carry the same commits twice. The same bug, arriving by a different door."""
+
+    def on_disk_repo(self, name):
+        """A directory the diary treats as a live checkout. No git needed: day_commits is
+        stubbed, and `.git` only has to exist for on_disk to be true."""
+        root = self.repo(name, {"tier": "own", "description": "the %s work" % name})
+        (root / ".git").write_text("", encoding="utf-8")
+        return root
+
+    def stub_day_commits(self):
+        """Records which checkouts git was asked about, and returns one commit for each."""
+        asked = []
+
+        def fake(root, d, authors):
+            asked.append(Path(root).name)
+            return [{"time": "10:30", "message": "read from git in %s" % Path(root).name,
+                     "files": 1, "insertions": 1, "deletions": 0}]
+
+        saved = da.day_commits
+        da.day_commits = fake
+        self.addCleanup(lambda: setattr(da, "day_commits", saved))
+        return asked
+
+    def test_git_is_not_asked_again_in_the_duplicate_checkout(self):
+        asked = self.stub_day_commits()
+        parent = self.on_disk_repo("nurture-loop-tek")
+        second = self.on_disk_repo("nurture-loop-codex")
+        day, _metas, _warnings = self.build([
+            a_slice(parent, "Knecta", "nurture-loop-tek"),
+            dict(a_slice(second, "Knecta", "nurture-loop-codex",
+                         [a_session("s-wt", "%sT09:00:00+00:00" % self.iso, 60, self.iso)]),
+                 dup_of="nurture-loop-tek"),
+        ])
+
+        self.assertEqual(asked, ["nurture-loop-tek"],
+                         "git was asked in the duplicate checkout too, so the repository's "
+                         "commits land in the day twice (asked: %r)" % (asked,))
+        self.assertEqual(day["totals"]["commits"], 1)
+        self.assertEqual(day["totals"]["sessions"], 1,
+                         "the second checkout's own sessions are its own and must still count")
+
+
+class TestWorktreeCommitsReachTheDay(unittest.TestCase):
+    """Silencing the duplicate checkout is only safe if the keeper sees the whole repository.
+
+    `dup_of` stops the diary asking git inside the second checkout, because git answers for the
+    REPOSITORY and it would re-import commits already reported. That leaves the checkout at the
+    repository root as the only one asked - so its read has to be the repository's, not its own
+    HEAD's. A linked worktree's unmerged commit is reachable from its branch and not from the
+    parent's HEAD, which is the normal mid-flight state of a worktree, and without --all the day
+    gets it from neither side: nothing from the duplicate, nothing from the keeper.
+
+    Real git, in a temp dir, because that is the only thing that can answer this. `collect_commits`
+    already passes --all, so this makes the diary agree with the worklog rather than inventing a
+    second rule."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="diary-worktree-test-"))
+        self.addCleanup(shutil.rmtree, str(self.base), ignore_errors=True)
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                        GIT_CONFIG_NOSYSTEM="1")
+
+    def git(self, *args):
+        import subprocess
+        return subprocess.run(["git"] + list(args), capture_output=True, text=True,
+                              env=self.env, check=True).stdout
+
+    def test_a_worktrees_unmerged_commit_is_in_the_keepers_day(self):
+        repo = self.base / "repo"
+        self.git("init", str(repo))
+        self.git("-C", str(repo), "config", "user.name", "Diary Test")
+        self.git("-C", str(repo), "config", "user.email", "diary-test@example.invalid")
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        self.git("-C", str(repo), "add", "seed.txt")
+        self.git("-C", str(repo), "-c", "commit.gpgsign=false", "commit", "-m", "seed commit")
+
+        worktree = self.base / "wt"
+        self.git("-C", str(repo), "worktree", "add", str(worktree), "-b", "codex-work")
+        (worktree / "feature.txt").write_text("mid-flight\n", encoding="utf-8")
+        self.git("-C", str(worktree), "add", "feature.txt")
+        self.git("-C", str(worktree), "-c", "commit.gpgsign=false", "commit",
+                 "-m", "unmerged work on the worktree branch")
+
+        today = datetime.now().date()
+        authors = {"diary test", "diary-test@example.invalid"}
+        subjects = [c["message"] for c in da.day_commits(repo, today, authors)]
+
+        self.assertIn("unmerged work on the worktree branch", subjects,
+                      "the worktree's commit is in neither day: the duplicate is silenced by "
+                      "dup_of and the keeper was asked about its own HEAD, not the repository "
+                      "(saw %r)" % (subjects,))
+        self.assertEqual(len(subjects), len(set(subjects)),
+                         "the repository's commits must appear once, not once per ref")

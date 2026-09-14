@@ -426,7 +426,17 @@ def day_commits(root, d, authors):
     since, until = day_bounds(d)
     sep = "\x1f"
     fmt = "\x1e%H" + sep + "%an" + sep + "%ae" + sep + "%aI" + sep + "%s"
-    r = sh(["git", "-C", str(root), "log", "--no-merges", "--numstat", "--date-order",
+    # --all, like collect_commits: git answers for the REPOSITORY, and since load_slices()
+    # silences the second checkout of one (dup_of), the checkout at the repository root is the
+    # only one asked. Without --all that read is its own HEAD's, so a worktree's unmerged
+    # commit - the normal mid-flight state - reaches neither side and drops out of the day.
+    # --exclude, and before --all, exactly as collect_commits does it. A stash and a note are
+    # both refs under refs/ holding single-parent commits, so --all walks them and --no-merges
+    # keeps them: a shelved change would go in the day and then again when it is unstashed and
+    # committed, and `git notes add` would read as a second piece of work on a commit.
+    r = sh(["git", "-C", str(root), "log", "--exclude=refs/stash", "--exclude=refs/notes/*",
+            "--all", "--no-merges",
+            "--numstat", "--date-order",
             "--since=" + since.isoformat(), "--until=" + until.isoformat(),
             "--pretty=format:" + fmt], timeout=180)
     if r.returncode != 0:
@@ -902,7 +912,12 @@ def build_day(cfg, d, wl, summarise=True, refresh=False):
         sessions.sort(key=lambda s: str(s.get("start") or ""))
         on_disk = path.is_dir() and (path / ".git").exists()
         authors = cfg_authors or (git_identity(path) if on_disk else set())
-        if on_disk:
+        if sl.get("dup_of"):
+            # A second checkout of one repository (a worktree, or a nested directory). git
+            # answers for the REPOSITORY, so asking here would re-import the very commits
+            # load_slices() just reported under dup_of. Its sessions are still its own.
+            commits = []
+        elif on_disk:
             commits = day_commits(path, d, authors)
         else:
             commits = [{"time": (parse_iso(c["time"]).strftime("%H:%M")),
@@ -916,6 +931,21 @@ def build_day(cfg, d, wl, summarise=True, refresh=False):
                                 % (project, path))
         if not sessions and not commits:
             continue
+        if not authors:
+            # Both branches above filter on `authors`, and both fall open when it is empty
+            # rather than reporting a day with nothing in it: on disk, git_identity() returns
+            # nothing when the repo has no user.name or user.email; off disk there is no git to
+            # ask at all, so the filter is open unless diary.json names an author. Either way
+            # --all reaches refs/remotes, so falling open publishes colleagues' commits as the
+            # day's work. Say so where the reader is, rather than letting the day quietly
+            # belong to someone else - the off-disk branch already says its commits carry no
+            # file counts, which is a different fact and reads like the only one.
+            # Below the gate, with the other two warnings: a repo that contributed nothing to
+            # this day has nothing to warn about, and warnings are not redacted the way the day
+            # file is - naming a private-tier repo in one sends out the name its tier withholds.
+            warnings.append("%s %s, so every author's commits are in this day, not only yours"
+                            % (project, "has no git user.name or user.email" if on_disk else
+                               "is not on disk, so its commits could not be filtered by author"))
         dcfg = repo_diary_cfg(path)
         try:
             label = label_for(dcfg)

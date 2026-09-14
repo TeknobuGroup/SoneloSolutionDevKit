@@ -11,6 +11,7 @@ where node is absent - CI has it, a developer machine may not.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -129,6 +130,43 @@ process.stdout.write(JSON.stringify(out));
             with self.subTest(case=name):
                 self.assertEqual(sum(self.js_result[name].values()), case["active_min"])
                 self.assertEqual(sum(self.python_result(case).values()), case["active_min"])
+
+
+
+class NothingFromThePotReachesInnerHtmlUnescaped(unittest.TestCase):
+    """The dashboard is built from the pot, and the pot is not trusted input.
+
+    Slice files are written by agents on other machines, arrive through an import, and carry
+    strings that came from git - a branch name may contain `<`, which git permits. The page is
+    opened from disk every morning, so markup that gets into `innerHTML` runs as script with
+    the whole dashboard in reach: every project name, repo path, session title and prompt
+    across every client on this machine.
+
+    `write_dashboard` escapes `<` to `\u003c` when it writes the JSON payload, which stops a
+    `</script>` breakout of the literal - but the string still holds a real `<` at runtime, so
+    it is `esc()` at the point of use that does the work here, and only that.
+
+    This reads the source rather than running it: the escaping happens in the browser, and
+    lifting a DOM in to prove it would be testing jsdom rather than this rule.
+    """
+
+    def test_a_branch_name_is_escaped_before_it_is_put_in_the_page(self):
+        src = js_function("renderLog")
+        self.assertIn("x.branches", src, "renderLog no longer shows branches; update this test")
+        bare = [ln.strip() for ln in src.split("\n")
+                if "x.branches.join" in ln and "esc(x.branches.join" not in ln]
+        self.assertEqual(bare, [], "a branch name goes into innerHTML unescaped: %s" % bare)
+
+    def test_every_list_of_pot_values_joined_into_html_goes_through_esc(self):
+        """The same mistake one field over: `join` is how these lists reach the page."""
+        bare = []
+        for line in wa.DASHBOARD_HTML.split("\n"):
+            if "innerHTML" not in line and "html +=" not in line:
+                continue
+            for m in re.finditer(r"(\w[\w.]*\.join\(', '\))", line):
+                if not line[:m.start()].rstrip().endswith("esc("):
+                    bare.append(m.group(1))
+        self.assertEqual(bare, [], "joined into the page without esc(): %s" % bare)
 
 
 if __name__ == "__main__":
