@@ -2,6 +2,33 @@
 
 Master list of user-observable behaviours, kept current by uat-writer. Per-PR documents live in docs/uat/.
 
+## Changed in this cycle (worklog v1.21)
+
+### New: "not measurable" marking when ActivityWatch could not see the machine
+
+When ActivityWatch was running in a context where it could not measure the machine (remote desktop session, unattended run, or the tool was not running), desk and editor time now read "not measurable" instead of a small confident number or a blank. The rule applies once in `load_slices()` at read time, so already-collected days restate on the next render.
+
+A day is marked when it carries at least 2 hours of Claude Code session bursts AND the machine's recorded desk time is less than 25% of that burst time — a clear contradiction. A day with no ActivityWatch record at all but sufficient Claude Code activity is also marked the same way. Days below the 2-hour threshold are untouched; a genuinely measured day is untouched.
+
+- UAT-1.21-1: Render a weekly report covering a day with ActivityWatch record and desk_s >= 25% of Claude Code burst time. The `## Days` table's `At desk` and `Editor` columns show measurable time (a duration, not `not measurable`), and the day is not marked. Before rendering, `cat <pot>/slices/_machine__<name>.json | grep -A50 '"days"'` shows the day's record has no `"unmeasured": true` key.
+- UAT-1.21-2: Render a weekly report covering a day where Claude Code has 2+ hours of bursts but the machine's desk_s is < 25% of that. The `## Days` table's `At desk` and `Editor` columns read `not measurable` for that day. Before rendering, the day's record in the machine slice shows `"unmeasured": true`. The day has no `0m` or blank — `not measurable` alone.
+- UAT-1.21-3: Render a weekly report covering a day with 2+ hours of Claude Code bursts but no ActivityWatch record at all (the day key is absent from the machine's `aw.days` dict). The report shows `not measurable` for that day. The day is created in the machine slice with `"desk_s": 0, "editor_s": 0, "unmeasured": true`.
+- UAT-1.21-4: Render a weekly report for a 2–14 day span covering a marked day. The `## Editor time` section appears with per-project cells; a marked day reads `n/m` (instead of a project's usual time or blank), with a footnote naming the day and saying "ActivityWatch could not measure the machine (remote session, unattended run, or not running)".
+- UAT-1.21-5: Open `dashboard.html` and scroll to the Days section. A day row marked for immeasurable time shows `n/m` in the `At desk` and `Editor` columns with a tooltip reading "not measurable — ActivityWatch could not measure the machine". The KPI cards (agent-hours, elapsed) exclude marked days from their calculation and show in the subtitle how many days were excluded, e.g. "1 day not measurable".
+- UAT-1.21-6: Render `morning.html` for a day marked as immeasurable. The page shows "Desk and editor time not measurable (ActivityWatch could not measure the machine — remote session, unattended run, or not running)." in place of the usual desk-time lines. On a machine that has never run ActivityWatch, the page shows no desk fact at all — not `0m at the desk`.
+- UAT-1.21-7: Render a weekly CSV (`weekly/worklog-YYYY-Www.csv`) for a week containing a marked day. The `editor_minutes` cell for that day is blank (not `0`, not `n/m`, not a formula). Other columns in that row are populated normally.
+- UAT-1.21-8: Render the daily diary with `python diary_agent.py render <date>` for a marked day. The day's `diary.json` entry shows `"desk_hours_unmeasured": true` and has no `totals.desk_hours` key. `diary_agent` version is 1.1 or later; the day-file carries a version check so a file written by 1.0 rebuilds.
+- UAT-1.21-9: A day below the 2-hour Claude Code floor (e.g., 21 Aug with 0.20 ratio on 1h 41m of Claude Code) is untouched — it carries no `"unmeasured": true` mark even if desk_s is low. A genuinely measured day with high Claude Code activity and measured desk time still shows that measured time — it is not suppressed by the same rule.
+- UAT-1.21-10: Import a repo slice from another machine into the pot (a path that does not exist on this one). Mark a day with low desk_s and 2+ hours Claude Code on the imported slice. Render. The machine's own desk record is not suppressed by the imported slice's sessions — machine scoping ensures only this machine's slices are used as the witness against this machine's desk data.
+
+### Re-test required: any scenario that asserts desk or editor figures
+
+- **UAT-1.18-1, UAT-1.18-2, UAT-1.18-3**: Work reported on the day it happened, with session and editor time split across days. These now need to verify the daily figures still distribute correctly, and that a marked day reads `not measurable` rather than a small incorrect number or blank. RE-TEST REQUIRED (2026-09-14) — verify the split still works when a day is marked, and that marked days show `not measurable` in the output.
+- **UAT-1.20-23**: Desk-time figures in the weekly report, CSVs, dashboard and morning page. RE-TEST REQUIRED (2026-09-14) — with the machine slice's `aw` field corrupted as described, marked days should still appear with `not measurable` rather than `0m` or blank, and the report should complete.
+
+**Pushed to UAT Hub** on 2026-09-14 as module `08. Worklog - desk and editor time "not measurable"`:
+10 cases, covering the new behaviour across weekly report, dashboard, morning page, CSV, and diary.
+
 ## Changed in this cycle (worklog v1.20)
 
 ### Fixed: a repository's commits are counted once, however many checkouts of it report
