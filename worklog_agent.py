@@ -61,9 +61,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.19"
-WHATS_NEW = "the report and the morning page now break cost down by context band and subagent share, and name this machine's model default and compaction cap"
-WHATS_NEW_SHORT = "cost now shows by context band"   # header strip only; keep under ~60 chars
+VERSION = "1.20.2"
+WHATS_NEW = "a repository's commits are counted once however many worktrees or nested checkouts of it report, so weeks inflated by a duplicate checkout are restated down; stashes and git notes are no longer counted as commits, no single malformed slice can stop every report, whatever is wrong with it - a repo's field, a session's, or a machine's desk time, and a branch name cannot put markup into the dashboard"
+WHATS_NEW_SHORT = "commits counted once per repository"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -339,7 +339,7 @@ def session_tokens_in_range(s, per_day, in_range, since, until):
             for model, tk in models.items():
                 acc = share.setdefault(model, {k: 0 for k in TOK_KEYS})
                 for k in TOK_KEYS:
-                    acc[k] += int((tk or {}).get(k, 0) or 0)
+                    acc[k] += tok_of(tk, k)
         return share, False
     whole = sum(per_day.values())
     frac = (sum(in_range.values()) / whole) if whole else 1.0
@@ -349,12 +349,12 @@ def session_tokens_in_range(s, per_day, in_range, since, until):
         # A session that spent nothing must not stamp the range "partial pricing" for a model
         # it never used, nor "estimated" for a split that never happened. Both markers exist to
         # be believed; one crying wolf sends someone hunting for a missing price that is not there.
-        if not any(int(tot.get(k, 0) or 0) for k in TOK_KEYS):
+        if not any(tok_of(tot, k) for k in TOK_KEYS):
             return {}, False
         by_model = {"?": tot}                       # older still: a total with no model breakdown
     share = {}
     for model, tk in by_model.items():
-        vals = {k: int(round(int((tk or {}).get(k, 0) or 0) * frac)) for k in TOK_KEYS}
+        vals = {k: int(round(tok_of(tk, k) * frac)) for k in TOK_KEYS}
         if any(vals.values()):   # a share that rounds to nothing must not list its model or mark the row
             share[model] = vals
     return share, bool(share) and frac < 1.0
@@ -383,7 +383,7 @@ def session_band_tokens_in_range(s, since, until):
             for model, tk in models.items():
                 macc = acc.setdefault(model, {k: 0 for k in TOK_KEYS})
                 for k in TOK_KEYS:
-                    macc[k] += int((tk or {}).get(k, 0) or 0)
+                    macc[k] += tok_of(tk, k)
     return out
 
 
@@ -395,7 +395,7 @@ def session_subagent_tokens_in_range(s, since, until):
         for model, tk in models.items():
             acc = out.setdefault(model, {k: 0 for k in TOK_KEYS})
             for k in TOK_KEYS:
-                acc[k] += int((tk or {}).get(k, 0) or 0)
+                acc[k] += tok_of(tk, k)
     return out
 
 
@@ -457,7 +457,14 @@ def window_start(cfg, now=None):
 
 def collect_commits(root, since):
     fmt = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s"
-    cmd = ["git", "-C", str(root), "log", "--all", "--no-merges",
+    # --exclude before --all, which is the only order in which it applies. --all is every ref
+    # under refs/, and two of them are not work. refs/stash: hanging off it are `index on
+    # <branch>` and `untracked files on <branch>`, single-parent commits that --no-merges does
+    # not filter - one shelved change, counted again for real when it is unstashed and committed.
+    # refs/notes: annotating a commit writes another one, authored and dated by whoever ran
+    # `git notes add`, which passes the diary's author filter as readily as it passes this.
+    cmd = ["git", "-C", str(root), "log", "--exclude=refs/stash", "--exclude=refs/notes/*",
+           "--all", "--no-merges",
            "--since=" + (since - timedelta(days=90)).isoformat(), "--pretty=format:" + fmt]
     try:
         out = subprocess.run(cmd, **NOWIN, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
@@ -752,6 +759,38 @@ def slice_path(pot, project, repo):
     return Path(pot) / "slices" / ("%s__%s.json" % (safe_name(project), safe_name(repo)))
 
 
+def repo_common_dir(root):
+    """Which repository this checkout belongs to, as something two slices can be compared on.
+
+    `--git-common-dir` is the git directory the checkout shares: a linked worktree's resolves
+    to its parent's, and so does a plain subdirectory's, because git answers for the
+    repository rather than for the directory it was asked in. That is exactly why
+    collect_commits() returns the same history from both, and recording it is how
+    dedupe_repositories() knows to count that history once.
+
+    Not the `origin` URL: two clones of one GitHub repo on one machine are separate working
+    copies whose histories genuinely diverge, and a URL would wrongly merge them.
+
+    git can answer relatively ('../.git' from a subdirectory), so anchor it on the root the
+    way git_dir_path() does, then normalise it for comparison.
+
+    norm() is normcase and normpath, not a resolve: it does not follow a symlink, a junction,
+    a subst drive or an 8.3 name, while git stores the path as it resolved when the worktree
+    was added. A checkout reached by a different spelling of one directory therefore names a
+    different repository - and because both slices are then NAMED, the hash fallback is
+    deliberately closed to them, so that pair silently goes back to being counted twice."""
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+                             **NOWIN, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=15)
+        if out.returncode == 0 and out.stdout.strip():
+            p = Path(out.stdout.strip())
+            return norm(p if p.is_absolute() else Path(root) / p)
+    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def collect_and_write(cfg, root):
     now = datetime.now(local_tz())
     since = window_start(cfg, now)
@@ -759,6 +798,7 @@ def collect_and_write(cfg, root):
     data = {
         "version": VERSION, "project": project, "repo": root.name, "path": str(root),
         "machine": platform.node(), "updated": now.isoformat(), "since": since.isoformat(),
+        "repo_id": repo_common_dir(root),
         "uncommitted": uncommitted_count(root),
         "commits": collect_commits(root, since),
         "sessions": collect_sessions(root, since, int(cfg["idle_minutes"])),
@@ -1007,17 +1047,384 @@ def shorten(text, n=90):
     return text if len(text) <= n else text[: n - 1].rstrip() + "\u2026"
 
 
+def repo_root_of(sl):
+    """The working copy at the top of the repository a slice's repo_id names, or None."""
+    rid = sl.get("repo_id")
+    if not isinstance(rid, str) or not rid:
+        return None
+    p = Path(rid)
+    return norm(p.parent if p.name == ".git" else p)
+
+
+def commit_hash(c):
+    """The hash a commit entry can be keyed on, or None if it has none to offer.
+
+    Slices are JSON files on disk that are hand-edited and copied between machines, so an entry
+    in one can be anything at all. load_slices() is the single choke point every consumer comes
+    through, so a file it cannot make sense of has to cost that file and nothing else - the rule
+    it already applies to JSON that is not a dict, one level further down."""
+    if not isinstance(c, dict):
+        return None
+    h = c.get("hash")
+    return h if isinstance(h, str) and h else None
+
+
+def commit_time(c):
+    return str((c.get("time") if isinstance(c, dict) else "") or "")
+
+
+def commit_list(sl):
+    """A slice's commits as the rest of the program is entitled to assume they are: a list of
+    dicts whose `hash` and `subject` are strings.
+
+    Everything downstream of load_slices() indexes and slices these without asking - build_report
+    does c["hash"][:7], the dashboard's JavaScript does c.hash.slice(0, 7) - and build_report is
+    called outside render()'s try, so one bad entry anywhere in the pot stops every report, not
+    just the file it came from. Slices are JSON on disk: hand-edited, truncated, copied between
+    machines. Cleaning here, at the single loader, is what keeps a damaged file costing only
+    itself. Entries with nothing to key on keep an empty hash rather than being dropped - there
+    is nothing to dedupe them against, and discarding them would lose real work."""
+    raw = sl.get("commits")
+    if not isinstance(raw, list):
+        return []                         # a truncated or mangled field is not iterable at all
+    clean = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue                      # a string or a number is not a commit in any reading
+        h, s = c.get("hash"), c.get("subject")
+        if isinstance(h, str) and isinstance(s, str):
+            clean.append(c)               # the ordinary case: no copy, no allocation
+        else:
+            clean.append(dict(c, hash=h if isinstance(h, str) else "",
+                              subject=s if isinstance(s, str) else ""))
+    return clean
+
+
+
+def as_int(v):
+    """A count from a slice file, as a count. Anything that is not one reads as none."""
+    if isinstance(v, bool):
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        return 0     # json.load gives Infinity back as a float, and int() refuses it
+
+
+SESSION_COUNTS = ("prompts", "active_min", "context_max")
+SESSION_MAPS = ("tokens", "tokens_by_model", "tokens_by_day_by_model",
+                "tokens_by_day_by_band_by_model", "subagent_tokens_by_day_by_model",
+                "agents", "tools", "commands")
+
+
+def tok_of(tk, k):
+    """One token count out of whatever a slice actually holds where a count belongs.
+
+    clean_session() normalises a session's own fields, and this is the leaf below them:
+    `tokens`, `tokens_by_model` and the by-day maps are dicts of dicts of counts, and cleaning
+    each of those maps to arbitrary depth at load time would cost a walk of every session in
+    the pot on every run. The arithmetic is in four places instead, and this is what they all
+    add - so the guarantee is kept where the addition happens rather than promised above it."""
+    return as_int(tk.get(k)) if isinstance(tk, dict) else 0
+
+
+def clean_session(s):
+    """One session, on the same terms as the slice around it. Returns (session, repaired).
+
+    Most of a slice's arithmetic lives in here - active_min is apportioned across days, bursts
+    are iterated as pairs, tokens are summed by model, tools and commands are added up - and
+    all of it on build_report's unprotected path, so `sessions` being a list of dicts was never
+    the whole of the claim. A null is left alone throughout: every consumer already reads one
+    as an absent field, and flagging it would make the log cry wolf over ordinary slices."""
+    out, bad = dict(s), False
+    for k in ("branch", "title"):
+        if out.get(k) is not None and not isinstance(out[k], str):
+            out[k], bad = str(out[k]), True
+    for k in SESSION_COUNTS:
+        if out.get(k) is not None and (not isinstance(out[k], int) or isinstance(out[k], bool)):
+            out[k], bad = as_int(out[k]), True
+    if out.get("bursts") is not None and not isinstance(out["bursts"], list):
+        out["bursts"], bad = [], True
+    for k in SESSION_MAPS:
+        if out.get(k) is not None and not isinstance(out[k], dict):
+            out[k], bad = {}, True
+    # One level in, because one level in is still the program's assumption rather than the
+    # file's: an agent is a record of its runs, and a tool or a command is a count of them.
+    agents = out.get("agents")
+    if isinstance(agents, dict) and not all(isinstance(a, dict) for a in agents.values()):
+        out["agents"], bad = {n: a for n, a in agents.items() if isinstance(a, dict)}, True
+    for k in ("tools", "commands"):
+        counts = out.get(k)
+        if isinstance(counts, dict) and not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in counts.values()):
+            out[k], bad = {n: as_int(v) for n, v in counts.items()}, True
+    return out, bad
+
+
+def clean_machine(d, name=""):
+    """A machine slice on the same terms as clean_slice(), and by the same argument.
+
+    Desk time and presence come out of the same pot, written by the same agents on the same
+    machines, and reach build_report on the same unprotected path: `aw["days"]` is merged into
+    a dict and indexed per day, and presence events are sorted on `e["time"]` and read on
+    `e["event"]`. Nothing here has no honest default - a machine slice with no usable desk time
+    is a machine that recorded none - so nothing is dropped, only emptied."""
+    out, fixed = dict(d), []
+    aw = out.get("aw")
+    if not isinstance(aw, dict):
+        if aw is not None:
+            fixed.append("aw")
+        aw = {}
+    days = aw.get("days")
+    if not isinstance(days, dict):
+        if days is not None:
+            fixed.append("aw.days")
+        aw = dict(aw, days={})
+    elif not all(isinstance(v, dict) for v in days.values()):
+        fixed.append("aw.days")
+        aw = dict(aw, days={k: v for k, v in days.items() if isinstance(v, dict)})
+    out["aw"] = aw
+    pres = out.get("presence")
+    if not isinstance(pres, dict):
+        if pres is not None:
+            fixed.append("presence")
+        pres = {}
+    events = pres.get("events")
+    if not isinstance(events, list):
+        if events is not None:
+            fixed.append("presence.events")
+        events = []
+    # An event with no time cannot be ordered and an event with no name cannot be read; both
+    # are indexed, not .get()-ed, by presence_days(), which the diary shares.
+    kept = [e for e in events if isinstance(e, dict)
+            and isinstance(e.get("time"), str) and isinstance(e.get("event"), str)]
+    if len(kept) != len(events):
+        fixed.append("presence.events")
+    out["presence"] = dict(pres, events=kept)
+    if fixed:
+        log("load: %s had %s of the wrong type; the rest of it is still reported"
+            % (name or "a machine slice", ", ".join(sorted(set(fixed)))))
+    return out
+
+
+def clean_slice(d, name=""):
+    """A slice as the rest of the program is entitled to assume it is, or None if it cannot be.
+
+    commit_list() was written for `commits` and the same thing is true of every field beside it:
+    `build_report` buckets on `project`, joins `repo`, formats `uncommitted` with %d and iterates
+    `sessions`, all outside render()'s try, so a value of the wrong type in any one of them stops
+    the report for every project rather than costing the file it came from - and it stops it
+    silently, because the hook worker logs the traceback and nothing else changes. The pot is
+    written by agents on other machines, copied between them by the import, and open to whatever
+    a half-finished write left behind, so this is ordinary input handling, not paranoia.
+
+    `project` is the one field with no honest default - it is the label every count hangs off -
+    so a slice without a usable one is dropped and said so in the log. Everything else is
+    normalised in place: a slice is evidence that work happened somewhere, and throwing it away
+    over a mangled branch name would lose more than it saves."""
+    project = d.get("project")
+    if not isinstance(project, str) or not project.strip():
+        log("load: %s carries no usable project name (%r), so it is not reported"
+            % (name or "a slice", project))
+        return None
+    out, fixed = dict(d), []
+    for k in ("repo", "path", "branch", "machine", "since", "updated"):
+        if k in out and not isinstance(out[k], str):
+            out[k] = "" if out[k] is None else str(out[k])
+            fixed.append(k)
+    if not isinstance(out.get("uncommitted"), int) or isinstance(out.get("uncommitted"), bool):
+        if out.get("uncommitted") is not None:
+            fixed.append("uncommitted")
+        out["uncommitted"] = as_int(out.get("uncommitted"))
+    ss = out.get("sessions")
+    if not isinstance(ss, list):
+        if ss is not None:
+            fixed.append("sessions")
+        ss = []
+    sessions, repaired = [], False
+    for s in ss:
+        if not isinstance(s, dict):
+            repaired = True               # a string where a session should be is not one
+            continue
+        s, changed = clean_session(s)
+        repaired = repaired or changed
+        sessions.append(s)
+    if repaired:
+        fixed.append("sessions")
+    out["sessions"] = sessions
+    before = out.get("commits")
+    out["commits"] = commit_list(out)
+    if not isinstance(before, list) or len(before) != len(out["commits"]):
+        fixed.append("commits")
+    if fixed:
+        log("load: %s had %s of the wrong type; the rest of it is still reported"
+            % (name or "a slice", ", ".join(sorted(set(fixed)))))
+    return out
+
+
+def at_repo_root(sl):
+    root = repo_root_of(sl)
+    return bool(root and sl.get("path") and norm(sl["path"]) == root)
+
+
+def dedupe_repositories(slices):
+    """One repository's commits, reported once - however many checkouts of it report them.
+
+    `git log --all` answers for the REPOSITORY, not for the directory it was run in, so every
+    checkout of one repository collects that repository's whole history: a linked worktree, and
+    a plain subdirectory with no .git of its own (git walks up). Counting each of them is how
+    one week on this machine came to read 388 commits when 334 were made, and the 28-day window
+    3095 when it was 2235.
+
+    Slices are grouped by `repo_id`, and then any groups sharing a commit hash are merged. A
+    git hash covers content, parents, author and time, so a shared hash IS a shared history -
+    which is what catches the slices that have no identity to group on: ones written before
+    v1.20, here or on another machine, and ones where git could not answer at collect time. It
+    is only for those: a slice written by v1.20 elsewhere carries THAT machine's path as its
+    repo_id, and two slices that each name a repository and name different ones are never
+    merged on a hash - so importing another machine's v1.20 slices means stripping or
+    translating repo_id first.
+
+    Within a group the commits are UNIONED by hash rather than one slice's list being elected,
+    because group members carry different `since` windows - a slice that stopped being
+    collected is often the only remaining holder of older history the live slice's window has
+    since dropped, and electing either one loses real work.
+
+    The union goes to the checkout at the repository root. The others keep their sessions and
+    their uncommitted count, which are per-checkout and were never duplicated, and carry
+    `dup_of` so that a consumer which re-reads git for itself (diary_agent's build_day) knows
+    not to ask again.
+
+    Pure: the caller's slices are never modified.
+    """
+    # Before anything else, and for every slice rather than only the ones that get merged: a
+    # slice with no duplicate is the commonest kind, and its junk reaches the report just the
+    # same. See commit_list().
+    out = [dict(sl, commits=commit_list(sl)) for sl in slices]
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:          # path compression: a pot can hold hundreds of slices
+            parent[x], x = root, parent[x]
+        return root
+
+    ids = {}                                  # group root -> the repo_ids that group contains
+
+    def union(a, b):
+        """Join two groups, unless each is a repository that has said what it is and they differ.
+
+        Identity beats a shared hash, because a shared hash is not quite proof: two repositories
+        seeded with the same content, message, author and second produce the same root commit,
+        and merging them on that would be wrong."""
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        ia, ib = ids.setdefault(ra, set()), ids.setdefault(rb, set())
+        if ia and ib and ia != ib:
+            return False
+        parent[ra] = rb
+        ids[rb] = ia | ib
+        return True
+
+    named = {}                                # slice index -> the repository it names, if any
+    for i, sl in enumerate(out):
+        find(i)
+        rid = norm(sl["repo_id"]) if isinstance(sl.get("repo_id"), str) and sl["repo_id"] else None
+        named[i] = rid
+        if rid:
+            union(i, ("repo_id", rid))
+            ids.setdefault(find(i), set()).add(rid)
+
+    # Hashes are the fallback for the slices with no identity to group on, and TWO shared
+    # hashes are required rather than one. Two repositories seeded with the same content,
+    # message, author and second produce the same root commit, so a single match is a
+    # coincidence - and acting on it folds a whole project into an unrelated one, its commits
+    # re-attributed and its name gone from the report. Sharing a history means sharing more
+    # than one commit of it. The cost is a repository with exactly one commit and two
+    # identity-less checkouts, which stays counted twice; every slice written from 1.20 on
+    # carries repo_id and never reaches this pass.
+    by_hash = defaultdict(set)
+    for i, sl in enumerate(out):
+        for c in sl["commits"]:
+            h = commit_hash(c)
+            if h:
+                by_hash[h].add(i)
+    shared = defaultdict(int)
+    for owners in by_hash.values():
+        if len(owners) < 2:
+            continue
+        owners = sorted(owners)
+        for a in range(len(owners)):
+            for b in range(a + 1, len(owners)):
+                shared[(owners[a], owners[b])] += 1
+    for (a, b), n in sorted(shared.items()):
+        if n < 2 or (named[a] and named[b]):
+            continue                      # two slices that both name a repository need no guess
+        if union(a, b):
+            # The hash pass is the one that can be wrong - it is a guess where identity was not
+            # recorded, and acting on it moves a project's whole history under another name. Say
+            # which two, and on how much evidence, so the guess is auditable after the fact.
+            # Which of them ends up reporting is not settled here: the keeper is elected below,
+            # by root-then-recency-then-size, so naming a survivor on this line would name the
+            # wrong one about as often as the right one.
+            log("dedupe: %s/%s and %s/%s share %d commits, so they are one repository" % (
+                out[a].get("project"), out[a].get("repo"),
+                out[b].get("project"), out[b].get("repo"), n))
+
+    groups = defaultdict(list)
+    for i in range(len(out)):
+        groups[find(i)].append(i)
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Stable sorts, least significant first: the checkout at the repository root reports,
+        # else the one collected most recently, else the one holding the most history.
+        members.sort(key=lambda i: (str(out[i].get("project") or ""), str(out[i].get("repo") or "")))
+        members.sort(key=lambda i: len(out[i]["commits"]), reverse=True)
+        members.sort(key=lambda i: str(out[i].get("updated") or ""), reverse=True)
+        members.sort(key=lambda i: 0 if at_repo_root(out[i]) else 1)
+        keeper = out[members[0]]
+        merged, seen = [], set()
+        for i in members:
+            for c in out[i]["commits"]:   # already sanitised above, for every slice in the pot
+                h = commit_hash(c)
+                if h is None:
+                    merged.append(c)      # nothing to key on, so nothing to dedupe it against
+                    continue
+                if h in seen:
+                    continue
+                seen.add(h)
+                merged.append(c)
+        merged.sort(key=commit_time)
+        keeper["commits"] = merged
+        for i in members[1:]:
+            out[i]["commits"] = []
+            out[i]["dup_of"] = keeper.get("repo") or keeper.get("project") or "?"
+    return out
+
+
 def load_slices(pot):
+    """Every consumer of the pot comes through here - render(), cmd_brief() and diary_agent -
+    so deduplicating here is what keeps the report, the dashboard, the weekly CSVs and the
+    diary telling one story without the rule being written out four times."""
     repos, machines = [], []
     for f in sorted((Path(pot) / "slices").glob("*.json")):
         d = read_json(f, None)
         if not isinstance(d, dict):
             continue
         if d.get("kind") == "machine":
-            machines.append(d)
+            machines.append(clean_machine(d, f.name))
         elif "project" in d:
-            repos.append(d)
-    return repos, machines
+            # One choke point, one place the pot stops being trusted input. See clean_slice().
+            sl = clean_slice(d, f.name)
+            if sl is not None:
+                repos.append(sl)
+    return dedupe_repositories(repos), machines
 
 
 def price_for(model, prices):
@@ -1139,7 +1546,8 @@ def build_report(slices, machines, since, until, cfg):
             if not t or t < since or t > until:
                 continue
             b["commits"] += 1
-            b["days"][t.date()].append((t, "commit", "`%s` %s" % (c["hash"][:7], shorten(c["subject"], 110)), c["subject"], t))
+            h, subject = str(c.get("hash") or ""), str(c.get("subject") or "")
+            b["days"][t.date()].append((t, "commit", "`%s` %s" % (h[:7], shorten(subject, 110)), subject, t))
         for s in sl.get("sessions", []):
             st, en = parse_iso(s.get("start")), parse_iso(s.get("end"))
             if not st:
@@ -1416,9 +1824,9 @@ def build_report(slices, machines, since, until, cfg):
         for s_ in b.get("session_objs", []):
             for name, a in (s_.get("agents") or {}).items():
                 g = agg_projs.setdefault(label, {}).setdefault(name, {"runs": 0, "wall_s": 0, "in": 0, "out": 0})
-                g["runs"] += a.get("runs", 0); g["wall_s"] += a.get("wall_s", 0)
-                g["in"] += (a.get("tokens") or {}).get("in", 0) + (a.get("tokens") or {}).get("cache_create", 0)
-                g["out"] += (a.get("tokens") or {}).get("out", 0)
+                g["runs"] += as_int(a.get("runs")); g["wall_s"] += as_int(a.get("wall_s"))
+                g["in"] += tok_of(a.get("tokens"), "in") + tok_of(a.get("tokens"), "cache_create")
+                g["out"] += tok_of(a.get("tokens"), "out")
             for k, v in (s_.get("commands") or {}).items():
                 agg_cmds[k] = agg_cmds.get(k, 0) + v
             for k, v in (s_.get("tools") or {}).items():
@@ -1457,7 +1865,7 @@ def build_report(slices, machines, since, until, cfg):
         pa = {}
         for s_ in b.get("session_objs", []):
             for name, a in (s_.get("agents") or {}).items():
-                g = pa.setdefault(name, [0, 0]); g[0] += a.get("runs", 0); g[1] += a.get("wall_s", 0)
+                g = pa.setdefault(name, [0, 0]); g[0] += as_int(a.get("runs")); g[1] += as_int(a.get("wall_s"))
         if pa:
             L.append("Agents: " + ", ".join("%s x%d (%s)" % (an.get(n, n), g[0], fmt_dur(g[1] / 60)) for n, g in sorted(pa.items(), key=lambda kv: -kv[1][1])))
         L.append("")
@@ -2234,7 +2642,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var html = '';
     focus.forEach(function (x) {
       if (!x.commits.length && !x.sessions.length) return;
-      html += '<h3><span class="sw" style="background:' + x.p.color + '"></span>' + esc(x.p.name) + ' <span class="muted" style="font-weight:400">' + esc(x.p.repos.join(', ')) + (x.branches.length ? ' · ' + x.branches.join(', ') : '') + '</span></h3>';
+      html += '<h3><span class="sw" style="background:' + x.p.color + '"></span>' + esc(x.p.name) + ' <span class="muted" style="font-weight:400">' + esc(x.p.repos.join(', ')) + (x.branches.length ? ' · ' + esc(x.branches.join(', ')) : '') + '</span></h3>';
       R.days.slice().reverse().forEach(function (d) {
         var dd = x.byDay[dateKey(d)]; if (!dd || (!dd.commits.length && !dd.sessions.length)) return;
         var items = dd.commits.map(function (c) { return { t: c.t, html: '<code>' + esc(c.hash.slice(0, 7)) + '</code> ' + esc(c.subject) }; })
@@ -2938,7 +3346,10 @@ def cmd_install(args):
     data = collect_and_write(cfg, root)
     collect_machine(cfg, force=True)
     totals = render(cfg)
-    say("  %d commits, %d Claude Code sessions for this repo since %s (%d-day window)" % (
+    # This checkout's raw count, and the pot's below it is the repository's counted once. A
+    # second checkout of one repository reports that repository's whole history here, so say
+    # which is which rather than printing two numbers that look like they should agree.
+    say("  %d commits, %d Claude Code sessions in this checkout since %s (%d-day window)" % (
         len(data["commits"]), len(data["sessions"]), parse_iso(data["since"]).strftime("%d %b"), int(cfg["window_days"])))
     if totals:
         say("  pot this week: %d commits, %d sessions, ~%s active  ->  %s" % (
@@ -3039,8 +3450,11 @@ def cmd_status(args):
     sp = slice_path(cfg["pot"], project_name(root), root.name)
     if sp.exists():
         d = read_json(sp, {})
+        # Raw, on purpose - this command describes files, not work - which makes it the one
+        # place a malformed slice is expected, and so the one place that must not raise.
+        sessions = d.get("sessions")
         say("slice     %s  (%d commits, %d sessions, updated %s)" % (
-            sp.name, len(d.get("commits", [])), len(d.get("sessions", [])),
+            sp.name, len(commit_list(d)), len(sessions) if isinstance(sessions, list) else 0,
             (parse_iso(d.get("updated")) or datetime.now()).strftime("%d %b %H:%M")))
         others = [f.name for f in sp.parent.glob("*.json") if f != sp and not f.name.startswith("_machine__")]
         say("others    %d other repo%s reporting to this pot" % (len(others), "" if len(others) == 1 else "s"))
@@ -3051,9 +3465,8 @@ def cmd_status(args):
     say("desk time ActivityWatch %s at %s" % ("reachable" if aw_reachable(cfg) else "not reachable", cfg["aw_url"]))
     mp = machine_slice_path(cfg["pot"])
     if mp.exists():
-        m = read_json(mp, {})
-        aw = m.get("aw") or {}
-        pe = (m.get("presence") or {}).get("events", [])
+        m = clean_machine(read_json(mp, {}), mp.name)
+        aw, pe = m["aw"], m["presence"]["events"]
         last = parse_iso(pe[-1]["time"]) if pe else None
         say("machine   %d days of desk time%s \u00b7 %d presence events%s" % (
             len(aw.get("days") or {}), (" (last error: %s)" % aw["error"]) if aw.get("error") else "",
