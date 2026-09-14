@@ -185,7 +185,7 @@ reduced to a digest and summarised in 150-250 words by the configured model.
 {
   "date": "2026-09-05",
   "generated": "2026-09-06T08:12:03+01:00",
-  "diary_version": "1.0",
+  "diary_version": "1.1",
   "totals": {"hours": 7.4, "commits": 11, "sessions": 6,
              "desk_hours": 9.1, "unlocked": "08:12-19:40", "unlocked_hours": 10.2},
   "projects": [
@@ -211,6 +211,13 @@ Two things about the numbers, both stated in `time_note` in every file:
   ActivityWatch and the presence stamps. `editor_hours` beside a project is ActivityWatch window
   titles matched to the project name - a guess, reported next to the effort figure rather than
   added to it.
+- **`desk_hours` is absent, and `"desk_hours_unmeasured": true` stands in its place**, on a day
+  the worklog marked as one the machine could not measure - a remote session, an unattended run,
+  or ActivityWatch not running. `editor_hours` is dropped for the same day, per project. The
+  flag is written rather than the key simply omitted, because a day-file with no `desk_hours`
+  already reads as a day spent away from the machine, and these are days spent at work. The
+  worklog applies the rule in `load_slices()`, so the diary reads the mark and never recomputes
+  it - see `docs/decisions/0014-*`.
 
 `totals.commits` and `totals.sessions` count the real day, including the private repos whose
 detail is withheld. Aggregate counts, no content.

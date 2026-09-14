@@ -46,7 +46,7 @@ import time
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 CENTRAL_CFG = Path("~/.claude/diary.json").expanduser()
 WORKLOG_CFG = Path("~/.claude/worklog.json").expanduser()
@@ -813,11 +813,20 @@ def leak_check(day, cfg, metas, redact=False):
 # ----------------------------------------------------------------------------- collect
 
 def aw_day(machines, d):
-    """Desk and editor seconds for one day, merged across machine slices."""
-    out = {"desk_s": 0, "editor_s": 0, "editor": {}}
+    """Desk and editor seconds for one day, merged across machine slices.
+
+    A record the worklog has marked `unmeasured` is skipped rather than added: ActivityWatch
+    measures local input, so over a remote session it reports a small confident number instead
+    of reporting blindness. The mark is applied in worklog_agent's mark_unmeasurable_desk() at
+    load_slices(), which is the load this comes through, so nothing is asked of the kit copy
+    here - a machine slice written by an older agent simply carries no flag."""
+    out = {"desk_s": 0, "editor_s": 0, "editor": {}, "unmeasured": False}
     for m in machines:
         rec = ((m.get("aw") or {}).get("days") or {}).get(d.isoformat())
         if not isinstance(rec, dict):
+            continue
+        if rec.get("unmeasured"):
+            out["unmeasured"] = True
             continue
         out["desk_s"] += int(rec.get("desk_s") or 0)
         out["editor_s"] += int(rec.get("editor_s") or 0)
@@ -876,7 +885,9 @@ def timeline(commits, sessions):
 
 TIME_NOTE = ("Project hours are Claude Code effort as the worklog counts it, so parallel "
              "sessions add up and the total can exceed the day. desk_hours and unlocked "
-             "are the machine's own figures for the same day. Commits and sessions are "
+             "are the machine's own figures for the same day, and desk_hours is absent "
+             "with desk_hours_unmeasured set where the machine was in no position to take "
+             "it. Commits and sessions are "
              "counted only where a project's tier lets them into this file.")
 
 
@@ -1000,6 +1011,9 @@ def build_day(cfg, d, wl, summarise=True, refresh=False):
     totals = {"hours": hours(total_min), "commits": n_commits, "sessions": n_sessions}
     if aw["desk_s"]:
         totals["desk_hours"] = hours(aw["desk_s"] / 60.0)
+    elif aw.get("unmeasured"):
+        # Said, not omitted: a diary with no desk_hours reads as a day away from the machine.
+        totals["desk_hours_unmeasured"] = True
     pres = presence_span(wl, machines, d)
     if pres:
         totals["unlocked"] = "%s-%s" % (pres["first"], pres["last"])
@@ -1054,6 +1068,12 @@ def is_stale(cfg, d, day):
     stale once a note or a worklog slice has been written since the file was."""
     path = day_path(cfg, d)
     if day is None or not path.exists():
+        return True
+    # And when the file was written under an older set of rules. Worklog 1.21 marks the days
+    # ActivityWatch was in no position to measure, so a 1.0 day-file carries a desk_hours that
+    # nothing could have measured - and on a pot nobody has written to since, no mtime below
+    # would ever notice.
+    if (day or {}).get("diary_version") != VERSION:
         return True
     try:
         mtime = path.stat().st_mtime

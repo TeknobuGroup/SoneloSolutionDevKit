@@ -61,9 +61,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 
-VERSION = "1.20.2"
-WHATS_NEW = "a repository's commits are counted once however many worktrees or nested checkouts of it report, so weeks inflated by a duplicate checkout are restated down; stashes and git notes are no longer counted as commits, no single malformed slice can stop every report, whatever is wrong with it - a repo's field, a session's, or a machine's desk time, and a branch name cannot put markup into the dashboard"
-WHATS_NEW_SHORT = "commits counted once per repository"   # header strip only; keep under ~60 chars
+VERSION = "1.21"
+# The causes are named once, in UNMEASURED_WHY. This line is printed a line away from that
+# sentence on the morning page, and it had already drifted to two of the three.
+WHATS_NEW = "a day's desk and editor time now reads “not measurable” rather than a small confident number, or a blank, when ActivityWatch was in no position to see the machine, judged against Claude Code's own session bursts, which are written locally however you were connected; the days restate themselves on the next render"
+WHATS_NEW_SHORT = "desk time you could not have measured"   # header strip only; keep under ~60 chars
 HERE = Path(__file__).resolve().parent          # <repo>/.worklog  (or <pot>/bin for the machine copy)
 CENTRAL_CFG = Path("~/.claude/worklog.json").expanduser()
 REPO_CFG = HERE / "worklog.json"
@@ -1408,6 +1410,188 @@ def dedupe_repositories(slices):
     return out
 
 
+# ----------------------------------------------------------- desk time nothing could measure
+
+# Two hours of Claude Code is the least evidence that can contradict anything, and a desk
+# figure under a quarter of it is the watchers reporting blind rather than reporting an idle
+# day. Calibrated over 28 days of one machine's pot: 9 days flagged, ratios 0.00-0.15; 18 kept,
+# 0.34-1.15. The gap between them is wide and 0.25 sits in the middle of it.
+DESK_EVIDENCE_S = 2 * 3600
+DESK_CONTRADICTED = 0.25
+NOT_MEASURABLE = "not measurable"
+# Where a duration would print in a narrow, repeated cell - a per-project column in the
+# Editor table, a figure in a dashboard day row - the words do not fit and a blank is the
+# one thing they must not be mistaken for. Both places carry a legend saying what it means.
+NOT_MEASURABLE_SHORT = "n/m"
+# The creation half of the rule is sized by timestamps out of a slice file, and
+# clean_session() does not range-check a burst: one pair spanning 2020-2035 would otherwise
+# fabricate 5,480 day records, all of which reach dashboard.html as one string in memory.
+# A year is past any window the report is ever asked for, and caps the damage at 366.
+UNMEASURED_CREATE_DAYS = 366
+# Three causes fit the evidence, and the sentence has to allow for all three: the day was
+# worked remotely, ActivityWatch was not running, or the session ran unattended with nobody at
+# the machine. In the third case the watchers were not blind - they measured an empty chair -
+# so naming only the first two would state a cause with more confidence than the rule has.
+# There is no second witness that could tell them apart. Presence looks like one and is not:
+# the lock/unlock events stop firing on a remote day, and presence_days() caps an unclosed
+# span at 16 hours, so the very days this rule catches render a long "unlocked" span out of
+# an invented end time - 8 and 9 September print 9h 35m and 16h. Reading that span as "the
+# user was here" would un-mark two of the days that prompted the change.
+UNMEASURED_WHY = ("Claude Code was active but the machine recorded almost no keyboard or mouse "
+                  "— a remote session, an unattended run, or ActivityWatch not running")
+
+
+def desk_measured(rec):
+    """True when a day's ActivityWatch record can honestly be read as a measurement.
+
+    One rule, two implementations - this and isMeasured() in the dashboard, which recomputes
+    desk and editor time client-side - pinned against each other in
+    tests/test_worklog_unmeasurable_desk.py. Always .get(): slices written by an older agent,
+    and every slice a machine-to-machine import brings in, carry no flag at all.
+
+    A record with nothing in it is a MEASURED zero, not a mark. clean_machine() guarantees a
+    dict and nothing about its keys, `{}` is falsy in Python and truthy in JavaScript, and
+    `bool(rec)` split the two halves apart on it: the report named such a day in the Editor
+    table's footnote while no cell anywhere - and no figure on the dashboard - carried the
+    mark that footnote was explaining."""
+    return isinstance(rec, dict) and not rec.get("unmeasured")
+
+
+def desk_minutes(rec):
+    """Minutes at the desk, or None where the machine was in no position to measure them."""
+    return as_int(rec.get("desk_s")) / 60 if desk_measured(rec) else None
+
+
+def day_active_union(slices):
+    """Seconds per local day with any Claude Code session active, concurrent sessions once.
+
+    build_report has always had this as its `wall_clock` closure over range-filtered buckets.
+    The rule below needs the same number before any range exists, so the algorithm lives here
+    and build_report calls it - one implementation in Python rather than two. Bursts come
+    through session_bursts(), which carries the fallback for slices written before bursts
+    existed; the one-second clamp is the one build_report and the dashboard both use, and
+    without it a burst ending at 23:59:59 loses its last second."""
+    per = defaultdict(list)
+    for sl in slices:
+        for s in sl.get("sessions", []):
+            # build_report drops a session whose start will not parse before its bursts are
+            # ever collected, so the closure this was lifted out of never counted one. The
+            # lift is only behaviour-preserving with the same guard in front of it.
+            if not parse_iso(s.get("start")):
+                continue
+            for a, b in session_bursts(s):
+                cur = a
+                for day, secs in clip_to_days(a, b + timedelta(seconds=1)):
+                    nxt = cur + timedelta(seconds=secs)
+                    per[day].append((cur, nxt))
+                    cur = nxt
+    out = {}
+    for day, iv in per.items():
+        iv.sort()
+        total, cur_s, cur_e = 0.0, None, None
+        for s, e in iv:
+            if e <= s:
+                continue
+            if cur_e is None or s > cur_e:
+                if cur_e is not None:
+                    total += (cur_e - cur_s).total_seconds()
+                cur_s, cur_e = s, e
+            else:
+                cur_e = max(cur_e, e)
+        if cur_e is not None:
+            total += (cur_e - cur_s).total_seconds()
+        out[day] = total
+    return out
+
+
+def mark_unmeasurable_desk(slices, machines):
+    """Mark the days whose desk and editor figures the machine was in no position to take.
+
+    ActivityWatch measures LOCAL input. Over a remote desktop it sees none: aw-watcher-afk
+    reports afk all day, the window watcher polls the foreground window of a disconnected
+    console session and freezes on a stale one, and the Win32 lock/unlock tasks stop firing.
+    Not one of the three says it is blind - each reports a small number, confidently - and a
+    confident wrong small number is worse than nothing, because a blank cell already means
+    zero and a reader cannot tell the two apart.
+
+    Claude Code's own bursts are the independent witness: the session process writes them on
+    this machine however the user is connected. A day carrying at least DESK_EVIDENCE_S of
+    them, against a desk figure under DESK_CONTRADICTED of that, is MARKED - never nulled and
+    never deleted - and so is a day with that much Claude Code and no record at all, which is
+    the same statement made by omission. `rec["desk_s"]` is indexed rather than fetched in two places here,
+    fmt_dur(None) raises, `null / 60` is 0 in JavaScript, and dropping the day would turn
+    have_aw off and take the columns away from the measurable days as well.
+
+    Read time, not collect time: collect_machine() refreshes only yesterday onwards
+    (docs/UAT_PLAN.md records that nothing rebuilds a machine slice's history), so a rule
+    applied where the days are written would never restate the week that prompted it."""
+    cache = {}
+
+    def union_for(name):
+        """The witness has to be the machine being judged, not the pot.
+
+        Repo slices are imported between machines - the kit's guidance is to import the other
+        machine's repo slices and never its machine slice - so a pot routinely holds sessions
+        that ran elsewhere. Judging this machine's desk record against a union that includes
+        them suppresses real measured data on the strength of a file it did not write, which
+        is the same fault as the bug, pointed the other way. A slice naming no machine is
+        evidence about whichever machine is being judged, not about none: the name was not
+        always recorded, and the kit's own copy still writes slices without one."""
+        if name not in cache:
+            cache[name] = day_active_union(
+                [sl for sl in slices if not sl.get("machine") or sl.get("machine") == name]
+                if name else slices)
+        return cache[name]
+
+    recorded, keepers = set(), []
+    for m in machines:
+        days = (m.get("aw") or {}).get("days")
+        if not isinstance(days, dict) or not days:
+            continue
+        union = union_for(m.get("machine"))
+        keepers.append((m.get("machine"), days))
+        for key, rec in list(days.items()):
+            if not isinstance(rec, dict):
+                continue
+            try:
+                d = datetime.strptime(str(key), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            # Every reader looks a day up by d.isoformat(), so a record filed under "2026-9-8"
+            # is invisible to all of them - and counted as a record that already exists, which
+            # silently cancelled the marking for that day. Re-filed where it will be read,
+            # never over a canonical record that already stands.
+            iso = d.isoformat()
+            if key != iso:
+                if iso in days:
+                    continue
+                days[iso] = rec
+                del days[key]
+            recorded.add(d)
+            active = union.get(d, 0.0)
+            if active >= DESK_EVIDENCE_S and as_int(rec.get("desk_s")) < active * DESK_CONTRADICTED:
+                rec["unmeasured"] = True
+    # A day nothing recorded at all is the same lie told by omission - 17-19 August in this
+    # machine's own pot carry 6-13 hours of Claude Code each from before ActivityWatch was
+    # installed, and Saturday 12 September none at all - and a missing record renders the
+    # blank cell that means the machine measured no desk time. Created and marked, with no
+    # invented numbers, and only on a machine that does record desk time: `keepers` is empty
+    # for a machine that has never run ActivityWatch, where have_aw is false and the report
+    # already says so. Written to one machine, and only for a day no machine has, so the
+    # dict.update() pooling every consumer does cannot let this overwrite a real measurement.
+    if keepers:
+        name, days = keepers[0]
+        today = datetime.now(local_tz()).date()
+        earliest = today - timedelta(days=UNMEASURED_CREATE_DAYS)
+        for d, active in union_for(name).items():
+            if d in recorded or active < DESK_EVIDENCE_S:
+                continue
+            if d > today or d < earliest:      # a slice's timestamps are not a bounded input
+                continue
+            days[d.isoformat()] = {"desk_s": 0, "editor_s": 0, "editor": {}, "unmeasured": True}
+    return machines
+
+
 def load_slices(pot):
     """Every consumer of the pot comes through here - render(), cmd_brief() and diary_agent -
     so deduplicating here is what keeps the report, the dashboard, the weekly CSVs and the
@@ -1424,7 +1608,12 @@ def load_slices(pot):
             sl = clean_slice(d, f.name)
             if sl is not None:
                 repos.append(sl)
-    return dedupe_repositories(repos), machines
+    repos = dedupe_repositories(repos)
+    # The desk figures are only as good as what could see the machine, and only the slices
+    # know that. Applied here for the same reason the dedupe is: the report, the dashboard,
+    # the weekly CSVs, the morning page and the diary all read the machine records from this
+    # one return, so the rule is written once rather than five times.
+    return repos, mark_unmeasurable_desk(repos, machines)
 
 
 def price_for(model, prices):
@@ -1619,6 +1808,11 @@ def build_report(slices, machines, since, until, cfg):
     pres = presence_days(presence_events, now) if presence_events else {}
     have_pres = any(d in pres for d in days)
     have_aw = any(d.isoformat() in aw_days_all for d in days)
+    # Days that have a record but cannot be read as one. Kept separate from "no record at all":
+    # a blank cell means the machine measured nothing, and these are days it measured blind.
+    unmeasured_days = [d for d in days
+                       if d.isoformat() in aw_days_all and not desk_measured(aw_days_all[d.isoformat()])]
+    active_union = day_active_union(slices)
 
     def trace_span(day):
         ts = []
@@ -1628,30 +1822,21 @@ def build_report(slices, machines, since, until, cfg):
         return (min(ts), max(ts)) if ts else None
 
     def wall_clock(day):
-        """Minutes with any Claude Code session active on this day (bursts merged across projects)."""
-        d0, d1 = day_window(day)
-        d1 = d1 + timedelta(seconds=1)
-        iv = []
-        for _, b in ordered:
-            for s, e in b["bursts"].get(day, []):
-                iv.append((max(s, d0), min(e, d1)))
-        iv.sort()
-        total, cur_s, cur_e = 0.0, None, None
-        for s, e in iv:
-            if e <= s:
-                continue
-            if cur_e is None or s > cur_e:
-                if cur_e is not None:
-                    total += (cur_e - cur_s).total_seconds()
-                cur_s, cur_e = s, e
-            else:
-                cur_e = max(cur_e, e)
-        if cur_e is not None:
-            total += (cur_e - cur_s).total_seconds()
-        return total / 60
+        """Minutes with any Claude Code session active on this day (bursts merged across projects).
+
+        day_active_union() is the same algorithm this used to hold inline, lifted so the
+        unmeasurable-desk rule can reach it before any range exists. It walks every slice
+        rather than the range-filtered buckets, which reaches the same total for a day in
+        range: a session with no minutes in range contributes no bursts to a day in it."""
+        return active_union.get(day, 0.0) / 60
 
     def editor_for(day, label, b):
         rec = aw_days_all.get(day.isoformat()) or {}
+        # The editor figure is window time intersected with not-afk, so it fails with the same
+        # watcher the desk figure does. Suppressing only editor_s would leave this - the path
+        # the Editor table, the weekly CSV and the dashboard's grid all take - still printing it.
+        if not desk_measured(rec):
+            return 0
         total = 0
         names = {label} | b["repos"]
         for key, secs in (rec.get("editor") or {}).items():
@@ -1659,6 +1844,21 @@ def build_report(slices, machines, since, until, cfg):
             if any(seg in names for seg in segs):
                 total += secs
         return total
+
+    def editor_csv_cell(day, label, b):
+        """The weekly CSV's editor column. Blank, not 0, for a day that cannot be measured,
+        so a person reading the file can tell the two apart.
+
+        It does NOT yet fix the Weeks chart: read_weekly_csvs() does int(float(r.get(col) or 0)),
+        which reads this blank straight back as 0, so a suppressed week still plots as a
+        measured zero - wrong in the same direction that chart is wrong today. Disclosed in
+        the CHANGELOG rather than quietly implied to be handled."""
+        if not have_aw:
+            return ""
+        rec = aw_days_all.get(day.isoformat())
+        if rec and not desk_measured(rec):
+            return ""
+        return int(editor_for(day, label, b) / 60)
 
     L = []
     if span == 1:
@@ -1686,10 +1886,12 @@ def build_report(slices, machines, since, until, cfg):
             bits.append("unlocked %s\u2013%s (%s)" % (pres[d]["first"].strftime("%H:%M"), pres[d]["last"].strftime("%H:%M"),
                                                     fmt_dur(pres[d]["on_s"] / 60)))
         rec = aw_days_all.get(d.isoformat())
-        if rec:
-            bits.append("%s at the desk" % fmt_dur(rec["desk_s"] / 60))
+        if desk_measured(rec):
+            bits.append("%s at the desk" % fmt_dur(desk_minutes(rec)))
             if rec.get("editor_s"):
                 bits.append("%s in the editor" % fmt_dur(rec["editor_s"] / 60))
+        elif rec:
+            bits.append("desk and editor time %s (%s)" % (NOT_MEASURABLE, UNMEASURED_WHY))
         if bits:
             L.append("**Day:** " + " \u00b7 ".join(bits))
             L.append("")
@@ -1731,10 +1933,22 @@ def build_report(slices, machines, since, until, cfg):
             for label, b in ordered:
                 cells = []
                 for d in days:
+                    rec = aw_days_all.get(d.isoformat())
+                    # A blank here already means under a minute FOR THIS PROJECT, so a blind
+                    # day cannot borrow it - it would read as "this project was not open",
+                    # which is the same lie the change exists to stop telling.
+                    if rec and not desk_measured(rec):
+                        cells.append(NOT_MEASURABLE_SHORT)
+                        continue
                     secs = editor_for(d, label, b)
                     cells.append(fmt_dur(secs / 60) if secs >= 60 else "")
                 L.append("| %s | %s |" % (label, " | ".join(cells)))
             L.append("")
+            if unmeasured_days:
+                L.append("%s = %s, on %s — %s." % (
+                    NOT_MEASURABLE_SHORT, NOT_MEASURABLE,
+                    ", ".join(d.strftime("%a %d") for d in unmeasured_days), UNMEASURED_WHY))
+                L.append("")
 
     if span >= 2:
         cols = ["Day"] + (["At desk"] if have_aw else []) + (["Unlocked"] if have_pres else []) + \
@@ -1743,6 +1957,10 @@ def build_report(slices, machines, since, until, cfg):
         L.append("")
         if have_aw or have_pres:
             L.append("At desk = keyboard/mouse active (ActivityWatch). Unlocked = between unlock/logon and lock/sleep.")
+        if unmeasured_days:
+            L.append("“%s”: %s. The day's Claude Code and commit figures are unaffected - "
+                     "they are written by the session on this machine however you were connected."
+                     % (NOT_MEASURABLE, UNMEASURED_WHY))
         # Always printed: on a machine with neither ActivityWatch nor presence data this used to
         # ship with no explanation, leaving an elapsed column looking like an effort one.
         L.append("Trace = first and last commit or Claude Code event. Claude Code (elapsed) = wall-clock time with any "
@@ -1754,11 +1972,15 @@ def build_report(slices, machines, since, until, cfg):
         for d in days:
             if d > now.date():
                 continue
-            rec = aw_days_all.get(d.isoformat()) or {}
+            rec = aw_days_all.get(d.isoformat())
             tr = trace_span(d)
             row = [d.strftime("%a %d %b")]
             if have_aw:
-                row.append(fmt_dur(rec["desk_s"] / 60) if rec else "")
+                # No record and an empty record are different statements - nothing was
+                # collected that day, against nothing happened that day - and the dashboard
+                # already draws them differently, a dash against a measured zero.
+                row.append("" if rec is None else
+                           fmt_dur(desk_minutes(rec)) if desk_measured(rec) else NOT_MEASURABLE)
             if have_pres:
                 row.append("%s\u2013%s (%s)" % (pres[d]["first"].strftime("%H:%M"), pres[d]["last"].strftime("%H:%M"),
                                                fmt_dur(pres[d]["on_s"] / 60)) if d in pres else "")
@@ -1766,7 +1988,12 @@ def build_report(slices, machines, since, until, cfg):
             act = wall_clock(d)
             row.append(fmt_dur(act) if act >= 1 else "")
             if have_aw:
-                row.append(fmt_dur(rec["editor_s"] / 60) if rec and rec.get("editor_s") else "")
+                # Same three ways as At desk, above: no record is blank, a record read as
+                # a measurement prints one even when it is zero, a marked one says so. An
+                # editor genuinely shut all day is a fact, and it used to print as a blank -
+                # indistinguishable from the day the watchers were never running.
+                row.append(NOT_MEASURABLE if rec is not None and not desk_measured(rec) else
+                           fmt_dur(as_int(rec.get("editor_s")) / 60) if rec is not None else "")
             n_c = sum(1 for _, b in ordered for it in b["days"].get(d, []) if it[1] == "commit")
             row.append(str(n_c) if n_c else "")
             L.append("| " + " | ".join(row) + " |")
@@ -1894,7 +2121,7 @@ def build_report(slices, machines, since, until, cfg):
                          sum(1 for it in items if it[1] == "commit"),
                          sum(1 for it in items if it[1] == "claude"),
                          b["day_active"].get(day, 0),
-                         int(editor_for(day, label, b) / 60) if have_aw else "",
+                         editor_csv_cell(day, label, b),
                          " | ".join(it[3] for it in items if it[1] == "commit"),
                          " | ".join(it[3] for it in items if it[1] == "claude" and it[3])])
     return "\n".join(L), rows, (tc, ts, ta)
@@ -2086,6 +2313,7 @@ main{padding:16px 20px 40px;display:grid;gap:16px;max-width:1400px;margin:0 auto
 .track .ct{position:absolute;top:2px;width:2px;height:24px;border-radius:1px}
 .figs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:12px;color:var(--muted);text-align:right}
 .figs b{display:block;color:var(--ink);font-size:13px;font-weight:600}
+.figs span[title] b{border-bottom:1px dotted var(--line);cursor:help}
 /* projects */
 table{border-collapse:collapse;width:100%}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600;text-align:right;padding:6px 8px;border-bottom:1px solid var(--line)}
@@ -2154,6 +2382,10 @@ svg.trend text{font-size:11px;fill:var(--muted)}
   var PALETTE = ['#00AF9F', '#6366f1', '#f59e0b', '#ef4444', '#0ea5e9', '#8b5cf6', '#10b981', '#f97316', '#ec4899', '#64748b', '#84cc16', '#14b8a6'];
   var ON = { logon: 1, unlock: 1 }, OFF = { lock: 1, logoff: 1, shutdown: 1, sleep: 1 };
   var H = 3600000, D = 86400000;
+  // Substituted from the Python constants below the template: this used to be a fourth
+  // hand-written copy of the sentence and had already drifted from the other three.
+  var NOT_MEASURABLE_SHORT = __NOT_MEASURABLE_SHORT__;
+  var UNMEASURED = __UNMEASURED_SENTENCE__;
   var now = new Date();
   var today = startOfDay(now);
 
@@ -2226,8 +2458,13 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     if (on !== null) out.push([on, new Date(Math.min(+now, +on + 16 * H))]);
     return out;
   })();
+  // The other half of desk_measured()/desk_minutes() in worklog_agent.py: this page recomputes
+  // desk and editor time client-side from the same records, so the rule has to be written here
+  // too. tests/test_worklog_unmeasurable_desk.py runs both and asserts they agree.
+  function isMeasured(rec) { return !!rec && !rec.unmeasured; }
+  function deskMinutes(rec) { return isMeasured(rec) ? (rec.desk_s || 0) / 60 : null; }
   function editorFor(p, key) {
-    var rec = aw[key]; if (!rec || !rec.editor) return 0;
+    var rec = aw[key]; if (!isMeasured(rec) || !rec.editor) return 0;
     var t = 0;
     Object.keys(rec.editor).forEach(function (k) {
       var segs = k.split(' - ');
@@ -2414,11 +2651,23 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     // by unioning bursts - active_min also carries idle_minutes per burst gap, so a union runs
     // tens of percent low and the dashboard would disagree with the report.
     var agent = sum(focus, function (x) { return x.active; });
-    var desk = 0, unl = 0, ed = 0;
+    var desk = 0, unl = 0, ed = 0, unmeas = 0;
     R.days.forEach(function (d) {
-      var k = dateKey(d); if (aw[k]) { desk += aw[k].desk_s / 60; ed += (aw[k].editor_s || 0) / 60; }
+      var k = dateKey(d), rec = aw[k];
+      // A total that quietly leaves the blind days out is a total that reads low without
+      // saying why, so the count goes on the card beside it.
+      if (rec && !isMeasured(rec)) unmeas++;
+      else if (rec) { desk += deskMinutes(rec); ed += (rec.editor_s || 0) / 60; }
       var d0 = +d, d1 = +addDays(d, 1); unlocked.forEach(function (iv) { unl += overlap(+iv[0], +iv[1], d0, d1) / 60000; });
     });
+    // "N days not measurable" reads as a footnote; the number above it is a total with
+    // those days taken OUT of it, and saying so is the difference between context and a
+    // disclosure. And when NO day in range could be measured, there is no total to show: a
+    // bare, confident 0m is the very thing this release exists to stop printing, moved up
+    // one level to the rollup.
+    var unmeasNote = unmeas ? '; ' + unmeas + ' day' + (unmeas === 1 ? '' : 's') + ' excluded, not measurable' : '';
+    var measured = R.days.filter(function (d) { var r = aw[dateKey(d)]; return r && isMeasured(r); }).length;
+    function awValue(mins) { return measured ? fmtDur(mins) : (unmeas ? NOT_MEASURABLE_SHORT : fmtDur(mins)); }
     var cards = [
       { v: commits, l: 'commits' },
       { v: sessions, l: 'Claude Code sessions' },
@@ -2426,8 +2675,8 @@ svg.trend text{font-size:11px;fill:var(--muted)}
         s: 'effort: parallel sessions add up' + (state.filter ? '' : '; equals the per-project totals below') },
       { v: fmtDur(active), l: 'elapsed', s: 'wall clock, any session; concurrent sessions count once; idle cap ' + DATA.idle_minutes + ' min' }
     ];
-    if (haveAw) cards.push({ v: fmtDur(state.filter ? editor : ed), l: state.filter ? 'editor time · ' + state.filter : 'editor time', s: 'VS Code in front, at the keyboard' });
-    if (haveAw) cards.push({ v: fmtDur(desk), l: 'at the desk', s: 'any app, keyboard or mouse active' });
+    if (haveAw) cards.push({ v: awValue(state.filter ? editor : ed), l: state.filter ? 'editor time · ' + state.filter : 'editor time', s: 'VS Code in front, at the keyboard' + unmeasNote });
+    if (haveAw) cards.push({ v: awValue(desk), l: 'at the desk', s: 'any app, keyboard or mouse active' + unmeasNote });
     if (havePres) cards.push({ v: fmtDur(unl), l: 'unlocked', s: 'logon/unlock to lock/sleep' });
     el('kpis').innerHTML = cards.map(function (c) { return '<div class="kpi"><div class="v">' + esc(c.v) + '</div><div class="l">' + esc(c.l) + '</div>' + (c.s ? '<div class="s">' + esc(c.s) + '</div>' : '') + '</div>'; }).join('');
   }
@@ -2436,6 +2685,8 @@ svg.trend text{font-size:11px;fill:var(--muted)}
     var notes = ['Bars are stretches of Claude Code activity, ticks are commits, coloured by project. The Claude figure is wall-clock time with any session active.'];
     if (havePres) notes.push('Light blue is the machine unlocked.');
     if (!haveAw) notes.push('Install ActivityWatch for desk and editor time.');
+    if (haveAw && R.days.some(function (d) { var r = aw[dateKey(d)]; return r && !isMeasured(r); }))
+      notes.push(NOT_MEASURABLE_SHORT + ' = ' + UNMEASURED + '. The Claude and commit figures for those days are unaffected.');
     el('daysNote').textContent = notes.join(' ');
     var html = '<div class="dayrow axis"><div></div><div class="track">' + [0, 3, 6, 9, 12, 15, 18, 21, 24].map(function (h) { return '<span class="tick" style="left:' + (h / 24 * 100) + '%">' + pad(h) + '</span>'; }).join('') + '</div><div class="figs">' +
       (haveAw ? '<span>desk</span><span>editor</span>' : '<span></span><span></span>') + '<span>Claude (elapsed)</span><span>commits</span></div></div>';
@@ -2467,7 +2718,7 @@ svg.trend text{font-size:11px;fill:var(--muted)}
       });
       act = wallClock(focus, d);
       var rec = aw[k], ed = 0;
-      if (state.filter) focus.forEach(function (x) { ed += (x.editorByDay[k] || 0) / 60; }); else ed = rec ? (rec.editor_s || 0) / 60 : 0;
+      if (state.filter) focus.forEach(function (x) { ed += (x.editorByDay[k] || 0) / 60; }); else ed = isMeasured(rec) ? (rec.editor_s || 0) / 60 : 0;
       var first = null, last = null;
       // clamped to the day: a session that opened last week must not drag this day's first
       // trace back to the day it opened
@@ -2483,7 +2734,12 @@ svg.trend text{font-size:11px;fill:var(--muted)}
         dd.commits.forEach(function (c) { if (!first || c.t < first) first = c.t; if (!last || c.t > last) last = c.t; });
       });
       html += '<div class="dayrow' + (+d === +today ? ' today' : '') + '"><div class="dl">' + esc(dayLabel(d)) + '<small>' + (first ? hm(first) + ' – ' + hm(last) : '&nbsp;') + '</small></div><div class="track">' + parts.join('') + '</div><div class="figs">' +
-        (haveAw ? '<span><b>' + (rec ? fmtDur(rec.desk_s / 60) : '–') + '</b>desk</span><span><b>' + (ed >= 1 ? fmtDur(ed) : '–') + '</b>editor</span>' : '<span></span><span></span>') +
+        (haveAw ? '<span' + (rec && !isMeasured(rec) ? ' title="' + esc(UNMEASURED) + '"' : '') + '><b>' + (isMeasured(rec) ? fmtDur(deskMinutes(rec)) : (rec ? NOT_MEASURABLE_SHORT : '–')) + '</b>desk</span>' +
+          // Unfiltered, `ed` is the machine's own figure and an exact zero is a measurement,
+          // so it prints as one and the dash is kept for a day with no record. Under a project
+          // filter it is that project's share, where a dash means "not this project" - the same
+          // convention the report's per-project Editor cells use.
+          '<span' + (rec && !isMeasured(rec) ? ' title="' + esc(UNMEASURED) + '"' : '') + '><b>' + (rec && !isMeasured(rec) ? NOT_MEASURABLE_SHORT : state.filter ? (ed >= 1 ? fmtDur(ed) : '–') : (rec ? fmtDur(ed) : '–')) + '</b>editor</span>' : '<span></span><span></span>') +
         '<span><b>' + (act ? fmtDur(act) : '–') + '</b>Claude</span><span><b>' + (nC || '–') + '</b>commits</span></div></div>';
     });
     el('days').innerHTML = days.length ? html : '<div class="empty">Nothing in this range yet.</div>';
@@ -2744,6 +3000,18 @@ svg.trend text{font-size:11px;fill:var(--muted)}
 </html>
 '''
 
+# The words are the same words on every surface, so a reword has to be made once. Done at
+# import, not at write time, so DASHBOARD_HTML is already the finished text for the tests that
+# lift functions out of it. __DATA__ is still substituted per render.
+# json.dumps, not the bare text: this lands inside the one <script> block, and one
+# apostrophe in a future reword would close the string and leave every card and table on the
+# page blank - with the suite green, because the tests search the text rather than parse it.
+# ensure_ascii=False so the em dash stays an em dash on the page and in those tests.
+DASHBOARD_HTML = (DASHBOARD_HTML
+                  .replace("__NOT_MEASURABLE_SHORT__", json.dumps(NOT_MEASURABLE_SHORT, ensure_ascii=False))
+                  .replace("__UNMEASURED_SENTENCE__",
+                           json.dumps(NOT_MEASURABLE + " — " + UNMEASURED_WHY, ensure_ascii=False)))
+
 
 # ----------------------------------------------------------------------------- morning brief (first run of the day)
 
@@ -2811,13 +3079,19 @@ def build_morning(slices, machines, cfg, pot):
     for m in machines:
         aw_days.update((m.get("aw") or {}).get("days") or {})
         presence += (m.get("presence") or {}).get("events", [])
-    rec = aw_days.get(y.isoformat()) or {}
+    # No `or {}`: an empty record is a measured zero, so a day the machine never recorded
+    # would otherwise acquire a confident "0m at the desk" - on the terse page opened first,
+    # every day, on every machine that has never run ActivityWatch.
+    rec = aw_days.get(y.isoformat())
     pres = presence_days(presence, now).get(y) if presence else None
     facts = []
-    if rec:
-        facts.append("%s at the desk" % fmt_dur(rec.get("desk_s", 0) / 60))
+    if desk_measured(rec):
+        facts.append("%s at the desk" % fmt_dur(desk_minutes(rec)))
         if rec.get("editor_s"):
             facts.append("%s in the editor" % fmt_dur(rec["editor_s"] / 60))
+    elif rec is not None:
+        # The terse page, opened first, with nothing else on it that explains the phrase.
+        facts.append("desk and editor time %s (%s)" % (NOT_MEASURABLE, UNMEASURED_WHY))
     if pres:
         facts.append("unlocked %s\u2013%s" % (pres["first"].strftime("%H:%M"), pres["last"].strftime("%H:%M")))
 

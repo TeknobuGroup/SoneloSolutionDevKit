@@ -27,7 +27,7 @@ import worklog_agent as wa
 TZ = wa.local_tz()
 NODE = shutil.which("node")
 
-HELPERS = ("pad", "startOfDay", "addDays", "dateKey", "dayMinutes")
+HELPERS = ("pad", "startOfDay", "addDays", "dateKey", "dayMinutes", "isMeasured", "deskMinutes")
 
 
 def js_function(name):
